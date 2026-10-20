@@ -5153,7 +5153,7 @@ void create_file_named(X86 *c, const std::string &name) {
     // archive into the profile. Such a handle opens through the read tier and
     // moves to the write tier at its first WriteFile (file_promote_for_write).
     bool deferred = want_write && !create;
-    int op = (want_write && !deferred) ? WIN32_FILE_WRITE : WIN32_FILE_READ;
+    int op = create ? WIN32_FILE_WRITE : WIN32_FILE_READ;
     std::string host = win32_host_path_op(name, op);
     if (host.empty()) {
         set_last_error(ERROR_FILE_NOT_FOUND_);

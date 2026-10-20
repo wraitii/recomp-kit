@@ -1196,14 +1196,15 @@ bool read_tm(uint32_t src, std::tm &tm) {
     return true;
 }
 
-void crt_stat64i32(X86 *c) {
+template <bool Wide> void crt_stat64i32(X86 *c) {
     uint32_t name = arg(c, 0), dst = arg(c, 1);
     if (!name || !dst || !gm_valid(dst, 48)) {
         wr32(guest_slot(g_errno_addr), EINVAL);
         set_eax(c, 0xffffffffu);
         return;
     }
-    std::string host = win32_host_path_op(gm_str(name, 4096), WIN32_FILE_READ);
+    std::string host =
+        win32_host_path_op(Wide ? gm_wstr(name) : gm_str(name, 4096), WIN32_FILE_READ);
     OsStat st{};
     if (host.empty() || os_stat(host.c_str(), &st) != 0) {
         wr32(guest_slot(g_errno_addr), ENOENT);
@@ -2122,7 +2123,8 @@ const ImportShim g_msvcr90_shims[] = {
     {"MSVCR90.dll", "_XcptFilter", ARGC_CDECL, crt_xcpt_filter},
     {"MSVCR90.dll", "signal", ARGC_CDECL, crt_signal},
     {"MSVCR90.dll", "rand", ARGC_CDECL, crt_rand},
-    {"MSVCR90.dll", "_stat64i32", ARGC_CDECL, crt_stat64i32},
+    {"MSVCR90.dll", "_stat64i32", ARGC_CDECL, crt_stat64i32<false>},
+    {"MSVCR90.dll", "_wstat64i32", ARGC_CDECL, crt_stat64i32<true>},
     {"MSVCR90.dll", "_time32", ARGC_CDECL, crt_time32},
     {"MSVCR90.dll", "_time64", ARGC_CDECL, crt_time64},
     {"MSVCR90.dll", "_localtime64", ARGC_CDECL, crt_localtime64},
