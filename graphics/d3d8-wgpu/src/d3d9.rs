@@ -669,17 +669,39 @@ pub fn d3d9_buffer_unlock(resource: &mut D3d9Resource, bytes: &[u8]) -> D3d9Buff
     b.lock_count.fetch_sub(1, Ordering::AcqRel);
     let closed = b.lock_count.load(Ordering::Acquire) == 0;
     if closed && !b.writable.is_empty() {
-        for &(lo, hi) in &b.writable {
-            let lo = lo as usize;
-            let hi = (hi as usize).min(b.bytes.len());
-            if lo < hi {
-                b.bytes[lo..hi].copy_from_slice(&bytes[lo..hi]);
-            }
-        }
         let (lo, hi) = b
             .writable
             .iter()
             .fold((u32::MAX, 0u32), |(lo, hi), &(a, c)| (lo.min(a), hi.max(c)));
+        let declared = (lo, hi);
+        let mut lo = lo as usize;
+        let mut hi = hi as usize;
+        if b.bytes[..lo] != bytes[..lo] {
+            lo = b.bytes[..lo]
+                .iter()
+                .zip(&bytes[..lo])
+                .position(|(old, new)| old != new)
+                .unwrap();
+        }
+        if b.bytes[hi..] != bytes[hi..] {
+            hi += b.bytes[hi..]
+                .iter()
+                .zip(&bytes[hi..])
+                .rposition(|(old, new)| old != new)
+                .unwrap()
+                + 1;
+        }
+        b.bytes[lo..hi].copy_from_slice(&bytes[lo..hi]);
+        let (lo, hi) = (lo as u32, hi as u32);
+        if (lo, hi) != declared {
+            static REPORTED: AtomicBool = AtomicBool::new(false);
+            if !REPORTED.swap(true, Ordering::Relaxed) || trace_enabled() {
+                eprintln!(
+                    "[d3d9] buffer writes extend beyond lock range: kind={:?} size={} declared={}-{} preserved={lo}-{hi}; preserving mapped writes",
+                    b.kind, b.size, declared.0, declared.1
+                );
+            }
+        }
         b.writable.clear();
         if hi > lo {
             if default_pool || b.writable_dirty {

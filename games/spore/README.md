@@ -73,7 +73,7 @@ bootstrap code map. Auxiliary mappings may push the heap start up, so this DLL
 owns `0x10000000`..`0x1003a000` and the effective heap base becomes
 `0x1003a000`.
 
-## D3DX shader compilation
+## Direct3D 9
 
 The `D3DXCompileShader` IAT at `0x011e2014` is called at `0x006fb5df`,
 `0x006fec68`, `0x00713d5e`, `0x00713df8`, `0x011f6cd4` and `0x011f7aeb`.
@@ -83,6 +83,13 @@ The native compiler is vkd3d-shader 2.1. `DIVERGENCE(original):` it emits
 full-precision bytecode when `D3DXSHADER_PARTIALPRECISION` is set, which the
 Direct3D 9 rules permit; `SKIPVALIDATION` still passes through vkd3d's HLSL
 front end, so malformed source may fail compilation.
+
+The streaming draw buffer at `0x00f66f30` passes its 16-bit index count as
+`SizeToLock` at `0x00f66fda`, while doubling only the offset. It later stores
+that count at `this+0x28`; `0x00f67020` divides it by three for triangle-list
+submission. Writable buffer unlocks preserve changed bytes outside the declared
+lock range, within the allocated buffer, so this original quirk does not leave
+the second half of an index upload stale. Draw fetch bounds remain enforced.
 
 ## Video conversion
 
