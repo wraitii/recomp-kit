@@ -6,6 +6,9 @@ guide covers source builds, toolkit development and new game ports. Read
 
 ## Prerequisites
 
+Apple silicon macOS is the primary target. See [Platforms](README.md#platforms)
+for Intel Mac, Windows and Linux support.
+
 - Python 3.9+ with a virtualenv holding `requirements-dev.txt` (CMake and Ninja
   come from it). On Windows use `.venv/Scripts/python.exe` below.
 - macOS: Xcode Command Line Tools. Linux: clang, lld, make and the SDL headers

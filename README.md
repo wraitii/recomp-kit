@@ -3,9 +3,19 @@
 Build native versions of supported classic PC games from your own copies.
 Recomp Toolkit checks your game files, recompiles the game and packages it as
 a native app for your computer. Launch each game's app directly, with its own
-settings and game files. Your original copy stays untouched.
+settings and game files.
 
 The desktop app handles setup and builds, with a library view for convenience.
+
+## Platforms
+
+Apple silicon (ARM) Macs are the main target. Recompiling these 32-bit x86 games
+as native ARM apps is where the toolkit is most useful.
+
+Intel Macs should also work by building the toolkit and its dependencies from
+source. Windows and Linux builds should generally work too. On x86 machines,
+recompiling x86 back to x86 adds overhead without the benefit of moving to a new
+CPU architecture, so further work is required.
 
 ## Get started
 
@@ -39,8 +49,9 @@ the required release and preparation steps.
 | [Spore](games/spore/README.md) | Work in progress | GOG Collection, Galactic Adventures 3.1.0.22 |
 
 Performance is generally good, with occasional slowdowns still being worked on,
-mostly in Civilization IV and Spore. Rare crashes from incorrect code mappings
-are also possible.
+mostly in Civilization IV and Spore. Game execution is currently single-threaded:
+the game's threads run one at a time. This has little impact on the games ported
+so far. Rare crashes from incorrect code mappings are also possible.
 
 ## Your installed apps
 
@@ -83,5 +94,5 @@ the toolkit or bring another game to it, start with [Contributing](CONTRIBUTING.
 - Explore the [architecture](docs/architecture.md), [code guide](docs/code-guide.md)
   and [translator](docs/ir.md).
 
-The kit also has Linux and Windows builds, and iOS and Android targets. Their
-build instructions are separate from the packaged macOS desktop app.
+Source builds cover Intel Macs, Windows and Linux, plus iOS and Android targets.
+The packaged desktop app targets Apple silicon Macs.
