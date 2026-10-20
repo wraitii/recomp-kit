@@ -2506,7 +2506,7 @@ struct GuestThread {
     uint32_t wait_result = 0; // what the wait returns once released
     std::vector<GuestApc> apcs;
     bool alertable = false;
-    double last_yield = 0.0; // for the bounded scheduling checkpoint
+    double slice_started = 0.0;
     jmp_buf exit_jmp;
     uint32_t exit_code = 0;
 };
@@ -3314,8 +3314,8 @@ uint32_t guest_block(const char *why) {
         g_sched_m.unlock();
         return 0x102;
     }
-    me->last_yield = sched_now();
     sched_run_others_locked(me->index, why);
+    me->slice_started = sched_now();
     uint32_t r = me->wait_result;
     g_sched_m.unlock();
     if (g_exit_requested)
@@ -3340,7 +3340,6 @@ bool guest_yield() {
         g_sched_m.unlock();
         return false;
     }
-    me->last_yield = sched_now();
     sched_expire_locked();
     size_t next = sched_next_runnable_locked(me->index);
     bool moved = next != NO_THREAD && next != me->index;
@@ -3351,6 +3350,7 @@ bool guest_yield() {
         while (g_baton != me->index)
             sched_wait_locked(me->index, 0.0, HOST_IDLE_BATON_SLICE);
     }
+    me->slice_started = sched_now();
     g_sched_m.unlock();
     if (moved && g_exit_requested)
         thread_finish_exit_process();
@@ -3454,6 +3454,7 @@ void sched_host_modal_end(bool began) {
         g_sched_cv.wait_for(g_sched_m, std::chrono::milliseconds(2));
     }
     me->blocked = was_blocked;
+    me->slice_started = sched_now();
     g_sched_m.unlock();
 }
 
@@ -3490,9 +3491,8 @@ void sched_checkpoint() {
         return;
     GuestThread *me = threads()[t_self];
     double now = sched_now();
-    if (now - me->last_yield < SCHED_SLICE_SECONDS)
+    if (now - me->slice_started < SCHED_SLICE_SECONDS)
         return;
-    me->last_yield = now;
     guest_yield();
 }
 
@@ -3783,6 +3783,8 @@ void *thread_host_main(void *arg) {
     while (g_baton != t->index && !g_exit_requested)
         g_sched_cv.wait(g_sched_m);
     bool exiting = g_exit_requested;
+    if (!exiting)
+        t->slice_started = sched_now();
     g_sched_m.unlock();
     // Created before the exit, first scheduled after it: Windows would never
     // run this body, so neither does this thread. It still ends through the
@@ -5046,8 +5048,8 @@ bool sched_drive_until_stopped(double timeout_seconds) {
         t->wait_n = 0;
         t->has_deadline = true;
         t->deadline = sched_now() + kYield;
-        t->last_yield = sched_now();
         sched_run_others_locked(me, "shutdown drive");
+        t->slice_started = sched_now();
         t->blocked = false;
         t->has_deadline = false;
     }

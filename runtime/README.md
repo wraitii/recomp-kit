@@ -197,10 +197,11 @@ yields if the running thread has held the baton for a millisecond. Scheduling
 must not depend on which API the guest happens to poll: the guest's frame limiter spins
 on `GetTickCount`, and when only blocking calls yielded it could starve the
 DirectInput workers indefinitely with their 200 ms waits already expired. The
-millisecond rate limit bounds the yield frequency. Translated direct, indirect,
-tail and auxiliary-module calls also checkpoint, with a per-thread 1024-call
-budget amortizing clock and registry work. This lets a guest-only polling loop
-wait for a worker without making an OS import. The checkpoint preserves the
+millisecond rate limit bounds the yield frequency. Each slice starts when its
+thread acquires the baton; time spent waiting does not count toward that slice.
+Translated direct, indirect, tail and auxiliary-module calls also checkpoint,
+with a per-thread 1024-call budget amortizing clock and registry work. This lets
+a guest-only polling loop wait for a worker without making an OS import. The checkpoint preserves the
 caller's CPU and honors `sched_atomic_enter` spans. A loop entirely within one
 translated body that makes no calls remains outside this call-boundary seam.
 
