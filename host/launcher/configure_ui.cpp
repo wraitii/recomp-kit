@@ -5,13 +5,18 @@
 namespace launcher {
 
 namespace {
-const Color kBackground{16, 18, 24, 255};
-const Color kText{230, 232, 238, 255};
-const Color kDim{150, 156, 170, 255};
-const Color kButton{52, 60, 78, 255};
-const Color kButtonHot{70, 82, 108, 255};
-const Color kFocus{240, 200, 90, 255};
-const Color kError{230, 100, 90, 255};
+const Color kBackground{11, 21, 48, 255};
+const Color kPanel{20, 37, 68, 255};
+const Color kLine{48, 73, 108, 255};
+const Color kText{237, 249, 255, 255};
+const Color kDim{173, 190, 214, 255};
+const Color kButton{24, 46, 80, 255};
+const Color kButtonHot{32, 61, 99, 255};
+const Color kPrimary{21, 85, 195, 255};
+const Color kPrimaryHot{28, 100, 216, 255};
+const Color kPrimaryLine{99, 159, 233, 255};
+const Color kFocus{140, 232, 255, 255};
+const Color kError{242, 170, 162, 255};
 constexpr int kRestore = 0;
 constexpr int kDone = 1;
 constexpr int kController = 2;
@@ -178,18 +183,20 @@ void ConfigureUi::pointer(int x, int y, bool pressed) {
 void ConfigureUi::draw(Canvas &canvas, int scale) {
     scale = std::max(1, scale);
     dirty_ = false;
-    const int w = canvas.width(), h = canvas.height(), margin = 18 * scale;
-    const int title_size = std::max(scale, std::min(3 * scale, h / 105));
+    const int w = canvas.width(), h = canvas.height(), margin = 24 * scale;
+    const int title_size = 2 * scale;
     canvas.clear(kBackground);
     std::string title = "Configure " + game_;
     const size_t title_chars = size_t(std::max(1, (w - 2 * margin) / (6 * title_size)));
     if (title.size() > title_chars)
         title = title.substr(0, title_chars > 3 ? title_chars - 3 : 1) + "...";
     canvas.text(margin, margin, title, title_size, kText);
-    int y = margin + Canvas::text_height(title_size) + 5 * scale;
+    int y = margin + Canvas::text_height(title_size) + 8 * scale;
     canvas.text(margin, y, "Changes are saved automatically. Used next time you play.", scale,
                 kDim);
-    y += Canvas::text_height(scale) + 6 * scale;
+    y += Canvas::text_height(scale) + 12 * scale;
+    canvas.fill({margin, y, w - 2 * margin, scale}, kLine);
+    y += 12 * scale;
 
     rows_.assign(settings_.size(), {});
     previous_.assign(settings_.size(), {});
@@ -197,25 +204,26 @@ void ConfigureUi::draw(Canvas &canvas, int scale) {
     const int row_h =
         std::max(34 * scale, (h - y - 72 * scale) / std::max(1, int(settings_.size())));
     for (size_t i = 0; i < settings_.size(); ++i) {
-        const Rect row{margin, y, w - 2 * margin, row_h - 2 * scale};
+        const Rect row{margin, y, w - 2 * margin, row_h - 6 * scale};
         rows_[i] = row;
         const bool focused = int(i) == focus_;
-        canvas.fill(row, focused ? kButtonHot : kButton);
-        if (focused)
-            canvas.frame(row, scale, kFocus);
+        canvas.fill(row, focused ? kButtonHot : kPanel);
+        canvas.frame(row, scale, focused ? kFocus : kLine);
         const int value_x = row.x + row.w - value_w;
         const ConfigureSetting &setting = settings_[i];
-        canvas.text(row.x + 9 * scale, row.y + 3 * scale, setting.label, scale, kText);
-        const int description_y = row.y + 13 * scale;
+        canvas.text(row.x + 9 * scale, row.y + 6 * scale, setting.label, scale, kText);
+        const int description_y = row.y + 18 * scale;
         const int description_w = std::max(1, value_x - row.x - 18 * scale);
         canvas.paragraph(row.x + 9 * scale, description_y, description_w, setting.description,
                          scale, kDim);
         const Rect value_area{value_x, row.y, value_w, row.h};
+        canvas.fill({value_x, row.y + scale, value_w - scale, row.h - 2 * scale}, kBackground);
+        canvas.fill({value_x, row.y, scale, row.h}, focused ? kFocus : kLine);
         const Rect prev{value_area.x, row.y, 20 * scale, row.h};
         const Rect next{row.x + row.w - 20 * scale, row.y, 20 * scale, row.h};
         previous_[i] = prev;
         canvas.text(prev.x + 6 * scale, row.y + (row.h - Canvas::text_height(scale)) / 2, "<",
-                    scale, kText);
+                    scale, kFocus);
         const std::string value = setting.value >= 0 && setting.value < int(setting.values.size())
                                       ? setting.values[size_t(setting.value)]
                                       : "?";
@@ -227,7 +235,7 @@ void ConfigureUi::draw(Canvas &canvas, int scale) {
         canvas.text(value_x + (value_w - tw) / 2, row.y + (row.h - Canvas::text_height(scale)) / 2,
                     clipped, scale, kText);
         canvas.text(next.x + 6 * scale, row.y + (row.h - Canvas::text_height(scale)) / 2, ">",
-                    scale, kText);
+                    scale, kFocus);
         y += row_h;
     }
 
@@ -243,9 +251,10 @@ void ConfigureUi::draw(Canvas &canvas, int scale) {
         buttons_[size_t(i)] = rect;
         const int index = int(settings_.size()) + i;
         const bool focused = focus_ == index;
-        canvas.fill(rect, focused || pressed_ == index ? kButtonHot : kButton);
-        if (focused)
-            canvas.frame(rect, scale, kFocus);
+        const bool hot = focused || pressed_ == index;
+        canvas.fill(rect,
+                    i == kDone ? (hot ? kPrimaryHot : kPrimary) : (hot ? kButtonHot : kButton));
+        canvas.frame(rect, scale, focused ? kFocus : i == kDone ? kPrimaryLine : kLine);
         std::string label = labels[i];
         const int max_chars = std::max(1, button_w / (6 * scale));
         if (int(label.size()) > max_chars)
