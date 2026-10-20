@@ -18,8 +18,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import unicodedata
-import uuid
 import zipfile
 
 import game_config
@@ -38,7 +36,6 @@ CANCEL_FILE = None
 KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT / "tools/recomp"))
 import install_jobs
-import assisted_install
 
 
 class SourceError(ValueError):
@@ -744,50 +741,8 @@ def catalog(storage, repair=False):
                             job_destination = locator.get("destination", root) if isinstance(locator, dict) else root
                             with install_jobs.DestinationLock(job_destination):
                                 journal = recover_publication(job_destination, identifier)
-                                if (journal.get("mode") == "assisted"
-                                        and journal.get("stage") in ("copying", "validating", "building")
-                                        and not journal.get("publication")):
-                                    job_paths, journal = install_jobs.load_job(job_destination, identifier)
-                                    assisted = {**journal.get("assisted", {}), "settle": None,
-                                                "recipeChanged": False, "recipeSessionId": None, "states": []}
-                                    install_jobs.update_job(job_paths, journal, "waiting_for_input",
-                                                            assisted=assisted)
                             if journal.get("stage") != "complete":
                                 remaining.append(locator)
-                                if journal.get("mode") == "assisted" and journal.get("stage") in ("waiting_for_input", "cancelling_assisted"):
-                                    assisted_journal = journal
-                                    try:
-                                        job_paths, journal = install_jobs.load_job(job_destination, identifier)
-                                        _, drop = assisted_install._validate_assisted_owner(job_paths, journal)
-                                        content = drop / "content"
-                                        validation_error = None
-                                        try:
-                                            assisted_install._validate_assisted_paths(job_paths, journal)
-                                        except (OSError, ValueError) as error:
-                                            validation_error = str(error)
-                                        recover_actions = ["resume_preparation", "open_assisted_folder", "cancel_assisted_job"]
-                                        log_path = Path(job_destination) / journal.get("log", "")
-                                        if log_path.is_file() and not log_path.is_symlink():
-                                            recover_actions.append("open_log")
-                                        recoverable_jobs.append({"jobId": identifier, "mode": "assisted",
-                                            "stage": journal["stage"], "destination": str(Path(job_destination).resolve()),
-                                            "sourceReference": journal.get("assisted", {}).get("sourceReference"),
-                                            "dropFolder": str(drop),
-                                            "contentFolder": str(content) if content.is_dir() and not content.is_symlink() else None,
-                                            "validationError": validation_error,
-                                            "canCancel": True, "canRecheck": validation_error is None,
-                                            "actions": recover_actions,
-                                            "log": str(log_path) if log_path.is_file() and not log_path.is_symlink() else None,
-                                            "errors": journal.get("errors", [])[-1:]})
-                                    except (OSError, ValueError) as error:
-                                        cancelling = assisted_journal.get("stage") == "cancelling_assisted"
-                                        recoverable_jobs.append({"jobId": identifier, "mode": "assisted",
-                                            "stage": assisted_journal.get("stage"), "destination": str(Path(job_destination).resolve()),
-                                            "sourceReference": assisted_journal.get("assisted", {}).get("sourceReference"),
-                                            "validationError": str(error), "canCancel": cancelling,
-                                            "canRecheck": False,
-                                            "actions": ["cancel_assisted_job"] if cancelling else [],
-                                            "errors": assisted_journal.get("errors", [])[-1:]})
                         if remaining != activity.get("activeJobs", []):
                             activity["activeJobs"] = remaining
                             install_jobs.write_json(activity_path, activity)
@@ -844,14 +799,11 @@ def catalog(storage, repair=False):
                     try:
                         _, journal = install_jobs.load_job(job_destination, identifier)
                         if journal.get("stage") != "complete":
-                            if (journal.get("mode") == "assisted"
-                                    and journal.get("stage") in ("waiting_for_input", "cancelling_assisted")):
-                                continue
                             attempt = journal.get("attempt")
                             can_resume = (journal.get("stage") not in ("publishing", "cleaning", "complete")
                                           and isinstance(attempt, int) and attempt > 0)
                             actions = ["locate_missing_file", "choose_another_copy", "change_destination",
-                                       "recheck_preparation", "open_log"]
+                                       "open_log"]
                             if can_resume:
                                 actions.insert(0, "retry_failed_stage")
                             recoverable_jobs.append({"jobId": identifier, "stage": journal.get("stage"),
@@ -1312,7 +1264,6 @@ def install(request, storage, prepared=None):
     bind_selected_auxiliary_paths(cfg, selected, root)
     executable_relative = Path(*selected["executable"]["path"].split("/"))
     exclude_paths = prepared.get("excludePaths", [])
-    assisted_request = request.get("mode") == "assisted"
     data = root / "original"
     emit("stage", stage="checking", message="Checking build prerequisites")
     checks = prerequisites(True, source_kind == "inno")
@@ -1328,8 +1279,6 @@ def install(request, storage, prepared=None):
                        {"kind": "folder", **install_jobs.payload_identity(selected["contentRoot"], check_cancel,
                                                                                 exclude_paths=exclude_paths,
                                                                                 progress=file_progress())})
-    if assisted_request:
-        source_identity["excludedOptionalPaths"] = list(exclude_paths)
     archive_bytes = adapter.archive_uncompressed_size(source_path, check_cancel) if source_kind in ("zip", "inno") else 0
     installer_bytes = adapter.source_size(source_path) if source_kind == "inno" else 0
     copy_estimate = source_identity.get("bytes", archive_bytes)
@@ -1415,9 +1364,7 @@ def install(request, storage, prepared=None):
         log_event(log_path, "inspecting", "installation attempt started",
                   {"jobId": job_identifier, "attempt": journal.get("attempt", 1)})
         staging = job_paths["staging"]
-        assisted_job = journal.get("mode") == "assisted"
-        work_root = staging / "work" if assisted_job else staging
-        build_root = work_root / "build"
+        build_root = staging / "build"
         staged_data = build_root / "original"
         reusable_copy = False
         if resumed and staged_data.is_dir() and journal.get("validatedInputs", {}).get("stagedOriginal"):
@@ -1432,31 +1379,19 @@ def install(request, storage, prepared=None):
                         reusable_copy = False
                         break
         if not reusable_copy:
-            if assisted_job:
-                if work_root.exists():
-                    install_jobs.remove_owned(work_root, staging, job_identifier,
-                                              journal.get("ownedTokens", {}).get("work"))
-                work_root.mkdir()
-                info = work_root.stat()
-                install_jobs.write_json(work_root / "owner.json", {"schema": install_jobs.SCHEMA,
-                                         "jobId": job_identifier, "device": info.st_dev, "inode": info.st_ino})
-                journal.setdefault("ownedTokens", {})["work"] = install_jobs.directory_token(work_root)
-                install_jobs.update_job(job_paths, journal, journal.get("stage", "copying"),
-                                        ownedTokens=journal["ownedTokens"])
-            else:
-                if staging.exists():
-                    install_jobs.remove_owned(staging, job_paths["meta"], job_identifier,
-                                              journal.get("ownedTokens", {}).get("staging"))
-                journal.setdefault("ownedTokens", {})["staging"] = None
-                install_jobs.update_job(job_paths, journal, journal.get("stage", "copying"),
-                                        ownedTokens=journal["ownedTokens"])
-                staging.mkdir()
-                info = staging.stat()
-                install_jobs.write_json(staging / "owner.json", {"schema": install_jobs.SCHEMA,
-                                         "jobId": job_identifier, "device": info.st_dev, "inode": info.st_ino})
-                journal.setdefault("ownedTokens", {})["staging"] = install_jobs.directory_token(staging)
-                install_jobs.update_job(job_paths, journal, journal.get("stage", "copying"),
-                                        ownedTokens=journal["ownedTokens"])
+            if staging.exists():
+                install_jobs.remove_owned(staging, job_paths["meta"], job_identifier,
+                                          journal.get("ownedTokens", {}).get("staging"))
+            journal.setdefault("ownedTokens", {})["staging"] = None
+            install_jobs.update_job(job_paths, journal, journal.get("stage", "copying"),
+                                    ownedTokens=journal["ownedTokens"])
+            staging.mkdir()
+            info = staging.stat()
+            install_jobs.write_json(staging / "owner.json", {"schema": install_jobs.SCHEMA,
+                                     "jobId": job_identifier, "device": info.st_dev, "inode": info.st_ino})
+            journal.setdefault("ownedTokens", {})["staging"] = install_jobs.directory_token(staging)
+            install_jobs.update_job(job_paths, journal, journal.get("stage", "copying"),
+                                    ownedTokens=journal["ownedTokens"])
             build_root.mkdir()
         else:
             stage = "validating"
@@ -1547,8 +1482,7 @@ def install(request, storage, prepared=None):
         publish_dir = staging / "publish"
         if publish_dir.exists():
             remove(publish_dir)
-        monitor_baseline = copied["bytes"] + (
-            journal.get("assisted", {}).get("validatedDropBytes", 0) if assisted_job else 0)
+        monitor_baseline = copied["bytes"]
         existing_growth = max(0, install_jobs.tree_size(staging, check_cancel) - monitor_baseline)
         check_space(job_paths, journal, root, "building",
                     max(0, install_jobs.MAX_BUILD_BYTES - existing_growth), log_path, space_plan)
@@ -1622,8 +1556,6 @@ def install(request, storage, prepared=None):
                           if source_kind in ("zip", "inno") else
                           {"kind": "folder", **install_jobs.payload_identity(selected["contentRoot"], check_cancel,
                                                                                exclude_paths=exclude_paths)})
-        if assisted_job:
-            current_source["excludedOptionalPaths"] = list(exclude_paths)
         if current_recipe.get("sha256") != recipe_facts.get("sha256") or current_source != source_identity:
             raise SourceError("inputs_changed_before_publish", "The source or build recipe changed during the build.",
                               ["Review the source and start a new installation."], str(source_path))
@@ -1762,20 +1694,10 @@ def install(request, storage, prepared=None):
                 except (OSError, ValueError, KeyError) as recovery_error:
                     emit("log", text=f"Publication recovery is required: {recovery_error}")
         if not committed:
-            assisted_retry = journal.get("mode") == "assisted" and not journal.get("publication")
-            failure_stage = "waiting_for_input" if assisted_retry else (
-                "cancelled" if diagnostic["code"] == "cancelled" else "failed")
+            failure_stage = "cancelled" if diagnostic["code"] == "cancelled" else "failed"
             try:
-                if assisted_retry:
-                    assisted = journal.get("assisted", {})
-                    assisted["settle"] = None
-                    assisted["recipeSessionId"] = None
-                    assisted["states"] = []
-                    install_jobs.update_job(job_paths, journal, failure_stage,
-                                            errors=[*journal.get("errors", []), diagnostic], assisted=assisted)
-                else:
-                    install_jobs.update_job(job_paths, journal, failure_stage,
-                                            errors=[*journal.get("errors", []), diagnostic])
+                install_jobs.update_job(job_paths, journal, failure_stage,
+                                        errors=[*journal.get("errors", []), diagnostic])
             except OSError as journal_error:
                 emit("log", text=f"Could not persist the failure journal: {journal_error}")
         raise
@@ -1940,8 +1862,6 @@ def validate_inspection_request(request):
 
 
 def resume_install(request, storage):
-    if request.get("mode") == "assisted":
-        return continue_assisted(request, storage)
     validate_inspection_request(request)
     game_id = request["game"]
     directory = KIT / "games" / game_id
@@ -1984,119 +1904,6 @@ def resume_install(request, storage):
                 if prepared["root"] != destination_lock.root:
                     raise install_jobs.JobError("destination_changed", "The registered destination changed during preflight.")
                 return install(request, storage, prepared)
-            finally:
-                DESTINATION_LOCKS = []
-
-
-def continue_assisted(request, storage):
-    if request.get("continue") is not True:
-        raise install_jobs.JobError("explicit_continue_required", "Continuing preparation requires an explicit user action.")
-    game_id = request["game"]
-    directory = KIT / "games" / game_id
-    if directory.parent != KIT / "games" or game_id == "stub" or not (directory / "game.toml").is_file():
-        raise install_jobs.JobError("unknown_game", "The requested game is unavailable.")
-    root, _, _ = assisted_install._locate(storage, game_id, request.get("jobId"))
-    with install_jobs.DestinationLock(storage, lock_name="registry.lock") as registry_lock:
-        with install_jobs.DestinationLock(root) as destination_lock:
-            global DESTINATION_LOCKS
-            DESTINATION_LOCKS = [registry_lock, destination_lock]
-            try:
-                root, job_paths, journal = assisted_install._locate(storage, game_id, request.get("jobId"))
-                if journal.get("stage") != "waiting_for_input":
-                    raise install_jobs.JobError("assisted_not_waiting", "This preparation job is not waiting for files.")
-                _, content = assisted_install._validate_assisted_paths(job_paths, journal)
-                try:
-                    session_id = str(uuid.UUID(request.get("sessionId")))
-                except (ValueError, TypeError, AttributeError) as error:
-                    raise install_jobs.JobError("invalid_watch_session", "Recheck preparation before continuing.") from error
-                if session_id != request.get("sessionId"):
-                    raise install_jobs.JobError("invalid_watch_session", "Recheck preparation before continuing.")
-                settle = journal.get("assisted", {}).get("settle") or {}
-                if settle.get("sessionId") != session_id:
-                    raise install_jobs.JobError("preparation_recheck_required", "Recheck preparation in this session before continuing.")
-                cfg = game_config.load(directory)
-                recipe_facts = recipe(directory)
-                if recipe_facts.get("sha256") != journal.get("recipeIdentity", {}).get("sha256"):
-                    raise install_jobs.JobError("recipe_changed", "The build recipe changed; recheck preparation before continuing.",
-                                                ["Recheck preparation", "Keep the waiting folder"])
-                before = assisted_install._snapshot(content, check_cancel)
-                if before["invalid"]:
-                    raise install_jobs.JobError("assisted_content_unstable", "Preparation files are still changing or contain unsafe paths.",
-                                                ["Wait for files to settle", "Recheck preparation"],
-                                                details={"diagnostics": before["invalid"]})
-                now = time.time()
-                optional_paths = [item["path"] for item in cfg["setup"]["checklist"]["items"]
-                                  if not item.get("required", True)]
-                for item in cfg["setup"]["checklist"]["items"]:
-                    if not item.get("required", True):
-                        continue
-                    record = settle.get("items", {}).get(item["id"], {})
-                    digest = assisted_install._item_digest(before, item["path"], optional_paths)
-                    if (digest is None or digest != record.get("digest")
-                            or assisted_install._item_changed(before, item["path"], optional_paths)
-                            or now - record.get("since", now) < assisted_install.STABLE_SECONDS):
-                        raise install_jobs.JobError("preparation_not_settled", "Required files have not been stable for two seconds.",
-                                                    ["Wait for the required files to settle", "Recheck preparation"],
-                                                    details={"path": item["path"]})
-                inspection = inspect_folder(cfg, content, check_cancel)
-                selected = select_candidate(inspection, request.get("candidateId"))
-                executable_relative = Path(*selected["executable"]["path"].split("/"))
-                if cfg["code_map_path"] is None or not cfg["code_map_path"].exists():
-                    raise install_jobs.JobError("missing_translation_metadata", "This game has no translation metadata.")
-                if cfg["game"].get("developer_exe"):
-                    raise install_jobs.JobError("fixed_developer_executable", "This game recipe requires a fixed developer executable.")
-                role_checks, role_diagnostics, _, _ = source_inspection.validate_required_roles(
-                    cfg, content, artifacts=[item for item in cfg["setup"]["checklist"]["items"]
-                        if item.get("required", True) or (
-                            item.get("id") in settle.get("items", {})
-                            and settle["items"][item["id"]].get("digest") is not None
-                            and now - settle["items"][item["id"]].get("since", now)
-                                >= assisted_install.STABLE_SECONDS)])
-                if any(item.get("required", True) and item["status"] != "verified" for item in role_checks):
-                    raise install_jobs.JobError("required_content_unverified", "Required preparation files no longer pass validation.",
-                                                ["Recheck preparation"], details={"diagnostics": role_diagnostics})
-                verified_optional = {item["id"] for item in role_checks
-                                     if not item.get("required", True) and item["status"] == "verified"}
-                unsupported_optional = {item.get("id") for item in selected.get("requiredRoles", [])
-                                        if not item.get("required", True) and item.get("found")
-                                        and unicodedata.normalize("NFC", item.get("actualPath", "").replace("\\", "/")).casefold()
-                                            != unicodedata.normalize("NFC", item.get("path", "").replace("\\", "/")).casefold()}
-                excluded_optional = [item.get("actualPath") or item["path"]
-                                     for item in cfg["setup"]["checklist"]["items"]
-                                     if not item.get("required", True)
-                                     and (item["id"] not in verified_optional or item["id"] in unsupported_optional)]
-                after = assisted_install._snapshot(content, check_cancel)
-                required_changed = any(
-                    assisted_install._item_changed(after, item["path"], optional_paths)
-                    or assisted_install._item_digest(before, item["path"], optional_paths)
-                    != assisted_install._item_digest(after, item["path"], optional_paths)
-                    for item in cfg["setup"]["checklist"]["items"] if item.get("required", True))
-                if after["invalid"] or required_changed:
-                    raise install_jobs.JobError("assisted_content_changed", "Preparation files changed during final verification.",
-                                                ["Wait for files to settle", "Recheck preparation"])
-                checks = prerequisites(True, False)
-                if not checks["ready"]:
-                    raise install_jobs.JobError("missing_prerequisites", "Build prerequisites are missing; the waiting folder is preserved.",
-                                                ["Install the listed build tools", "Continue preparation"],
-                                                details={"checks": checks["checks"]})
-                identity = {"kind": "folder", **install_jobs.payload_identity(
-                    selected["contentRoot"], check_cancel, exclude_paths=excluded_optional),
-                    "excludedOptionalPaths": excluded_optional}
-                if journal.get("sourceIdentity") != identity:
-                    work = job_paths["staging"] / "work"
-                    if work.exists():
-                        install_jobs.remove_owned(work, job_paths["staging"], journal["jobId"],
-                                                  journal.get("ownedTokens", {}).get("work"))
-                    journal["validatedInputs"] = {}
-                journal["sourceIdentity"] = identity
-                journal["candidateId"] = selected["id"]
-                journal["recipeIdentity"] = recipe_facts
-                journal.setdefault("assisted", {})["validatedDropBytes"] = before["bytes"]
-                install_jobs.update_job(job_paths, journal, "waiting_for_input")
-                prepared = {"gameId": game_id, "directory": directory, "sourcePath": content,
-                            "root": root, "cfg": cfg, "sourceKind": "folder", "explicitSource": None,
-                            "selected": selected, "excludePaths": excluded_optional}
-                return install({**request, "mode": "assisted", "jobId": journal["jobId"]}, storage, prepared)
             finally:
                 DESTINATION_LOCKS = []
 
@@ -2145,19 +1952,6 @@ def main():
             result = adopt_request(request, storage)
         elif action == "job_log":
             result = job_log(request, storage)
-        elif action == "assisted_start":
-            result = assisted_install.start(request, storage, KIT, check_cancel,
-                                            lambda game_dir: install_jobs.recipe_identity(KIT, game_dir),
-                                            inspect_folder, emit)
-        elif action == "assisted_status":
-            result = assisted_install.status(request, storage, KIT, request.get("sessionId"), check_cancel)
-        elif action == "assisted_path":
-            result = assisted_install.path(request, storage)
-        elif action == "assisted_cancel":
-            result = assisted_install.cancel_job(request, storage)
-        elif action == "assisted_recheck":
-            result = assisted_install.recheck(request, storage, KIT,
-                                              lambda game_dir: install_jobs.recipe_identity(KIT, game_dir))
         elif action == "check":
             result = prerequisites(request.get("needsRust", True), request.get("needsInnoextract", False))
         elif action == "install":

@@ -22,7 +22,7 @@ kit as a submodule.
 ## Recomp Toolkit
 
 Recomp Toolkit imports installed folders, ZIPs and GOG Inno installers
-with exact version checks, and offers an assisted drop folder for manual preparation.
+with exact version checks. Sources that cannot be imported automatically can be prepared outside the library and inspected as a folder.
 Installer imports require `innoextract` 1.9 or later (on macOS: `brew install innoextract`)
 and recognize supported games by extracting and hashing only executable candidates
 and required modules, with data paths checked against the installer listing.

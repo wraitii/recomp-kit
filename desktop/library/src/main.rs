@@ -133,8 +133,8 @@ async fn pick(kind: String, app: tauri::AppHandle) -> Option<String> {
 
 #[tauri::command]
 async fn query(mut request: Value, app: tauri::AppHandle) -> Result<Value, String> {
-    if !matches!(request["action"].as_str(), Some("catalog" | "check" | "inspect" | "discover" | "preflight" | "adopt" | "job_log"
-        | "assisted_start" | "assisted_status" | "assisted_path" | "assisted_cancel" | "assisted_recheck")) {
+    if !matches!(request["action"].as_str(),
+                  Some("catalog" | "check" | "inspect" | "discover" | "preflight" | "adopt" | "job_log")) {
         return Err("Unsupported query".into());
     }
     tauri::async_runtime::spawn_blocking(move || {
@@ -181,13 +181,6 @@ async fn query(mut request: Value, app: tauri::AppHandle) -> Result<Value, Strin
 }
 
 #[tauri::command]
-async fn open_assisted_folder(game: String, job_id: String, app: tauri::AppHandle) -> Result<(), String> {
-    let result = query(json!({"action":"assisted_path", "game":game, "jobId":job_id}), app).await?;
-    let folder = result["dropFolder"].as_str().ok_or("The saved job has no safe drop folder")?;
-    open_folder(folder.to_owned())
-}
-
-#[tauri::command]
 fn open_folder(path: String) -> Result<(), String> {
     let path = PathBuf::from(path);
     if !path.is_absolute() || !path.is_dir() || path.is_symlink() {
@@ -201,22 +194,6 @@ fn open_folder(path: String) -> Result<(), String> {
     let program = "xdg-open";
     Command::new(program).arg(path).spawn().map_err(|e| e.to_string())?;
     Ok(())
-}
-
-#[tauri::command]
-async fn cancel_assisted(game: String, job_id: String, app: tauri::AppHandle) -> Result<Value, String> {
-    let confirmed = rfd::AsyncMessageDialog::new()
-        .set_level(rfd::MessageLevel::Warning)
-        .set_title("Remove prepared files?")
-        .set_description("This removes files copied into this job’s owned preparation folder. It does not change the selected source. This cannot be undone.")
-        .set_buttons(rfd::MessageButtons::YesNo)
-        .show()
-        .await;
-    if confirmed != rfd::MessageDialogResult::Yes {
-        return Ok(json!({"confirmed": false}));
-    }
-    query(json!({"action":"assisted_cancel", "game":game, "jobId":job_id,
-                 "confirmed":true}), app).await
 }
 
 #[tauri::command]
@@ -348,9 +325,7 @@ fn main() {
             query,
             start_job,
             cancel_job,
-            open_assisted_folder,
             open_folder,
-            cancel_assisted,
             open_url
         ])
         .build(tauri::generate_context!())

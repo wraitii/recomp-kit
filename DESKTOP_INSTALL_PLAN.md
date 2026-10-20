@@ -12,15 +12,15 @@ kit checkout, Python, or build tools.
 
 ## Scope and non-goals
 
-- Current milestone: macOS installed folders, ZIPs, assisted preparation, movable
-  game folders and interruption recovery. Additional installer, archive and disc
+- Current milestone: macOS installed folders, ZIPs, movable game folders and
+  interruption recovery. Additional installer, archive and disc
   adapters in Step 4 follow individually against real inputs. Windows and Linux
   packaging follow the macOS validation pass.
 - Out of scope: downloading game content, bundling game data, executing installers
   (including under Wine), bypassing copy protection or DRM, patching a user's files in
   place, and making Wine a dependency of the library or the finished app.
-- Support level is best-effort. Sources the library cannot extract are handled by
-  assisted mode (Step 6), not by running their installers.
+- Support level is best-effort. Sources the library cannot extract must be prepared
+  outside the library; their installers are never run by the library.
 - Existing development installations may be recreated; legacy library records and
   installed layouts are outside the new contract.
 
@@ -34,49 +34,18 @@ kit checkout, Python, or build tools.
   in Step 4; libarchive stays only if it covers the image reading we need.
 - **Platform:** macOS only for this pass.
 - **Black & White:** the installed-folder route is supported. Installer and disc-image
-  extraction for Black & White is handled by assisted mode, not by a dedicated
-  Black & White flow. Standalone extraction utilities are deferred; they do not ship
-  in this pass.
-- **Assisted mode:** available for every source, and offered whenever automatic
-  preparation cannot finish. It is also selectable up front. Requirements are in
-  Step 6.
+  extraction for Black & White remains manual; it does not have a dedicated flow.
+  Standalone extraction utilities are deferred; they do not ship in this pass.
 - **Source identity:** each source variant is its own candidate, identified by payload
   hashes, never by file name. The same game can appear as several variants (stock disc,
   repack, patched folder, different language).
 
-## Assisted mode requirements
+## Preparation guidance
 
-These are the requirements that Step 6 implements. They are the baseline for review.
-
-- **Entry:** the user can choose assisted mode at source selection, and the library
-  offers it when a required file or tool is missing. It never starts a build while
-  required content is absent.
-- **Drop folder:** created inside the job's staging area and shown with Open and Copy
-  path actions. It is never the user's source and never a folder the library reads
-  outside the job.
-- **Checklist:** a plain-text file in the drop folder lists each required item with its
-  name, purpose, accepted forms, and where to find it. The text is stable and readable
-  by a person or their own agent. The library does not depend on any agent.
-- **Live feedback:** the library watches the drop folder and shows each item as missing,
-  waiting for the file to settle, checking, verified, wrong version, or unreadable.
-  It validates a file only after its size and modification time have been stable for
-  a short interval, so partial copies are not reported as failures.
-- **Continue:** enabled only when every required item is verified. The build starts
-  only after the user chooses Continue. Optional items never block Continue.
-- **Validation parity:** the same validators as the automatic path run on drop-folder
-  content. Assisted mode must not weaken identity, hash or containment checks.
-- **Result:** OK, or FAIL with structured errors per item and a recovery action each
-  (Retry check, Open drop folder, Cancel job). A failed check never starts the build.
-- **Persistence:** the waiting state and drop-folder identity live in the journal. The
-  job survives quitting and restarting the library. On resume, every item is
-  revalidated; earlier results are not trusted.
-- **Isolation:** the library never writes into the user's source, never executes any
-  file from the drop folder, and applies size and count budgets and containment checks
-  to everything in it.
-- **Cancel:** removes the drop folder only if the job created it, and only after
-  confirmation. Cancelling never touches the user's source.
-- **Feedback restraint:** status announcements happen on meaningful changes (an item
-  becomes verified or fails, and the final result), not on every file event.
+The library does not create or watch a preparation folder. A user prepares files
+outside the library and selects the resulting folder, which is checked by the normal
+inspection path. Per-game `[setup.preparations]` and `[setup.checklist]` data supplies
+the explanation and expected files.
 
 ## Design constraints
 
@@ -142,18 +111,11 @@ actions are code, never shell commands from game data.
 
 Structured errors contain a stable code, stage, affected relative path when applicable,
 short message, technical details, and recovery actions. A versioned job journal records
-job ID, game, source identity/record, recipe identity, mode (`automatic` or `assisted`),
-stage, validated inputs/outputs and errors. Assisted journals also persist the owned
-drop-folder identity and checklist item identities. Settled verification results are
-recomputed on resume; only an explicit Continue after all required items verify advances
-to building. Stages are `inspecting`, `discovering`,
-`preparing`, `extracting`, `copying`, `validating`, `building`, `publishing`,
-`cleaning`, `waiting_for_input`, `cancelling_assisted`, `complete`, `failed`, and
-`cancelled`. The checklist
-record declares required and optional items with stable IDs, purpose, accepted forms,
-and acquisition guidance. Assisted item states are `missing`, `settling`, `checking`,
-`verified`, `wrong_version`, or `unreadable`; automatic and assisted modes share the
-same validators.
+job ID, game, source identity/record, recipe identity, stage, validated inputs/outputs
+and errors. Stages are `inspecting`, `discovering`, `preparing`, `extracting`,
+`copying`, `validating`, `building`, `publishing`, `cleaning`, `complete`, `failed`,
+and `cancelled`. The checklist record declares required and optional items with stable
+IDs, purpose, accepted forms, and acquisition guidance for the manual instructions.
 
 The versioned `installation.json` is the installed-folder contract. It records game ID;
 a stable profile ID stored in the manifest and used as the key beneath the OS user-data
@@ -196,11 +158,11 @@ under the new contract.
 - [x] Describe preparation with a stable identifier, applicability conditions,
   user-facing explanation, required inputs or tools, and validated outputs. Keep complex
   actions in explicit helpers, not shell strings in TOML.
-- [x] Describe the assisted-mode checklist per game: required and optional items, their
-  identities, and how each is obtained. This feeds Step 6.
+- [x] Describe preparation guidance per game: required and optional items, their
+  identities, and how each is obtained. This feeds the inspection guidance.
 - [x] Black & White: record the evidence-backed stock 1.2 executable identity and the
   1.42 supported target. The installed-folder route is supported; installer and disc
-  media stay assisted. Exact patch order and content deltas remain unverified, so guidance
+  media remain manual. Exact patch order and content deltas remain unverified, so guidance
   stays manual and makes no sufficiency claim (Step 6 and Step 9).
 - [x] Civilization IV: the recipe-pinned `msxml3.dll` is read and hash-checked by the
   loader. A matching copy exists in the inspected sibling game folder, but its
@@ -298,7 +260,7 @@ No app or build was run; importing a real ZIP remains unverified.
   sample before claiming coverage.
 
 Completion: supported inputs converge on one validated installation candidate, and
-unsupported inputs produce an actionable explanation or route to assisted mode.
+unsupported inputs produce an actionable explanation or manual preparation guidance.
 
 ## Step 5 Make jobs journaled and recoverable
 
@@ -328,7 +290,7 @@ exercised end to end.
   volumes, unsupported formats, permissions, space and failed tools. Keep hashes and
   process output in expandable details.
 - [x] Offer recovery actions: Choose another copy, Locate missing file, Change
-  destination, Recheck preparation, Retry failed stage, and Open log.
+  destination, Retry failed stage, and Open log.
 - [ ] Budget simultaneous extraction, copying, build outputs, dependency builds and
   retained backups. Enforce limits during extraction, not only in preflight.
 - [ ] Give cancellation a bounded process-tree shutdown with escalation. Lock the
@@ -343,32 +305,12 @@ exercised end to end.
 Completion: interruption leaves either the previous usable app or an explicitly
 recoverable installation, and each next action states what it will do.
 
-## Step 6 Implement assisted mode
+## Step 6 Assisted mode (removed)
 
-Depends on Steps 1, 2 and 5. Implements the requirements in "Assisted mode requirements".
-
-- [x] Add the waiting-for-input stage to the job model and journal, and persist the
-  drop-folder identity with it.
-- [x] Generate the drop folder and the plain-text checklist from the game's checklist
-  definition (Step 2). Include the exact path and the expected layout.
-- [ ] Preserve the Black & White installed-folder route and assisted media route. Keep
-  patch guidance manual and limited to the pinned 1.42 target; do not claim a verified
-  patch order, content deltas or sufficiency. Retain the limitation if evidence is absent.
-- [x] Implement the folder watcher with settle detection, per-item states, and
-  validation through the same validators as the automatic path.
-- [x] Gate the build on Continue, which is enabled only when all required items verify.
-  Run every preparation step that does not need the drop folder before the gate.
-- [x] Implement FAIL results with per-item structured errors and recovery actions.
-- [x] Implement resume-after-restart with full revalidation, and cancel with ownership
-  checks.
-- [ ] Enforce the isolation rules: no writes to the user's source, no execution of drop
-  folder content, and size, count and containment budgets.
-
-Completion: a user can supply content by hand, see exactly what is missing, and reach
-OK or a clear FAIL without the library ever starting a build on unverified input.
-Backend and desktop UI changes compile; runtime folder-watcher, restart, and cancellation
-exercises remain for Step 9. Strict filesystem quotas are outside this milestone; the
-current build-output ceiling is best-effort and does not cover global compiler caches.
+The prepared-folder subsystem was removed on 2026-10-20. The library no longer creates
+a job-owned preparation folder, watches copied files, or resumes a waiting preparation
+job. Manual preparation guidance and validation remain available through the normal
+source inspection path.
 
 ## Step 7 Publish a movable game folder and sidecars
 
@@ -437,15 +379,14 @@ checkout/build references; this does not establish runtime portability.
   picker differences kept behind the same discovery flow.
 - [x] Show what was found: game, version and status, source location, required
   preparation, and destination. Show successful tool checks compactly.
-- [x] Show extra preparation only when it applies, with a supported automated action or
-  clear manual instructions followed by reinspection. Offer assisted mode here, and
-  preserve the user's choices when going back.
+- [x] Show extra preparation only when it applies, with clear manual instructions
+  followed by reinspection. Preserve the user's choices when going back.
 - [x] Preview the final game folder, explain that sources are preserved, and show the
   estimated peak and available space per affected volume before Install.
 - [x] Make destination selection explicit: a parent directory versus the final game
   folder. Show the exact resulting path before confirmation.
 - [x] Provide keyboard access, sensible focus changes and restrained accessible status
-  announcements, as set out in the assisted-mode requirements.
+  announcements.
 
 Completion: users understand their copy's status and their options before any build
 tool is involved. Library and windowed app builds, Python/JavaScript syntax, game
@@ -464,14 +405,14 @@ dependency audit passed. No app launches or tests were run.
   one search root.
 - [ ] With user permission before any app runs, exercise installed folders, direct
   executable selection, GOG multipart inputs, InstallShield media, disc images, archives,
-  nested inputs, multiple candidates and assisted mode end to end.
+  nested inputs and multiple candidates end to end.
 - [ ] Check Black & White version guidance and Civ IV preparation and parent data against
   actual supported inputs. Verify the Black & White official/fan patch sequence and
   content deltas if evidence permits; otherwise preserve the manual-only limitation.
   Claim adapter coverage only with evidence.
 - [ ] Exercise missing files and tools, unsupported versions, low space, cancellation,
-  restart recovery during assisted mode, failed updates, interruption at each
-  publication step, and cleanup failure, without risking user sources.
+  restart recovery, failed updates, interruption at each publication step, and cleanup
+  failure, without risking user sources.
 - [ ] Move and rename a finished game folder. Launch the game and Configure directly
   without library involvement, then reattach it. Make the old source and build paths
   unavailable, clear path overrides, and launch from an unrelated working directory.
@@ -514,9 +455,8 @@ binaries were added; their bundling and notices remain part of unfinished Step 4
 Keep this plan for the holistic review while earlier implementation and runtime
 validation items remain open.
 
-Cleanup review (2026-10-17): fixed assisted Continue, recovery actions and nested
-layout validation; interrupted assisted builds return to preparation for fresh
-validation and explicit Continue. Rebuilds require the installed original copy.
+Cleanup review (2026-10-20): removed the assisted preparation folder and its
+recovery actions. Rebuilds require the installed original copy.
 Space estimates no longer hash payloads, validated retries retain build outputs,
 and game recipe identities exclude library UI inputs. Native launchers share path
 checks; runtime launch validation no longer depends on installer ownership records.

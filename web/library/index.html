@@ -41,28 +41,7 @@
       <p id="selected-source" class="selected" hidden></p>
       <p id="copy-result-help"></p>
       <div id="inspection" hidden></div>
-      <div class="buttons actions"><button id="inspection-back" class="back">Back</button><button id="inspection-cancel" hidden>Cancel inspection</button><button id="choose-another">Choose another copy</button><button id="assisted-with-source" hidden>Set up preparation folder</button><button id="review-copy" class="primary" hidden>Continue</button></div>
-    </section>
-    <section id="preparation-plan" hidden>
-      <h3>Prepare files outside this app</h3>
-      <p>Use this folder to collect extracted game files. The library will check them before building.</p>
-      <ol class="preparation-instructions">
-        <li>Install your copy on Windows, or extract it with a compatible tool.</li>
-        <li>Create a preparation folder with a checklist of required files.</li>
-        <li>Copy the files there, keeping their folder structure. We’ll check them as you copy.</li>
-      </ol>
-      <div class="buttons actions"><button id="preparation-back" class="back">Back</button><button id="create-preparation" class="primary">Create preparation folder</button></div>
-    </section>
-    <section id="assisted" hidden>
-      <h3>Copy your game files</h3>
-      <p id="assisted-help" class="muted">Copy the extracted files here, keeping their folder structure.</p>
-      <p class="preparation-folder"> <code id="assisted-path" tabindex="0"></code> <button id="copy-assisted-path">Copy path</button> <button id="open-assisted-folder">Open folder</button></p>
-      <details><summary>Full file checklist</summary><pre id="assisted-checklist"></pre></details>
-      <div id="assisted-items"></div>
-      <p id="assisted-summary" class="muted"></p>
-      <p id="assisted-status" class="sr-only" role="status" aria-live="polite"></p>
-      <details><summary>Preparation options</summary><p class="muted">Back keeps these files. Discard preparation deletes these copies.</p><div class="buttons"><button id="assisted-recheck">Check files again</button><button id="assisted-cancel">Discard preparation</button></div></details>
-      <div class="buttons actions"><button id="assisted-back" class="back">Back</button><button id="assisted-continue" class="primary" disabled>Build game</button></div>
+      <div class="buttons actions"><button id="inspection-back" class="back">Back</button><button id="inspection-cancel" hidden>Cancel inspection</button><button id="choose-another">Choose another copy</button><button id="review-copy" class="primary" hidden>Continue</button></div>
     </section>
     <section id="job" aria-live="polite" hidden>
       <h3 id="stage"></h3><p id="job-duration" class="muted">This can take several minutes or longer.</p><p id="stage-help" class="muted"></p><progress id="progress" max="1"></progress><p id="current" class="muted"></p>

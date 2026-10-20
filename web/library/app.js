@@ -14,7 +14,6 @@ const descriptions = {
 const cardActions = { ready: "View installed game →", notInstalled: "Choose game files →", needsBuild: "Continue setup →", busy: "View setup →", unavailable: "Not available yet" };
 const gigabytes = (bytes) => `${(bytes / 1e9).toFixed(1).replace(".", ",")} GB`;
 let currentScreen = null;
-let preparationRoute = false;
 let hasInspection = false;
 let busy = false;
 let checking = false;
@@ -39,18 +38,6 @@ let activeJobId = "";
 let failedJobId = "";
 let inspecting = false;
 let inspectionRevision = 0;
-let assistedJob = null;
-let assistedSessionId = "";
-let assistedPollTimer = null;
-let assistedPollInFlight = false;
-let assistedPollPromise = null;
-let assistedRevision = 0;
-let assistedAnnouncement = "";
-let assistedItemSignature = "";
-let assistedItemStates = new Map();
-let assistedStatusText = "";
-let assistedWasReady = false;
-let assistedCanContinue = false;
 
 function message(text) {
   const target = element(element("installer").open ? "install-message" : "message");
@@ -92,9 +79,6 @@ function lock(value) {
   element("review-copy").disabled = busy || checking || inspecting || !inspectionReady || !candidateCanInstall || !candidateId;
   element("install").disabled = busy || checking || inspecting || !checksReady || !preflightReady || !inspectionReady || !candidateCanInstall || !candidateId || !source || !destination;
   element("pick-destination").disabled = busy || checking || inspecting;
-  element("assisted-continue").disabled = busy || assistedPollInFlight || !assistedCanContinue;
-  element("assisted-recheck").disabled = busy || !assistedJob;
-  element("assisted-cancel").disabled = busy || !assistedJob;
 }
 
 function renderRecovery() {
@@ -107,15 +91,13 @@ function renderRecovery() {
     const row = document.createElement("article");
     row.className = "recovery-job";
     const heading = document.createElement("strong");
-    heading.textContent = job.mode === "assisted" ? "Preparation in progress" : "Installation interrupted";
+    heading.textContent = "Installation interrupted";
     const status = document.createElement("p");
     const latestError = job.error || job.errors?.at(-1);
-    row.classList.toggle("current-failure", Boolean(latestError || job.validationError));
-    status.textContent = job.validationError || latestError?.message || (job.canResume
+    row.classList.toggle("current-failure", Boolean(latestError));
+    status.textContent = latestError?.message || (job.canResume
       ? "Continue from the saved files."
       : "This installation needs attention before it can continue.");
-    if (job.mode === "assisted") status.textContent = job.validationError ||
-      "Your preparation folder and copied files are still available.";
     const destinationPath = document.createElement("p");
     destinationPath.textContent = job.destination || "";
     row.append(heading, status, destinationPath);
@@ -136,19 +118,15 @@ function renderRecovery() {
     const secondary = document.createElement("div");
     secondary.className = "buttons recovery-actions";
     const savedSource = document.createElement("p");
-    savedSource.textContent = `Source: ${job.source?.path || job.sourceReference?.path || "Not selected"}`;
+    savedSource.textContent = `Source: ${job.source?.path || "Not selected"}`;
     more.append(moreLabel, savedSource, secondary);
     const available = new Set(job.actions || []);
     const choices = [
-      ["resume_preparation", "Resume preparation", () => resumePreparation(job)],
       ["retry_failed_stage", "Try again", () => retrySavedJob(job)],
       ["locate_missing_file", "Locate game files", () => locateSource(job)],
-      ["recheck_preparation", "Check files", () => recheckPreparation(job)],
       ["choose_another_copy", "Choose other files", chooseAnotherCopy],
       ["change_destination", "Change install location", () => changeDestination(job)],
       ["open_log", "View log", () => openJobLog(job)],
-      ["open_assisted_folder", "Open folder", () => backend.openAssistedFolder(selected.id, job.jobId)],
-      ["cancel_assisted_job", "Discard preparation", () => cancelAssisted(job)],
     ];
     let hasPrimary = false;
     for (const [action, label, handler] of choices) {
@@ -156,7 +134,7 @@ function renderRecovery() {
       const button = document.createElement("button");
       button.textContent = label;
       button.onclick = () => attempt(handler);
-      if (!hasPrimary && action !== "cancel_assisted_job") {
+      if (!hasPrimary) {
         button.className = "primary";
         actions.append(button);
         hasPrimary = true;
@@ -214,8 +192,6 @@ function renderInspection(result) {
     element("copy-result-title").textContent = title;
     element("copy-result-help").textContent = help;
     element("review-copy").hidden = !ready;
-    element("assisted-with-source").hidden = ready || !media && !candidate;
-    element("assisted-with-source").classList.remove("primary");
     element("choose-another").classList.toggle("primary", !ready);
     element("choose-another").textContent = media ? "Choose extracted game files" : "Choose game files";
     const primary = ready ? "review-copy" : "choose-another";
@@ -298,7 +274,6 @@ function renderInspection(result) {
 
 async function inspectSource(path) {
   hasInspection = false;
-  preparationRoute = false;
   const revision = ++inspectionRevision;
   const selectedGame = selected?.id;
   source = path;
@@ -315,7 +290,6 @@ async function inspectSource(path) {
   element("copy-result-title").textContent = "Checking selected files…";
   element("copy-result-help").textContent = "Identifying the files and verifying the game version.";
   element("review-copy").hidden = true;
-  element("assisted-with-source").hidden = true;
   message("");
   inspecting = true;
   step(4);
@@ -352,15 +326,12 @@ async function inspectSource(path) {
 
 function step(index, installing = false) {
   currentScreen = index;
-  if (index === 1 || index === 4) preparationRoute = false;
-  for (const [i, name] of ["requirements", "source", "job", "ready", "copy-result", "preparation-plan", "assisted"].entries()) element(name).hidden = i !== index;
+  for (const [i, name] of ["requirements", "source", "job", "ready", "copy-result"].entries()) element(name).hidden = i !== index;
   element("recovery").hidden = index !== 1 || busy || !selected?.recoverableJobs?.length;
   element("setup").hidden = true;
   element("steps").hidden = index === 3 || (index === 2 && ["play", "log"].includes(lastAction));
   const needsAttention = index === 4 && !inspecting;
-  const timeline = preparationRoute
-    ? [[1, "Choose copy"], [4, "Check copy"], [5, "Prepare files"], [6, "Collect files"], [2, "Install"]]
-    : [[1, "Choose copy"], ...(needsAttention ? [[4, "Check copy"]] : []), [0, "Review"], [2, "Install"]];
+  const timeline = [[1, "Choose copy"], ...(needsAttention ? [[4, "Check copy"]] : []), [0, "Review"], [2, "Install"]];
   const activeScreen = index === 4 && inspecting ? 1 : index;
   const active = timeline.findIndex(([screen]) => screen === activeScreen);
   element("steps").replaceChildren(...timeline.map(([screen, label], i) => {
@@ -379,15 +350,14 @@ function step(index, installing = false) {
   element("choose-source").textContent = source ? "Change copy…" : navigator.platform.includes("Mac") ? "Choose files or folder" : "Choose game file";
   element("source-forward").hidden = !source;
   element("source-forward").textContent = hasInspection ? candidateCanInstall && inspectionReady ? "Continue to review" : "View copy details" : "Check this copy";
-  element("create-preparation").textContent = assistedJob ? "Return to preparation folder" : "Create preparation folder";
   if (index === 3) {
     element("installed-location").textContent = `Installed in ${destination}`;
     element("update-note").hidden = !selected?.updateAvailable;
   }
   if (index === 1) {
     element(source ? "source-forward" : "choose-source").focus();
-  } else if ([0, 4, 5, 6].includes(index)) {
-    const heading = element(["requirements", "source", "job", "ready", "copy-result", "preparation-plan", "assisted"][index]).querySelector("h3");
+  } else if ([0, 4].includes(index)) {
+    const heading = element(["requirements", "source", "job", "ready", "copy-result"][index]).querySelector("h3");
     heading.tabIndex = -1;
     heading.focus();
   }
@@ -417,11 +387,7 @@ async function refresh() {
 }
 
 async function openGame(game) {
-  preparationRoute = false;
   hasInspection = false;
-  stopAssistedPolling();
-  assistedJob = null;
-  assistedCanContinue = false;
   selected = game;
   failedJobId = "";
   activeJobId = "";
@@ -526,8 +492,6 @@ async function checkRequirements() {
 }
 
 async function chooseDroppedPath(path) {
-  stopAssistedPolling();
-  assistedJob = null;
   resumeJob = null;
   await inspectSource(path);
 }
@@ -617,247 +581,6 @@ async function changeDestination(job) {
   lock(false);
 }
 
-async function recheckPreparation(job) {
-  const path = source || job.source?.path;
-  if (!path) throw new Error("Choose the missing game source before checking preparation.");
-  const result = await inspectSource(path);
-  if (!result) return;
-  if (job.candidateId && result.candidates?.some((item) => item.installable && item.id === job.candidateId)) {
-    resumeJob = job;
-    candidateId = job.candidateId;
-    source = path;
-    destination = job.destination;
-    element("destination").value = destination;
-  } else {
-    resumeJob = null;
-    const candidate = result.candidates?.find((item) => item.id === job.candidateId);
-    const issue = candidate?.diagnostics?.find((item) => item.severity === "error");
-    if (issue) message(issue.message);
-  }
-}
-
-function stopAssistedPolling() {
-  assistedRevision++;
-  assistedSessionId = "";
-  assistedCanContinue = false;
-  assistedPollInFlight = false;
-  if (assistedPollTimer) clearTimeout(assistedPollTimer);
-  assistedPollTimer = null;
-}
-
-async function pauseAssistedPolling() {
-  const sessionId = assistedSessionId;
-  const pending = assistedPollPromise;
-  const wasBusy = busy;
-  if (assistedPollTimer) clearTimeout(assistedPollTimer);
-  assistedPollTimer = null;
-  checking = true;
-  lock(wasBusy);
-  stopAssistedPolling();
-  if (pending) await pending;
-  return sessionId;
-}
-
-function showAssisted() {
-  preparationRoute = true;
-  step(6);
-  lock(false);
-}
-
-async function loadAssistedDetails(job, revision) {
-  const details = await backend.query({ action: "assisted_path", game: selected.id, jobId: job.jobId });
-  if (revision !== assistedRevision || assistedJob?.jobId !== job.jobId) return;
-  element("assisted-path").textContent = details.dropFolder;
-  element("assisted-checklist").textContent = details.checklistText || "The generated checklist is unavailable. Open the drop folder to inspect it.";
-  if (details.validationError) {
-    assistedCanContinue = false;
-    element("assisted-summary").textContent = details.validationError;
-    element("assisted-summary").classList.add("preparation-error");
-    element("assisted-status").textContent = details.validationError;
-  }
-}
-
-async function pollAssisted(revision) {
-  if (revision !== assistedRevision || !assistedJob || assistedPollInFlight || busy) return;
-  assistedPollInFlight = true;
-  lock(false);
-  const requestSession = assistedSessionId;
-  assistedPollPromise = (async () => { try {
-    const result = await backend.query({ action: "assisted_status", game: selected.id,
-      jobId: assistedJob.jobId, sessionId: requestSession });
-    if (revision !== assistedRevision || requestSession !== assistedSessionId) return;
-    assistedCanContinue = Boolean(result.canContinue);
-    const itemList = result.items || [];
-    const signature = JSON.stringify(itemList);
-    if (signature !== assistedItemSignature) {
-      const items = element("assisted-items");
-      const expanded = new Set([...items.querySelectorAll("details[open]")].map((node) => node.dataset.itemId));
-      items.replaceChildren();
-      for (const item of itemList) {
-        const row = document.createElement("article");
-        const title = document.createElement("strong");
-        title.textContent = `${item.path} · ${item.status.replaceAll("_", " ")}${item.required ? "" : " (optional)"}`;
-        const detail = document.createElement("p");
-        detail.textContent = item.message;
-        row.append(title, detail);
-        if (item.diagnostic) {
-          const error = document.createElement("details");
-          error.dataset.itemId = item.id;
-          error.open = expanded.has(item.id);
-          const label = document.createElement("summary");
-          label.textContent = item.diagnostic.code;
-          const info = document.createElement("pre");
-          info.textContent = JSON.stringify(item.diagnostic.details || {}, null, 2);
-          error.append(label, info);
-          row.append(error);
-        }
-        items.append(row);
-      }
-      assistedItemSignature = signature;
-    }
-    let itemAnnouncement = "";
-    for (const item of itemList) {
-      const old = assistedItemStates.get(item.id);
-      if (item.status !== old && ["verified", "wrong_version", "unreadable"].includes(item.status)) {
-        itemAnnouncement = `${item.path}: ${item.status.replace("_", " ")}.`;
-        break;
-      }
-    }
-    assistedItemStates = new Map(itemList.map((item) => [item.id, item.status]));
-    const requiredVerified = itemList.filter((item) => item.required).every((item) => item.status === "verified");
-    const candidateProblem = requiredVerified ? result.diagnostics?.find((item) => item.message)?.message : "";
-    const verified = itemList.filter((item) => item.required && item.status === "verified").length;
-    const required = itemList.filter((item) => item.required).length;
-    const message = result.recipeChanged ? "Build tools changed. Choose Check files again in Preparation options." :
-      result.canContinue ? "All required files are ready. You can build the game." :
-      candidateProblem || `${verified} of ${required} required files ready. ${result.checking ? "Checking copied files…" : "Copy the remaining files into the folder above."}`;
-    element("assisted-summary").classList.remove("preparation-error");
-    element("assisted-summary").textContent = message;
-    if (itemAnnouncement) {
-      assistedStatusText = itemAnnouncement;
-    } else if (result.recipeChanged && message !== assistedAnnouncement) {
-      assistedStatusText = message;
-    } else if (result.canContinue && !assistedWasReady) {
-      assistedStatusText = message;
-    }
-    if (assistedStatusText && element("assisted-status").textContent !== assistedStatusText)
-      element("assisted-status").textContent = assistedStatusText;
-    assistedWasReady = Boolean(result.canContinue);
-    assistedAnnouncement = message;
-    if (result.checklist) element("assisted-checklist").textContent = result.checklist;
-    lock(false);
-  } catch (error) {
-    if (revision === assistedRevision) {
-      assistedCanContinue = false;
-      const text = errorText(error);
-      element("assisted-summary").textContent = text;
-      element("assisted-summary").classList.add("preparation-error");
-      if (element("assisted-status").textContent !== text) element("assisted-status").textContent = text;
-      lock(false);
-    }
-  } finally {
-    if (revision === assistedRevision) {
-      assistedPollInFlight = false;
-      lock(false);
-      if (assistedJob) assistedPollTimer = setTimeout(() => pollAssisted(revision), 1000);
-    }
-  } })();
-  await assistedPollPromise;
-  assistedPollPromise = null;
-}
-
-async function resumePreparation(job) {
-  stopAssistedPolling();
-  assistedJob = job;
-  assistedSessionId = crypto.randomUUID();
-  assistedAnnouncement = "";
-  assistedItemSignature = "";
-  assistedItemStates = new Map();
-  assistedStatusText = "";
-  assistedWasReady = false;
-  assistedCanContinue = false;
-  const revision = assistedRevision;
-  showAssisted();
-  element("assisted-items").replaceChildren();
-  element("copy-assisted-path").textContent = "Copy path";
-  element("assisted-summary").classList.remove("preparation-error");
-  element("assisted-summary").textContent = "Checking files…";
-  element("assisted-status").textContent = "Starting a fresh preparation check for this session…";
-  await loadAssistedDetails(job, revision);
-  void pollAssisted(revision);
-}
-
-async function startAssisted(reference = "") {
-  if (busy || checking || inspecting) return;
-  const selectedGame = selected?.id;
-  if (!selectedGame) return;
-  checking = true;
-  lock(true);
-  stopAssistedPolling();
-  assistedJob = null;
-  const request = { action: "assisted_start", game: selectedGame };
-  if (reference) request.source = reference;
-  if (destination) request.destination = destination;
-  try {
-    const result = await backend.query(request);
-    if (selected?.id !== selectedGame) return;
-    await refresh();
-    const job = selected?.recoverableJobs?.find((item) => item.jobId === result.jobId)
-      || { jobId: result.jobId, mode: "assisted", stage: "waiting_for_input", destination: result.destination };
-    await resumePreparation(job);
-  } finally {
-    checking = false;
-    lock(false);
-  }
-}
-
-async function continueAssisted() {
-  if (!assistedJob || !assistedCanContinue || !assistedSessionId) return;
-  const job = assistedJob;
-  const game = selected.id;
-  const sessionId = await pauseAssistedPolling();
-  if (selected?.id !== game || assistedJob?.jobId !== job.jobId) {
-    checking = false;
-    lock(busy);
-    return;
-  }
-  checking = false;
-  lock(busy);
-  await start({ action: "install", mode: "assisted", game, jobId: job.jobId,
-    continue: true, sessionId });
-}
-
-async function cancelAssisted(job = assistedJob) {
-  if (!job) return;
-  const game = selected.id;
-  const previousJob = assistedJob;
-  await pauseAssistedPolling();
-  try {
-    const result = await backend.cancelAssisted(game, job.jobId);
-    if (selected?.id !== game) return;
-    if (!result?.state) {
-      await resumePreparation(previousJob || job);
-      return;
-    }
-    if (previousJob && previousJob.jobId !== job.jobId) {
-      await resumePreparation(previousJob);
-      return;
-    }
-    assistedJob = null;
-    assistedCanContinue = false;
-    element("assisted").hidden = true;
-    await refresh();
-    message("The job-owned preparation folder was removed. The selected source was left unchanged.");
-    step(1);
-  } catch (error) {
-    if (selected?.id === game) await resumePreparation(previousJob || job);
-    throw error;
-  } finally {
-    checking = false;
-    lock(busy);
-  }
-}
-
 async function openJobLog(job) {
   lastAction = "log";
   element("job").classList.remove("job-failed");
@@ -882,7 +605,7 @@ async function start(request) {
   lock(true);
   message("");
   lines = [];
-  lastAction = request.mode === "assisted" ? "assisted" : request.action;
+  lastAction = request.action;
   activeJobId = request.jobId || "";
   step(2);
   element("job").classList.remove("job-failed");
@@ -964,12 +687,12 @@ function jobEvent(event) {
       element("progress").hidden = true;
       element("current").hidden = true;
       element("stage-help").textContent = errorText(event.outcome.diagnostic || event.outcome.message);
-      element("retry").textContent = lastAction === "assisted" ? "Return to preparation" : "Try again";
+      element("retry").textContent = "Try again";
       element("retry").hidden = false;
       element("retry").classList.toggle("primary", selected?.state !== "ready");
       message("");
     } else {
-      if (lastAction === "install" || lastAction === "assisted") { selected.state = "ready"; selected.updateAvailable = false; }
+      if (lastAction === "install") { selected.state = "ready"; selected.updateAvailable = false; }
       step(3);
       if (lastAction === "play") element("installer").close();
     }
@@ -983,7 +706,6 @@ function jobEvent(event) {
 
 function close() {
   if (busy || checking || inspecting) return;
-  stopAssistedPolling();
   checkRevision++;
   element("installer").close();
 }
@@ -1040,44 +762,6 @@ element("inspection-back").onclick = () => {
   lock(false);
 };
 element("review-back").onclick = () => { message(""); step(1); };
-element("preparation-back").onclick = () => { message(""); step(hasInspection ? 4 : 1); };
-element("assisted-back").onclick = () => attempt(async () => {
-  await pauseAssistedPolling();
-  checking = false;
-  message("");
-  step(5);
-  lock(false);
-});
-element("assisted-with-source").onclick = () => {
-  preparationRoute = true;
-  message("");
-  step(5);
-};
-element("create-preparation").onclick = () => attempt(() => assistedJob ? resumePreparation(assistedJob) : startAssisted(source));
-element("assisted-recheck").onclick = () => attempt(async () => {
-  if (!assistedJob) return;
-  const job = assistedJob;
-  const game = selected.id;
-  await pauseAssistedPolling();
-  try {
-    await backend.query({ action: "assisted_recheck", game, jobId: job.jobId });
-    if (selected?.id === game && assistedJob?.jobId === job.jobId) await resumePreparation(job);
-  } catch (error) {
-    if (selected?.id === game && assistedJob?.jobId === job.jobId) await resumePreparation(job);
-    throw error;
-  } finally {
-    checking = false;
-    lock(busy);
-  }
-});
-element("assisted-cancel").onclick = () => attempt(() => cancelAssisted());
-element("assisted-continue").onclick = () => attempt(continueAssisted);
-element("open-assisted-folder").onclick = () => attempt(() => backend.openAssistedFolder(selected.id, assistedJob.jobId));
-element("copy-assisted-path").onclick = () => attempt(async () => {
-  const value = element("assisted-path").textContent;
-  try { await navigator.clipboard.writeText(value); element("copy-assisted-path").textContent = "Copied"; element("assisted-status").textContent = "Folder path copied."; }
-  catch { message("Select the folder path above and copy it manually."); element("assisted-path").focus(); element("assisted-path").select?.(); }
-});
 element("install").onclick = () => attempt(() => {
   const request = { action: "install", game: selected.id, source, candidateId, destination };
   if (resumeJob && source === resumeJob.source?.path && destination === resumeJob.destination && candidateId === resumeJob.candidateId) request.jobId = resumeJob.jobId;
@@ -1101,7 +785,6 @@ element("retry").onclick = () => attempt(async () => {
   if (lastAction === "play") { message(""); step(3); return; }
   if (failedJobId) {
     const saved = selected?.recoverableJobs?.find((job) => job.jobId === failedJobId);
-    if (saved?.mode === "assisted") return resumePreparation(saved);
     if (saved?.canResume) return retrySavedJob(saved);
     if (saved) throw new Error("This saved job needs a different recovery action. Choose it in Saved installation before retrying.");
   }
@@ -1126,13 +809,12 @@ element("settings").onclick = () => {
   source = "";
   element("install-title").textContent = "Recomp Toolkit settings";
   element("installer").showModal();
-  for (const name of ["steps", "requirements", "source", "job", "ready", "copy-result", "preparation-plan"]) element(name).hidden = true;
+  for (const name of ["steps", "requirements", "source", "job", "ready", "copy-result"]) element(name).hidden = true;
   element("setup").hidden = false;
-  element("assisted").hidden = true;
   element("recovery").hidden = true;
   message("");
 };
-element("installer").addEventListener("close", () => { stopAssistedPolling(); element("steps").hidden = false; });
+element("installer").addEventListener("close", () => { element("steps").hidden = false; });
 element("save").onclick = () => attempt(async () => {
   await backend.save({ kit: element("kit").value.trim(), python: element("python").value.trim() });
   await refresh();
@@ -1150,7 +832,7 @@ await attempt(async () => {
   await backend.listen(jobEvent);
   window.__TAURI__?.event.listen("tauri://drag-drop", ({ payload }) => {
     const path = payload?.paths?.[0];
-    if (path && selected && element("installer").open && !busy && !checking && !inspecting && element("assisted").hidden) attempt(() => chooseDroppedPath(path));
+    if (path && selected && element("installer").open && !busy && !checking && !inspecting) attempt(() => chooseDroppedPath(path));
   });
   const settings = await backend.settings();
   element("kit").value = settings.kit;

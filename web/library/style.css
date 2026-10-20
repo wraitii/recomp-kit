@@ -57,8 +57,6 @@ dialog::backdrop { background: #060e23cc; }
 a { color: var(--accent); }
 pre { max-height: 230px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.6 ui-monospace, monospace; background: var(--bg); padding: 14px; border-radius: 8px; user-select: text; }
 .actions .back { margin-right: auto; }
-.preparation-instructions { padding-left: 22px; }
-.preparation-instructions li { margin: 12px 0; }
 .actions { justify-content: flex-end; margin-top: 16px; }
 .version-requirement { margin: 0 0 4px; font-size: 14px; color: var(--muted); }
 .version-requirement strong { color: var(--text); font-weight: 600; }
@@ -94,15 +92,6 @@ input { min-width: 0; flex: 1; color: var(--text); background: var(--bg); border
 @media (max-width: 760px) { #games { grid-template-columns: repeat(2, minmax(0, 1fr)); } header, main { padding: 16px; } header { flex-wrap: wrap; gap: 12px; } dialog { padding: 22px; } }
 @media (max-width: 480px) { #games { grid-template-columns: 1fr; } }
 @media (prefers-reduced-motion: reduce) { .game { transition: none; } }
-#assisted-items { display: grid; gap: .5rem; margin-block: 1rem; }
-#assisted-items article { border: 1px solid var(--line); border-radius: .5rem; padding: .75rem; }
-#assisted-items article p { margin: .25rem 0 0; }
-#assisted-path { overflow-wrap: anywhere; user-select: all; }
-#assisted-checklist { max-height: 18rem; overflow: auto; white-space: pre-wrap; }
 
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
 .job-failed #stage { color: #f2aaa2; border-left: 3px solid #d9756b; padding-left: 12px; }
-.preparation-folder { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.preparation-folder code { flex-basis: 100%; }
-
-#assisted-summary.preparation-error { color: #f2aaa2; }

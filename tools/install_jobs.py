@@ -29,13 +29,12 @@ MAX_MONITOR_ENTRIES = 200000
 MAX_MONITOR_DEPTH = 128
 RECIPE_DIRS = ("runtime", "dx", "host", "platform", "mods", "graphics", "cmake", "third_party")
 RECIPE_FILES = ("CMakeLists.txt", "CMakePresets.json")
-RECIPE_TOOL_EXCLUDES = {"assisted_install.py", "build_library.py", "check_game_literals.py",
+RECIPE_TOOL_EXCLUDES = {"build_library.py", "check_game_literals.py",
                         "check_repo.py", "format.py", "install_jobs.py", "ios_logs.py",
                         "setup.py", "source_inspection.py", "test.py", "zip_adapter.py", "inno_adapter.py"}
 IGNORED_PARTS = {".git", "__pycache__", ".pytest_cache", "tests", "test", ".venv"}
 JOURNAL_STAGES = {"inspecting", "discovering", "preparing", "extracting", "copying", "validating",
-                  "building", "publishing", "cleaning", "waiting_for_input", "cancelling_assisted",
-                  "complete", "failed", "cancelled"}
+                  "building", "publishing", "cleaning", "complete", "failed", "cancelled"}
 
 
 class JobError(ValueError):
@@ -334,8 +333,7 @@ def _check_owned_dir(path, expected_parent, identifier, create=False, token=None
     return path
 
 
-def create_job(destination, game_id, source, source_identity, recipe_identity, candidate_id, attempt=1,
-               mode="automatic"):
+def create_job(destination, game_id, source, source_identity, recipe_identity, candidate_id, attempt=1):
     identifier = job_id()
     job_paths = paths(destination, identifier)
     job_paths["meta"].mkdir(parents=True, exist_ok=True)
@@ -348,7 +346,7 @@ def create_job(destination, game_id, source, source_identity, recipe_identity, c
     journal = {"schema": SCHEMA, "jobId": identifier, "gameId": game_id,
                "destination": str(job_paths["root"]), "source": source,
                "sourceIdentity": source_identity, "recipeIdentity": recipe_identity,
-               "candidateId": candidate_id, "attempt": attempt, "mode": mode,
+               "candidateId": candidate_id, "attempt": attempt,
                "stage": "inspecting", "validatedInputs": {}, "validatedOutputs": {},
                "errors": [], "log": f".recomp-toolkit/logs/{identifier}-{attempt}.log",
                "owned": {"staging": f"staging-{identifier}", "backup": f"backup-{identifier}"},
@@ -373,7 +371,7 @@ def load_job(destination, identifier):
     if job_paths["staging"].exists():
         _check_owned_dir(job_paths["staging"], job_paths["meta"], identifier,
                          token=journal.get("ownedTokens", {}).get("staging"))
-    elif journal.get("stage") not in {"failed", "cancelled", "publishing", "cleaning", "complete", "cancelling_assisted"}:
+    elif journal.get("stage") not in {"failed", "cancelled", "publishing", "cleaning", "complete"}:
         raise JobError("missing_job_staging", "The job staging folder is missing.")
     if job_paths["backup"].exists():
         _check_owned_dir(job_paths["backup"], job_paths["meta"], identifier,
