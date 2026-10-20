@@ -4,10 +4,15 @@
 #include "game_config.h"
 #include "../../platform/os.h"
 #include "../../runtime/layout.h"
+#include "../../runtime/installation_manifest.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <string>
+
+InstallationManifest installation_manifest_for_process() {
+    return {};
+}
 
 static int g_checks = 0, g_failures = 0;
 #define CHECK(x)                                                                                   \

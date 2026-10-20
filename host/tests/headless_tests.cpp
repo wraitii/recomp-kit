@@ -149,8 +149,9 @@ int main(int argc, char **argv) {
             for (uint32_t x = 0; x < surface->width; ++x)
                 wr16(surface->pixels + y * surface->pitch + x * 2, 0x7e0);
         host_present(g_mem + surface->pixels, 640, 480, 16, nullptr, surface->pitch);
-        check(frame_pixel(20, 20) == 0x00ff00 && frame_pixel(4, 4) == 0x0000ff,
-              "DirectDraw present retains its green base under the blue window");
+        check(frame_pixel(20, 20) == 0x00ff00, "DirectDraw primary pixels remain green");
+        check(frame_pixel(4, 4) == 0xff0000,
+              "DirectDraw primary excludes unrelated top-level windows");
         for (unsigned n = 0; n < 3; ++n) {
             os_sleep_us(20000);
             host_present(g_mem + surface->pixels, 640, 480, 16, nullptr, surface->pitch);

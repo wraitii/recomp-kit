@@ -88,12 +88,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
-            preset: linux-stub
-            labels: "nogame|gpu" # lavapipe supplies the Vulkan device
-          - os: windows-2025
-            preset: windows-stub
-            labels: nogame
           - os: macos-15
             preset: ios-stub
             labels: none

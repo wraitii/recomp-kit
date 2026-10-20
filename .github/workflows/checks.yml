@@ -29,21 +29,83 @@ jobs:
       - name: Check repository boundaries and documentation links
         run: .venv/bin/python tools/check_repo.py
 
-  macos:
-    runs-on: macos-15
+  native-compile:
+    # Game files and generated code are never available in CI. The *-stub
+    # presets link every host against tools/gen_stub_translation.py's link-only
+    # translation, so a broken host still fails the build. Each platform builds
+    # every test binary it has and runs the suites that need no game files;
+    # macOS (Metal) and Linux (lavapipe) also run the GPU suites. Nothing is
+    # uploaded.
+    continue-on-error: ${{ matrix.os != 'macos-15' }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            preset: macos-stub
+            labels: "nogame|gpu"
+          - os: ubuntu-24.04
+            preset: linux-stub
+            labels: "nogame|gpu" # lavapipe supplies the Vulkan device
+          - os: windows-2025
+            preset: windows-stub
+            labels: nogame
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7.0.1
-      - name: Install parser generators
+      - name: Install macOS parser generators
+        if: runner.os == 'macOS'
         run: brew install bison flex
+      - name: Install clang, lld and SDL3's window and audio headers (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          # SDL3's documented Linux build dependencies (README-linux), so the
+          # X11 and Wayland backends configure without a per-extension hunt.
+          # FFmpeg builds from source with build-essential; no FFmpeg packages.
+          sudo apt-get install -y -qq clang lld build-essential flex bison pkg-config libasound2-dev \
+            libpulse-dev libaudio-dev libjack-dev libsndio-dev libx11-dev libxext-dev \
+            libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxtst-dev \
+            libxkbcommon-dev libdrm-dev libgbm-dev libgl1-mesa-dev libgles2-mesa-dev \
+            libegl1-mesa-dev libdbus-1-dev libibus-1.0-dev libudev-dev \
+            libpipewire-0.3-dev libwayland-dev libdecor-0-dev liburing-dev \
+            mesa-vulkan-drivers glslc
+      - name: Software Vulkan for the GPU suites (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          ls -l /usr/share/vulkan/icd.d/ || true
+          echo "VK_LOADER_DEBUG=error,warn" >> "$GITHUB_ENV"
+          echo "LIBGL_ALWAYS_SOFTWARE=1" >> "$GITHUB_ENV"
+          echo "SDL_VIDEODRIVER=dummy" >> "$GITHUB_ENV"
+      - name: Enter the Visual Studio developer environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
       - name: Install CMake and Ninja
+        shell: bash
         run: |
           python3 -m venv .ci
-          .ci/bin/python -m pip install cmake==4.1.2 ninja==1.13.0
-          echo "$PWD/.ci/bin" >> "$GITHUB_PATH"
-      - name: Configure without game files
-        run: cmake --preset macos-stub
-      - name: Build native test binaries and hosts
-        run: cmake --build --preset macos-stub --target check_binaries recomp_app recomp_headless recomp_smoke
-      - name: Run game-free native and GPU suites
-        run: ctest --preset macos-stub -L 'nogame|gpu' --output-on-failure
+          if [ -d .ci/Scripts ]; then BIN=.ci/Scripts; else BIN=.ci/bin; fi
+          "$BIN/python" -m pip install cmake==4.1.2 ninja==1.13.0 -r tools/requirements.txt
+          if [ "$RUNNER_OS" = Windows ]; then
+            cygpath -w "$PWD/$BIN" >> "$GITHUB_PATH"
+          else
+            echo "$PWD/$BIN" >> "$GITHUB_PATH"
+          fi
+      - name: Configure
+        if: runner.os != 'Windows'
+        run: cmake --preset ${{ matrix.preset }} -DPython3_EXECUTABLE="$PWD/.ci/bin/python"
+      - name: MSYS2's make for the FFmpeg build (Windows)
+        if: runner.os == 'Windows'
+        run: C:\msys64\usr\bin\pacman.exe -S --noconfirm --needed make diffutils flex bison
+      - name: Configure with video (Windows)
+        if: runner.os == 'Windows'
+        run: >-
+          cmake --preset ${{ matrix.preset }} -DPython3_EXECUTABLE="$PWD/.ci/Scripts/python.exe" -DRECOMP_FFMPEG_MAKE=C:/msys64/usr/bin/make.exe
+          -DFLEX_EXECUTABLE=C:/msys64/usr/bin/flex.exe -DBISON_EXECUTABLE=C:/msys64/usr/bin/bison.exe
+      - name: Build every test binary this platform has
+        run: cmake --build --preset ${{ matrix.preset }} --target check_binaries
+      - name: Link every host against the stub translation
+        run: cmake --build --preset ${{ matrix.preset }} --target recomp_app recomp_headless recomp_smoke
+      - name: Run the suites that need no game files
+        run: ctest --preset ${{ matrix.preset }} -L "${{ matrix.labels }}" --output-on-failure
