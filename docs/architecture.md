@@ -218,7 +218,9 @@ than correctness.
 transfer, grouped by how it resolved: `known` (translated function table), `module`
 (another module's table), `shim` (Win32 import), `region` (decoded region), `interp`
 (interpreted), `thunk`, and `unknown`. It is written at exit, so quit the game
-normally to keep it.
+normally to keep it. Developer builds include this support by default;
+`tools/build.py --no-observe` compiles it out. Games built through the desktop
+app use this option.
 
 ## Current boundaries
 
