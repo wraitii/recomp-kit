@@ -90,7 +90,7 @@ if(WIN32)
   if(NOT MINGW)
     file(WRITE "${VKD3D_SHADER_GENERATED}/unistd.h" "#include <io.h>\n")
   endif()
-  target_compile_definitions(vkd3d_shader PRIVATE HAVE__STRTOF_L)
+  target_compile_definitions(vkd3d_shader PRIVATE HAVE__STRTOF_L _USE_MATH_DEFINES)
 elseif(APPLE)
   target_compile_definitions(vkd3d_shader PRIVATE HAVE_STRTOF_L HAVE_XLOCALE_H HAVE_PTHREAD_H
     _DARWIN_C_SOURCE)
