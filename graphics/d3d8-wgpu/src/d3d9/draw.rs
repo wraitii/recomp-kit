@@ -632,7 +632,7 @@ impl GeometryData {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct LayoutAttribute {
     format: wgpu::VertexFormat,
     offset: u32,
@@ -2509,11 +2509,12 @@ impl D3d9DrawState {
         let ms = started.elapsed().as_secs_f64() * 1000.0;
         if trace_compilation() || ms >= 50.0 || result.is_err() {
             eprintln!(
-                "[d3d9-compile] pipeline-end frame={} recipe={recipe:016x} sources={sources:x?} layout={layout:x?} ms={ms:.3} ok={} cached={} buffers={:016x} target={:?} primitive={:?} depth={:?} multisample={:?}",
+                "[d3d9-compile] pipeline-end frame={} recipe={recipe:016x} sources={sources:x?} layout={layout:x?} ms={ms:.3} ok={} cached={} buffers={:016x} vertex_layouts={:?} target={:?} primitive={:?} depth={:?} multisample={:?}",
                 self.frame,
                 result.is_ok(),
                 self.pipelines.len(),
                 fingerprint(&key.buffers),
+                key.buffers,
                 key.target,
                 key.primitive,
                 key.depth,
