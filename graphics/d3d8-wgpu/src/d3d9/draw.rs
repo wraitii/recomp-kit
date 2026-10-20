@@ -26,6 +26,31 @@ fn fingerprint(value: &impl Hash) -> u64 {
     hasher.finish()
 }
 
+fn trace_selected(frame: u64, frame_draw: u32, total_draw: u64) -> bool {
+    static WINDOW: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    let window = WINDOW.get_or_init(|| {
+        let start = std::env::var("RECOMP_D3D9_TRACE_FRAME_START")
+            .ok()?
+            .parse::<u64>()
+            .ok()?;
+        let count = std::env::var("RECOMP_D3D9_TRACE_FRAME_COUNT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(2);
+        Some((start, start.saturating_add(count)))
+    });
+    if let Some((start, end)) = window {
+        frame >= *start && frame < *end && frame_draw < super::trace_draw_limit()
+    } else {
+        total_draw < u64::from(super::trace_draw_limit())
+    }
+}
+
+fn trace_readback() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("RECOMP_D3D9_TRACE_READBACK").is_ok_and(|v| v == "1"))
+}
+
 pub const D3DPT_POINTLIST: u32 = 1;
 pub const D3DPT_LINELIST: u32 = 2;
 pub const D3DPT_LINESTRIP: u32 = 3;
@@ -798,7 +823,7 @@ fn native_geometry(
         D3DPT_TRIANGLESTRIP => wgpu::PrimitiveTopology::TriangleStrip,
         _ => return Ok(None),
     };
-    if !command.indexed || linked.is_empty() || super::trace_enabled() {
+    if !command.indexed || linked.is_empty() {
         return Ok(None);
     }
     let mut streams = std::mem::take(&mut draw.native_streams);
@@ -2209,6 +2234,9 @@ pub(crate) struct D3d9DrawState {
     geometry: FastMap<usize, CachedGeometry>,
     geometry_seen: FastMap<usize, (Weak<Vec<u8>>, u64)>,
     frame: u64,
+    trace_frame_draw: u32,
+    trace_total_draw: u64,
+    trace_shaders: std::collections::BTreeSet<u32>,
     upload: Option<wgpu::Buffer>,
     bind_groups: FastMap<BindGroupKey, wgpu::BindGroup>,
     bind_group_scratch: Vec<wgpu::BindGroup>,
@@ -2247,6 +2275,7 @@ impl D3d9DrawState {
 
     pub(crate) fn end_frame(&mut self) {
         self.frame += 1;
+        self.trace_frame_draw = 0;
     }
 
     pub(crate) fn discard_batch(&mut self) {
@@ -2837,9 +2866,7 @@ fn resolve_shading(
         ShaderVariantKey {
             pixel: false,
             shader: ShaderOrigin::DeclaredFixedFunction,
-            state: KeyWords::from_slice(&[
-                key[0], key[1], key[2], key[3], key[4], rs(state, 9),
-            ]),
+            state: KeyWords::from_slice(&[key[0], key[1], key[2], key[3], key[4], rs(state, 9)]),
         }
     } else {
         fixed_function_key(false, state, &snapshot.textures)
@@ -3097,120 +3124,225 @@ pub(crate) fn execute(
             };
             (None, vertices, order, draw_indices, topology)
         };
+    let trace_this = super::trace_enabled()
+        && trace_selected(draw.frame, draw.trace_frame_draw, draw.trace_total_draw);
+    let count = draw.trace_total_draw;
     if super::trace_enabled() {
-        static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count < super::trace_draw_limit() && (count < 24 || count % 61 == 0) {
-            eprintln!("[d3d9-trace] indices={:?}", &order[..order.len().min(12)]);
-            for stream in &snapshot.command.streams {
+        draw.trace_frame_draw = draw.trace_frame_draw.saturating_add(1);
+        draw.trace_total_draw = draw.trace_total_draw.saturating_add(1);
+    }
+    if trace_this {
+        let command = &snapshot.command;
+        eprintln!(
+            "[d3d9-trace] begin frame={} draw={count} frame_draw={} primitive={} primitives={} indexed={} base_vertex={} start_vertex={} min_vertex={} num_vertices={} index_format={} index_bytes={} index_hash={:016x} target={:?} subresource={:?} depth={:?} native={}",
+            draw.frame,
+            draw.trace_frame_draw - 1,
+            command.primitive,
+            command.primitive_count,
+            command.indexed,
+            command.base_vertex,
+            command.start_vertex,
+            command.min_vertex,
+            command.num_vertices,
+            command.index_format,
+            command.index_bytes.len(),
+            fingerprint(&command.index_bytes),
+            snapshot.target.view,
+            snapshot.target.subresource,
+            snapshot
+                .depth
+                .as_ref()
+                .map(|d| (&d.view, d.width, d.height, d.format)),
+            native_geometry.is_some()
+        );
+        for (pixel, shader) in [(false, vs), (true, ps)] {
+            if let Some(shader) = shader {
+                let id = state.shader(pixel);
                 eprintln!(
-                    "[d3d9-trace] stream={} offset={} stride={} sample={:?}",
-                    stream.stream,
-                    stream.offset,
-                    stream.stride,
-                    stream
-                        .bytes
-                        .get(
-                            stream.offset as usize
-                                ..stream.bytes.len().min(stream.offset as usize + 96)
-                        )
-                        .unwrap_or(&[])
+                    "[d3d9-trace] shader pixel={pixel} id={id} code_hash={:016x} constants={}",
+                    fingerprint(&shader.code),
+                    shader.program.const_limit()
                 );
-            }
-            eprintln!(
-                "[d3d9-trace] draw={} target={}x{} format={} viewport={:?} vs={} ps={} declaration={:?}",
-                count,
-                snapshot.target.width,
-                snapshot.target.height,
-                snapshot.target.format,
-                [
-                    state.viewport().x as f32,
-                    state.viewport().y as f32,
-                    state.viewport().width as f32,
-                    state.viewport().height as f32,
-                    state.viewport().min_z,
-                    state.viewport().max_z
-                ],
-                state.shader(false),
-                state.shader(true),
-                declaration
-            );
-            for id in [7, 14, 15, 19, 20, 22, 23, 24, 25, 27, 137, 162, 168, 174] {
-                eprintln!("[d3d9-trace] rs[{id}]={}", rs(state, id));
-            }
-            for texture in &snapshot.textures {
-                if texture.stage >= 8 {
+                if draw.trace_shaders.insert(id) {
                     eprintln!(
-                        "[d3d9-trace] sampler={} id={} size={}x{} format={} lod={}",
-                        texture.stage,
-                        state.texture(texture.stage)?,
-                        texture.width,
-                        texture.height,
-                        texture.format,
-                        texture.lod
+                        "[d3d9-trace] shader_code id={id} words={:08x?}\n[d3d9-trace] shader_wgsl id={id}\n{}",
+                        shader.code, shader.wgsl
                     );
-                    continue;
                 }
+            }
+            let constants = state.constants_f(
+                pixel,
+                0,
+                if pixel {
+                    super::state::PS_CONST_F
+                } else {
+                    super::state::VS_CONST_F
+                } as u32,
+            )?;
+            eprintln!(
+                "[d3d9-trace] constants pixel={pixel} hash={:016x}",
+                fingerprint(&bytemuck::cast_slice::<f32, u32>(&constants))
+            );
+            for (register, value) in constants.chunks_exact(4).enumerate() {
+                if value.iter().any(|v| v.to_bits() != 0) {
+                    eprintln!("[d3d9-trace] constant pixel={pixel} c{register}={value:?}");
+                }
+            }
+        }
+        eprintln!("[d3d9-trace] indices={:?}", &order[..order.len().min(12)]);
+        if let Some(geometry) = &native_geometry {
+            eprintln!(
+                "[d3d9-trace] native layouts={:?} topology={:?} index_offset={} index_size={} base_vertex={} count={}",
+                geometry.layouts,
+                geometry.topology,
+                geometry.index_offset,
+                geometry.index_size,
+                geometry.base_vertex,
+                geometry.count
+            );
+            let samples =
+                primitive_vertex_count(command.primitive, command.primitive_count)?.min(6);
+            for index in command.start_vertex..command.start_vertex.saturating_add(samples) {
+                let raw = indexed_vertex_index(
+                    &command.index_bytes,
+                    command.index_format,
+                    index as usize,
+                );
+                let absolute = (i64::from(raw) + i64::from(command.base_vertex)) as u32;
+                for element in linked.into_iter().flatten() {
+                    let stream = stream_for(command, u32::from(element.stream))?;
+                    let Some(size) = element_size(element.element_type) else {
+                        continue;
+                    };
+                    let bytes = vertex_element_bytes(
+                        &stream.bytes,
+                        stream.stream,
+                        stream.stride,
+                        stream.offset,
+                        u64::from(element.offset),
+                        size as usize,
+                        absolute,
+                    )?;
+                    eprintln!(
+                        "[d3d9-trace] fetched raw_index={raw} vertex={absolute} location={} value={:?}",
+                        element.location,
+                        expand_element(element.element_type, bytes)?
+                    );
+                }
+            }
+        }
+        for stream in &snapshot.command.streams {
+            eprintln!(
+                "[d3d9-trace] stream={} bytes={} hash={:016x}",
+                stream.stream,
+                stream.bytes.len(),
+                fingerprint(&stream.bytes)
+            );
+            eprintln!(
+                "[d3d9-trace] stream={} offset={} stride={} sample={:?}",
+                stream.stream,
+                stream.offset,
+                stream.stride,
+                stream
+                    .bytes
+                    .get(
+                        stream.offset as usize..stream.bytes.len().min(stream.offset as usize + 96)
+                    )
+                    .unwrap_or(&[])
+            );
+        }
+        eprintln!(
+            "[d3d9-trace] draw={} target={}x{} format={} viewport={:?} vs={} ps={} declaration={:?}",
+            count,
+            snapshot.target.width,
+            snapshot.target.height,
+            snapshot.target.format,
+            [
+                state.viewport().x as f32,
+                state.viewport().y as f32,
+                state.viewport().width as f32,
+                state.viewport().height as f32,
+                state.viewport().min_z,
+                state.viewport().max_z
+            ],
+            state.shader(false),
+            state.shader(true),
+            declaration
+        );
+        for id in [7, 14, 15, 19, 20, 22, 23, 24, 25, 27, 137, 162, 168, 174] {
+            eprintln!("[d3d9-trace] rs[{id}]={}", rs(state, id));
+        }
+        for texture in &snapshot.textures {
+            if texture.stage >= 8 {
                 eprintln!(
-                    "[d3d9-trace] stage={} id={} size={}x{} format={} lod={} color_op={} color_args={}/{} alpha_op={} alpha_args={}/{}",
+                    "[d3d9-trace] sampler={} id={} size={}x{} format={} lod={}",
                     texture.stage,
                     state.texture(texture.stage)?,
                     texture.width,
                     texture.height,
                     texture.format,
-                    texture.lod,
-                    tss(state, texture.stage, 1),
-                    tss(state, texture.stage, 2),
-                    tss(state, texture.stage, 3),
-                    tss(state, texture.stage, 4),
-                    tss(state, texture.stage, 5),
-                    tss(state, texture.stage, 6)
+                    texture.lod
                 );
-                eprintln!(
-                    "[d3d9-trace] stage={} coord_index={:#x} transform_flags={:#x} matrix={:?} address={:?}",
-                    texture.stage,
-                    tss(state, texture.stage, 11),
-                    tss(state, texture.stage, 24),
-                    state.transform(16 + texture.stage)?,
-                    [
-                        ss(state, texture.stage, 1),
-                        ss(state, texture.stage, 2),
-                        ss(state, texture.stage, 3)
-                    ]
-                );
+                continue;
             }
             eprintln!(
-                "[d3d9-trace] vertex_stride={} packed_bytes={}",
-                vertices.stride,
-                vertices.bytes.len()
+                "[d3d9-trace] stage={} id={} size={}x{} format={} lod={} color_op={} color_args={}/{} alpha_op={} alpha_args={}/{}",
+                texture.stage,
+                state.texture(texture.stage)?,
+                texture.width,
+                texture.height,
+                texture.format,
+                texture.lod,
+                tss(state, texture.stage, 1),
+                tss(state, texture.stage, 2),
+                tss(state, texture.stage, 3),
+                tss(state, texture.stage, 4),
+                tss(state, texture.stage, 5),
+                tss(state, texture.stage, 6)
             );
-            for vertex in vertices
-                .bytes
-                .chunks((vertices.stride as usize).max(1))
-                .take(6)
-            {
-                let values = if let Some(linked) = &linked {
-                    linked
-                        .iter()
-                        .zip(&vertices.attributes)
-                        .map(|(input, attribute)| {
-                            let element_type = if native_vertex_format(input.element_type).is_some()
-                            {
-                                input.element_type
-                            } else {
-                                D3DDECLTYPE_FLOAT4
-                            };
-                            expand_element(element_type, &vertex[attribute.offset as usize..])
-                        })
-                        .collect::<Result<Vec<_>, _>>()?
-                } else {
-                    vertex
-                        .chunks_exact(16)
-                        .map(|bytes| expand_element(D3DDECLTYPE_FLOAT4, bytes))
-                        .collect::<Result<Vec<_>, _>>()?
-                };
-                eprintln!("[d3d9-trace] vertex={values:?}");
-            }
+            eprintln!(
+                "[d3d9-trace] stage={} coord_index={:#x} transform_flags={:#x} matrix={:?} address={:?}",
+                texture.stage,
+                tss(state, texture.stage, 11),
+                tss(state, texture.stage, 24),
+                state.transform(16 + texture.stage)?,
+                [
+                    ss(state, texture.stage, 1),
+                    ss(state, texture.stage, 2),
+                    ss(state, texture.stage, 3)
+                ]
+            );
+        }
+        eprintln!(
+            "[d3d9-trace] vertex_stride={} packed_bytes={}",
+            vertices.stride,
+            vertices.bytes.len()
+        );
+        for vertex in vertices
+            .bytes
+            .chunks((vertices.stride as usize).max(1))
+            .take(6)
+        {
+            let values = if let Some(linked) = &linked {
+                linked
+                    .iter()
+                    .zip(&vertices.attributes)
+                    .map(|(input, attribute)| {
+                        let element_type = if native_vertex_format(input.element_type).is_some() {
+                            input.element_type
+                        } else {
+                            D3DDECLTYPE_FLOAT4
+                        };
+                        expand_element(element_type, &vertex[attribute.offset as usize..])
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                vertex
+                    .chunks_exact(16)
+                    .map(|bytes| expand_element(D3DDECLTYPE_FLOAT4, bytes))
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            eprintln!("[d3d9-trace] vertex={values:?}");
         }
     }
     let target_key = (snapshot.target.texture.format(), snapshot.target.format);
@@ -3358,6 +3490,18 @@ pub(crate) fn execute(
         state.constants_f_bytes(true, memo.ps_count)?,
         &psp,
     ];
+    if trace_this {
+        eprintln!(
+            "[d3d9-trace] submit frame={} draw={count} vs_count={} ps_count={} uniform_hashes={:016x?} depth={:?} blend={:?} packed_vertex_hash={:016x}",
+            draw.frame,
+            memo.vs_count,
+            memo.ps_count,
+            uniform_values.map(|v| self::fingerprint(&v)),
+            depth_state(state, snapshot.depth.as_ref())?,
+            blend_state(state, opaque_format(snapshot.target.format))?,
+            self::fingerprint(&vertices.bytes)
+        );
+    }
     let alignment = gpu.limits().min_uniform_buffer_offset_alignment.max(1) as usize;
     let uniform_sizes = uniform_values.map(|bytes| bytes.len() as u64);
     let shared_for = |batch: &DrawBatch| -> [Option<u32>; 4] {
@@ -3609,14 +3753,9 @@ pub(crate) fn execute(
     if draw.batch.data.len() >= 32 << 20 {
         flush(gpu, draw, queries)?;
     }
-    if super::trace_enabled() {
+    if trace_this && trace_readback() {
         flush(gpu, draw, queries)?;
-        static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count < super::trace_draw_limit()
-            && (count < 24 || count % 61 == 0)
-            && matches!(snapshot.target.format, 21 | 22)
-        {
+        if matches!(snapshot.target.format, 21 | 22 | 32) {
             let mut pixels =
                 vec![0; snapshot.target.width as usize * snapshot.target.height as usize * 4];
             match gpu.read_texture(

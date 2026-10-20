@@ -134,6 +134,15 @@ hashes derived from sources/layout/state, timings and cache sizes. Matching
 recipe hashes expose recompilation across cache clears; missing source/layout
 metadata is reported as `None`.
 
+`RECOMP_D3D9_TRACE=1` logs draw state, shader bytecode/WGSL, constant values,
+buffer hashes and decoded vertex samples. `RECOMP_D3D9_TRACE_FRAME_START=<n>`
+selects a frame window; `RECOMP_D3D9_TRACE_FRAME_COUNT=<n>` defaults to 2 and
+`RECOMP_D3D9_TRACE_DRAWS=<n>` limits draws per frame in that window (default 24).
+Without a frame window, the limit applies to the first draws across all frames.
+Tracing preserves native geometry submission; `RECOMP_D3D9_TRACE_READBACK=1`
+additionally flushes selected draws and logs the target's nonblack pixel count.
+Readback changes GPU synchronization; leave it off for the initial capture.
+
 ## Supported slice and remaining work
 
 Full-target color/depth/stencil clears, material/light storage, render/texture-stage
