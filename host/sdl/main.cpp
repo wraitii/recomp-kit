@@ -212,8 +212,17 @@ HostWindowSize viewport_window_size_for(int gw, int gh) {
 // guest threads that ask (host_display_screen_size): the fullscreen window
 // itself, which keeps clear of a camera notch, or else the window's display.
 std::atomic<int> g_screen_w{0}, g_screen_h{0};
+std::atomic<double> g_screen_refresh_rate{60.0};
 void note_screen_size() {
     SDL_DisplayID display = g_window ? SDL_GetDisplayForWindow(g_window) : SDL_GetPrimaryDisplay();
+    double refresh_rate = 0.0;
+    int mode_count = 0;
+    SDL_DisplayMode **modes = SDL_GetFullscreenDisplayModes(display, &mode_count);
+    if (modes) {
+        for (int i = 0; i < mode_count; ++i)
+            refresh_rate = std::max(refresh_rate, double(modes[i]->refresh_rate));
+        SDL_free(modes);
+    }
     int w = 0, h = 0;
     if (g_window && (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN)) {
         if (!SDL_GetWindowSize(g_window, &w, &h))
@@ -226,11 +235,16 @@ void note_screen_size() {
         }
     }
     if (const SDL_DisplayMode *mode = SDL_GetDesktopDisplayMode(display)) {
+        refresh_rate = std::max(refresh_rate, double(mode->refresh_rate));
         const int pw = int(std::lround(mode->w * mode->pixel_density));
         const int ph = int(std::lround(mode->h * mode->pixel_density));
         if (pw > 0 && ph > 0)
             host_display_set_screen(pw, ph);
     }
+    if (refresh_rate <= 1.0)
+        refresh_rate = 60.0;
+    if (g_screen_refresh_rate.exchange(refresh_rate) != refresh_rate)
+        fprintf(stderr, "[host] display maximum refresh rate %.3f Hz\n", refresh_rate);
     if (w <= 0 || h <= 0)
         return;
     g_screen_w.store(w);
@@ -2572,4 +2586,8 @@ extern "C" int host_display_screen_size(int *w, int *h) {
     // Never a portrait screen: the game's image goes above the controls.
     host_landscape_screen_size(sw, sh, w, h);
     return 1;
+}
+
+extern "C" double host_display_refresh_rate() {
+    return g_screen_refresh_rate.load();
 }

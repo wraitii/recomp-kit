@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <initializer_list>
 #include <cstdlib>
+#include <cmath>
 
 #define MAKE_D3DHRESULT(code) (0x88760000u | (uint32_t)(code))
 static const uint32_t D3D_OK9 = 0u;
@@ -375,7 +376,7 @@ static recomp::d3d::D3d9DisplayMode d3d9_current_display_mode() {
     recomp::d3d::D3d9DisplayMode mode{};
     mode.width = w;
     mode.height = h;
-    mode.refresh_rate = 0;
+    mode.refresh_rate = (uint32_t)std::lround(host_display_refresh_rate());
     mode.format = d3d9_display_format(bpp);
     return mode;
 }
@@ -393,7 +394,7 @@ static void add_display_mode(std::vector<recomp::d3d::D3d9DisplayMode> &modes, u
     recomp::d3d::D3d9DisplayMode mode{};
     mode.width = w;
     mode.height = h;
-    mode.refresh_rate = 0;
+    mode.refresh_rate = (uint32_t)std::lround(host_display_refresh_rate());
     mode.format = d3d9_display_format(32);
     modes.push_back(mode);
 }
@@ -421,7 +422,9 @@ d3d9_device_display_mode(const recomp::d3d::D3d9PresentParams &present) {
     recomp::d3d::D3d9DisplayMode mode{};
     mode.width = present.width;
     mode.height = present.height;
-    mode.refresh_rate = present.fullscreen_refresh_rate;
+    mode.refresh_rate = present.fullscreen_refresh_rate
+                            ? present.fullscreen_refresh_rate
+                            : (uint32_t)std::lround(host_display_refresh_rate());
     mode.format = d3d9_display_format(32);
     return mode;
 }

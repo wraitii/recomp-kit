@@ -12,6 +12,7 @@ uint32_t host_display_elements(uint64_t *ids, uint32_t max);
 float host_display_aspect(void);
 /* The screen the window lives on, in pixels; 0 when unknown. */
 int host_display_screen(int32_t *w, int32_t *h);
+double host_display_refresh_rate(void);
 void host_display_set_screen(int32_t w, int32_t h);
 uint64_t host_display_epoch(void);
 int host_display_offer_mode(int w, int h, int bpp);
