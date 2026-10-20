@@ -11,6 +11,10 @@
 CTest labels: `nogame`, `game`, `gpu`, `device`, `mods`. Run a subset with
 `ctest --test-dir <build root>/cmake/macos -L nogame` or `-R dx_tests`.
 
+Push and pull-request CI checks portable tooling and macOS stub builds, including
+the game-free native and GPU suites. Windows, Linux, Android and iOS checks remain
+available through the manually dispatched `Experimental platform checks` workflow.
+
 `d3d8_surface_tests` (`gpu`) exercises the backbuffer descriptor, texture
 levels and staging, vtable calling convention, identity, bounds and
 device/factory ownership through guest COM dispatch. Its devices are

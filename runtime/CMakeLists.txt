@@ -46,7 +46,7 @@ endif()
 if(NOT IOS AND NOT ANDROID)
 set(ENTRY_FIXTURE_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/entry-fixture)
 set(ENTRY_FIXTURE_SOURCES
-  ${ENTRY_FIXTURE_DIR}/chunk_0d000000_14.c
+  ${ENTRY_FIXTURE_DIR}/fixture_body.c
   ${ENTRY_FIXTURE_DIR}/chunk_entries_0d000000.c
   ${ENTRY_FIXTURE_DIR}/fixture_table.c)
 add_custom_command(

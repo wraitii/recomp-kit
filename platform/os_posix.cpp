@@ -2,6 +2,8 @@
 // third_party/ that may include a POSIX or Mach header besides os_win32.cpp.
 #include "os.h"
 
+#include <string>
+
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -40,7 +42,6 @@
 #include <CoreServices/CoreServices.h>
 #include <dispatch/dispatch.h>
 #include <atomic>
-#include <string>
 #endif
 #endif
 #ifndef MAP_ANON
