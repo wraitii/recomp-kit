@@ -120,6 +120,15 @@ both stage bindings (texture id or unbound), `RECOMP_D3D8_TRACE_DRAWS_START=<n>`
 skips that many draws first, and `RECOMP_D3D8_TRACE_STAGE1=1` restricts the trace
 to draws with a stage-1 texture bound.
 
+D3D9 logs shader-module and pipeline creation taking at least 50 ms, plus
+shader/layout/pipeline cache clears, to stderr with the `[d3d9-compile]` prefix.
+`RECOMP_D3D9_TRACE_PIPELINES=1` also logs every pipeline miss before and after
+compilation, every module creation, and shader variants. Records include frame
+numbers, source hashes and byte counts (vertex then pixel), pipeline recipe
+hashes derived from sources/layout/state, timings and cache sizes. Matching
+recipe hashes expose recompilation across cache clears; missing source/layout
+metadata is reported as `None`.
+
 ## Supported slice and remaining work
 
 Full-target color/depth/stencil clears, material/light storage, render/texture-stage

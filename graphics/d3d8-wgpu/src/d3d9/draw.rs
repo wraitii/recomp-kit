@@ -4,12 +4,27 @@ use super::shader::VertexElement;
 use super::state::{D3d9State, MAX_ANISOTROPY, MAX_SAMPLERS};
 use super::{SurfaceView, TargetRect, wgsl};
 use crate::RenderError;
-use crate::fast_map::FastMap;
+use crate::fast_map::{FastHasher, FastMap};
 use smallvec::{SmallVec, smallvec};
 use std::borrow::Cow;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 mod ffvs;
+
+fn trace_compilation() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("RECOMP_D3D9_TRACE_PIPELINES").is_ok_and(|value| value == "1")
+    })
+}
+
+fn fingerprint(value: &impl Hash) -> u64 {
+    let mut hasher = FastHasher::default();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
 
 pub const D3DPT_POINTLIST: u32 = 1;
 pub const D3DPT_LINELIST: u32 = 2;
@@ -2205,7 +2220,19 @@ pub(crate) struct D3d9DrawState {
     memos: Vec<Box<DrawMemo>>,
 }
 impl D3d9DrawState {
-    pub fn clear(&mut self) {
+    fn log_cache_clear(&self, reason: &str) {
+        eprintln!(
+            "[d3d9-compile] cache-clear frame={} reason={reason} variants={} modules={} layouts={} pipelines={}",
+            self.frame,
+            self.shader_variants.len(),
+            self.shaders.len(),
+            self.layouts.len(),
+            self.pipelines.len()
+        );
+    }
+
+    fn clear(&mut self, reason: &str) {
+        self.log_cache_clear(reason);
         self.memos.clear();
         self.pipeline_memo = None;
         self.pipelines.clear();
@@ -2227,7 +2254,7 @@ impl D3d9DrawState {
     }
 
     pub(crate) fn reset(&mut self) {
-        self.clear();
+        self.clear("device-reset");
         self.discard_batch();
         self.upload = None;
         self.bind_groups.clear();
@@ -2315,6 +2342,17 @@ impl D3d9DrawState {
             return Ok(Arc::clone(source));
         }
         let source = generate()?;
+        if trace_compilation() {
+            eprintln!(
+                "[d3d9-compile] source frame={} origin={:?} pixel={} variant={:016x} source={:016x} bytes={}",
+                self.frame,
+                key.shader,
+                key.pixel,
+                fingerprint(&key),
+                fingerprint(&source),
+                source.len()
+            );
+        }
         let texture_stages = (0..16)
             .filter(|stage| source.contains(&format!("var tx{stage}:")))
             .collect();
@@ -2324,7 +2362,7 @@ impl D3d9DrawState {
             module: std::sync::OnceLock::new(),
         });
         if self.shader_variants.len() >= 512 {
-            self.clear();
+            self.clear("variant-limit-all-caches");
         }
         self.shader_variants.insert(key, Arc::clone(&cached));
         Ok(cached)
@@ -2364,6 +2402,7 @@ impl D3d9DrawState {
         if let Some(shader) = self.shaders.get(source) {
             return Ok(shader.clone());
         }
+        let started = Instant::now();
         wgsl::validate(&source)?;
         let shader = gpu.validate("Draw", || {
             Ok(gpu
@@ -2373,8 +2412,17 @@ impl D3d9DrawState {
                     source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(&source)),
                 }))
         })?;
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        if trace_compilation() || ms >= 50.0 {
+            eprintln!(
+                "[d3d9-compile] module frame={} source={:016x} bytes={} ms={ms:.3}",
+                self.frame,
+                fingerprint(&source),
+                source.len()
+            );
+        }
         if self.shaders.len() >= 512 {
-            self.clear();
+            self.clear("module-limit-all-caches");
         }
         self.shaders.insert(source.to_owned(), shader.clone());
         Ok(shader)
@@ -2398,6 +2446,7 @@ impl D3d9DrawState {
                 }))
         })?;
         if self.layouts.len() >= 128 {
+            self.log_cache_clear("layout-limit-pipelines-and-layouts");
             self.pipelines.clear();
             self.layouts.clear();
         }
@@ -2417,10 +2466,61 @@ impl D3d9DrawState {
         }
         let pipeline = match self.pipelines.get(&key) {
             Some(pipeline) => pipeline.clone(),
-            None => gpu.validate("Draw", || Ok(self.create_pipeline(gpu, key.clone())))?,
+            None => self.compile_pipeline(gpu, key.clone())?,
         };
         self.pipeline_memo = Some((key, pipeline.clone()));
         Ok(pipeline)
+    }
+
+    fn compile_pipeline(
+        &mut self,
+        gpu: &D3d9Gpu,
+        key: PipelineKey,
+    ) -> Result<wgpu::RenderPipeline, RenderError> {
+        let sources = key.modules.each_ref().map(|module| {
+            self.shaders
+                .iter()
+                .find(|(_, cached)| *cached == module)
+                .map(|(source, _)| (fingerprint(source), source.len()))
+        });
+        let layout = self
+            .layouts
+            .iter()
+            .find(|(_, cached)| *cached == &key.layout)
+            .map(|(layout, _)| fingerprint(layout));
+        let recipe = fingerprint(&(
+            sources,
+            layout,
+            &key.buffers,
+            &key.target,
+            key.primitive,
+            &key.depth,
+            key.multisample,
+        ));
+        if trace_compilation() {
+            eprintln!(
+                "[d3d9-compile] pipeline-begin frame={} recipe={recipe:016x} sources={sources:x?} layout={layout:x?} cached={}",
+                self.frame,
+                self.pipelines.len()
+            );
+        }
+        let started = Instant::now();
+        let result = gpu.validate("Draw", || Ok(self.create_pipeline(gpu, key.clone())));
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        if trace_compilation() || ms >= 50.0 || result.is_err() {
+            eprintln!(
+                "[d3d9-compile] pipeline-end frame={} recipe={recipe:016x} sources={sources:x?} layout={layout:x?} ms={ms:.3} ok={} cached={} buffers={:016x} target={:?} primitive={:?} depth={:?} multisample={:?}",
+                self.frame,
+                result.is_ok(),
+                self.pipelines.len(),
+                fingerprint(&key.buffers),
+                key.target,
+                key.primitive,
+                key.depth,
+                key.multisample
+            );
+        }
+        result
     }
 
     fn create_pipeline(&mut self, gpu: &D3d9Gpu, key: PipelineKey) -> wgpu::RenderPipeline {
@@ -2471,6 +2571,7 @@ impl D3d9DrawState {
                 cache: None,
             });
         if self.pipelines.len() >= 512 {
+            self.log_cache_clear("pipeline-limit-pipelines");
             self.pipelines.clear();
         }
         self.pipelines.insert(key, pipeline.clone());
