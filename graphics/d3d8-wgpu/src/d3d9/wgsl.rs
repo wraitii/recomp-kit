@@ -638,6 +638,7 @@ pub struct Variant {
     pub projected: u16,
     pub depth: u16,
     pub alpha: u16,
+    pub raw_inputs: u16,
 }
 
 const PRELUDE: &str = r#"diagnostic(off, derivative_uniformity);
@@ -1315,7 +1316,12 @@ impl<'a> Gen<'a> {
             s += "    @builtin(vertex_index) vid: u32,\n";
         } else {
             for i in &inputs {
-                s += &format!("    @location({i}) v{i}: vec4<f32>,\n");
+                let ty = if self.variant.raw_inputs & (1 << i) != 0 {
+                    "vec4<u32>"
+                } else {
+                    "vec4<f32>"
+                };
+                s += &format!("    @location({i}) v{i}: {ty},\n");
             }
         }
         s += "}\n";
@@ -1331,7 +1337,12 @@ impl<'a> Gen<'a> {
         s += "    var ot: array<vec4<f32>, 8>;\n";
         s += "    var vv: array<vec4<f32>, 16>;\n";
         for i in &inputs {
-            s += &format!("    vv[{i}] = vin.v{i} * vsp.ascale[{i}];\n");
+            let value = if self.variant.raw_inputs & (1 << i) != 0 {
+                format!("vec4<f32>(vin.v{i})")
+            } else {
+                format!("vin.v{i}")
+            };
+            s += &format!("    vv[{i}] = {value} * vsp.ascale[{i}];\n");
         }
         s += &self.body;
         s += "    var o: V2F;\n";

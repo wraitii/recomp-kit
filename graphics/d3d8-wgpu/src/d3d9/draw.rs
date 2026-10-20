@@ -814,6 +814,7 @@ fn native_geometry(
     draw: &mut D3d9DrawState,
     command: &DrawCommand,
     linked: &[LinkedInput],
+    allow_raw_inputs: bool,
 ) -> Result<Option<Box<NativeGeometry>>, RenderError> {
     let topology = match command.primitive {
         D3DPT_POINTLIST => wgpu::PrimitiveTopology::PointList,
@@ -829,7 +830,12 @@ fn native_geometry(
     let mut streams = std::mem::take(&mut draw.native_streams);
     streams.clear();
     for input in linked {
-        let Some(format) = native_vertex_format(input.element_type) else {
+        let format = if allow_raw_inputs && input.element_type == D3DDECLTYPE_UBYTE4 {
+            Some(wgpu::VertexFormat::Uint8x4)
+        } else {
+            native_vertex_format(input.element_type)
+        };
+        let Some(format) = format else {
             return Ok(None);
         };
         let stream_id = u32::from(input.stream);
@@ -2204,6 +2210,7 @@ const DRAW_MEMOS: usize = 16;
 struct DrawMemo {
     fingerprint: u64,
     ff_key: Option<[u32; 5]>,
+    raw_inputs: u16,
     target: (wgpu::TextureFormat, u32),
     depth: Option<(wgpu::TextureFormat, u32)>,
     textures: BoundTextures,
@@ -2655,8 +2662,10 @@ fn translated_source(
     program: &wgsl::Program,
     state: &D3d9State,
     textures: &[BoundTexture],
+    raw_inputs: u16,
 ) -> Result<String, RenderError> {
     let mut variant = wgsl::Variant::default();
+    variant.raw_inputs = raw_inputs;
     for stage in 0..16 {
         if state.texture(stage)? == 0 {
             variant.unbound |= 1 << stage;
@@ -2705,8 +2714,10 @@ fn translated_key(
     program: &wgsl::Program,
     state: &D3d9State,
     textures: &[BoundTexture],
+    raw_inputs: u16,
 ) -> Result<ShaderVariantKey, RenderError> {
     let mut variant = wgsl::Variant::default();
+    variant.raw_inputs = raw_inputs;
     for stage in 0..16 {
         if state.texture(stage)? == 0 {
             variant.unbound |= 1 << stage;
@@ -2757,6 +2768,7 @@ fn translated_key(
             u32::from(variant.projected),
             opaque,
             rs(state, 9),
+            u32::from(raw_inputs),
         ]),
     })
 }
@@ -2854,6 +2866,7 @@ fn resolve_shading(
     snapshot: &DrawSnapshot,
     target: (wgpu::TextureFormat, u32),
     depth: Option<(wgpu::TextureFormat, u32)>,
+    raw_inputs: u16,
 ) -> Result<Box<DrawMemo>, RenderError> {
     let vertex_key = if let Some(v) = vs {
         translated_key(
@@ -2861,6 +2874,7 @@ fn resolve_shading(
             &v.program,
             state,
             &snapshot.textures,
+            raw_inputs,
         )?
     } else if let Some(key) = &ff_key {
         ShaderVariantKey {
@@ -2873,7 +2887,7 @@ fn resolve_shading(
     };
     let vertex_source = draw.source(vertex_key, || {
         let source = if let Some(v) = vs {
-            translated_source(&v.program, state, &snapshot.textures)?
+            translated_source(&v.program, state, &snapshot.textures, raw_inputs)?
         } else if let Some(key) = &ff_key {
             ffvs::source(key)
         } else {
@@ -2887,13 +2901,14 @@ fn resolve_shading(
             &p.program,
             state,
             &snapshot.textures,
+            0,
         )?
     } else {
         fixed_function_key(true, state, &snapshot.textures)
     };
     let pixel_source = draw.source(pixel_key, || {
         let source = if let Some(p) = ps {
-            translated_source(&p.program, state, &snapshot.textures)?
+            translated_source(&p.program, state, &snapshot.textures, 0)?
         } else {
             ff_fragment_source(state, &snapshot.textures)?
         };
@@ -2975,6 +2990,7 @@ fn resolve_shading(
     Ok(Box::new(DrawMemo {
         fingerprint: state.pipeline_fingerprint(),
         ff_key,
+        raw_inputs,
         target,
         depth,
         textures: snapshot.textures.clone(),
@@ -3084,9 +3100,19 @@ pub(crate) fn execute(
         None => ff_key.is_some().then_some(linked_inputs.as_slice()),
     };
     let direct = linked
-        .map(|linked| native_geometry(gpu, draw, &snapshot.command, linked))
+        .map(|linked| native_geometry(gpu, draw, &snapshot.command, linked, vs.is_some()))
         .transpose()?
         .flatten();
+    let mut raw_inputs = 0u16;
+    if direct.is_some() {
+        for input in linked.into_iter().flatten() {
+            if input.element_type == D3DDECLTYPE_UBYTE4 {
+                raw_inputs |= 1u16
+                    .checked_shl(input.location)
+                    .ok_or_else(|| invalid("Draw", "raw byte vertex input location exceeds 15"))?;
+            }
+        }
+    }
     let (mut native_geometry, vertices, order, draw_indices, topology) =
         if let Some(geometry) = direct {
             let topology = geometry.topology;
@@ -3357,6 +3383,7 @@ pub(crate) fn execute(
         .rposition(|memo| {
             memo.fingerprint == fingerprint
                 && memo.ff_key == ff_key
+                && memo.raw_inputs == raw_inputs
                 && memo.target == target_key
                 && memo.depth == depth_key
                 && memo.textures == snapshot.textures
@@ -3375,6 +3402,7 @@ pub(crate) fn execute(
             &snapshot,
             target_key,
             depth_key,
+            raw_inputs,
         )?,
     };
     if snapshot.command.primitive == 1
