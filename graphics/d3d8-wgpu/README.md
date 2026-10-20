@@ -37,6 +37,9 @@ indices and base/start offsets rather than upload hints. Sparse unlit spans,
 strips/fans and diagnostic draws retain expansion; `RECOMP_D3D8_EXPAND_INDICES=1`
 forces it for comparisons. Queued vertex/index bytes and constants are immutable
 snapshots. Shaders and supported render pipelines are cached per device.
+Pixel float constant storage holds c0–c223 for uploads, readback and state blocks,
+independently of shader-model-specific bytecode limits, matching
+[DXVK's D3D9 constant storage](https://github.com/doitsujin/dxvk/blob/master/src/d3d9/d3d9_device.h).
 Buffer locks accept DISCARD/NOOVERWRITE on static buffers as ordinary writes,
 matching [Wine's D3D9 compatibility behavior](https://github.com/wine-mirror/wine/blob/master/dlls/wined3d/device.c).
 DrawIndexedPrimitiveUP supports triangle lists and fans with 16/32-bit guest

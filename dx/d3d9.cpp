@@ -32,6 +32,7 @@ static const uint32_t D3DERR_MOREDATA = MAKE_D3DHRESULT(2151);
 static const uint32_t D3DERR_DEVICELOST = MAKE_D3DHRESULT(2152);
 static const uint32_t D3DERR_DEVICENOTRESET = MAKE_D3DHRESULT(2153);
 static const uint32_t D3DOK_NOAUTOGEN = 0x08760000u | 2159u;
+static constexpr uint32_t D3D9_PIXEL_SHADER_FLOAT_CONSTANTS = 224;
 
 static uint32_t bridge_result(X86 *c, const recomp::d3d::Status &status) {
     if (status.code == recomp::d3d::StatusCode::Ok)
@@ -5727,14 +5728,16 @@ void Dev_SetVertexShaderConstantF(X86 *c) {
 void Dev_SetPixelShaderConstantF(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t start = arg(c, 1), data = arg(c, 2), count = arg(c, 3);
-    bool range_valid = count <= 32 && start <= 32 - count;
+    bool range_valid = count <= D3D9_PIXEL_SHADER_FLOAT_CONSTANTS &&
+                       start <= D3D9_PIXEL_SHADER_FLOAT_CONSTANTS - count;
     bool data_valid = !count || (count <= UINT32_MAX / 16 && data && gm_valid(data, count * 16));
     if (!dev || !dev->d3d9_device || !range_valid || !data_valid) {
         static uint32_t failures = 0;
         if (++failures == 1 || (failures & (failures - 1)) == 0)
             LOGW("d3d9: SetPixelShaderConstantF invalid upload: start=%u count=%u data=%08x "
-                 "limit=32 range_valid=%d data_valid=%d failures=%u",
-                 start, count, data, range_valid, data_valid, failures);
+                 "limit=%u range_valid=%d data_valid=%d failures=%u",
+                 start, count, data, D3D9_PIXEL_SHADER_FLOAT_CONSTANTS, range_valid, data_valid,
+                 failures);
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
@@ -6386,7 +6389,8 @@ void Dev_GetVertexShaderConstantF(X86 *c) {
 void Dev_GetPixelShaderConstantF(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t data = arg(c, 2), count = arg(c, 3);
-    if (!dev || !dev->d3d9_device || count > 32 || arg(c, 1) > 32 - count) {
+    if (!dev || !dev->d3d9_device || count > D3D9_PIXEL_SHADER_FLOAT_CONSTANTS ||
+        arg(c, 1) > D3D9_PIXEL_SHADER_FLOAT_CONSTANTS - count) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }

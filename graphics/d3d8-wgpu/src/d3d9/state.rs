@@ -11,7 +11,7 @@ pub const MAX_STREAM_STRIDE: u32 = 0xffff;
 pub const VS_CONST_F: usize = 256;
 pub const VS_CONST_I: usize = 16;
 pub const VS_CONST_B: usize = 16;
-pub const PS_CONST_F: usize = 32;
+pub const PS_CONST_F: usize = 224;
 pub const PS_CONST_I: usize = 16;
 pub const PS_CONST_B: usize = 16;
 
