@@ -52,8 +52,32 @@ jobs:
             preset: windows-stub
             labels: nogame
     runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_VERSION: ${{ matrix.preset }}
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@v7.0.1
+      - name: Set up compiler cache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: v0.18.0
+      - name: Identify dependency cache
+        id: dependency-cache-key
+        shell: bash
+        run: echo "image=$ImageVersion" >> "$GITHUB_OUTPUT"
+      - name: Restore compiled dependencies and downloads
+        id: dependencies
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            build/cmake/${{ matrix.preset }}/_deps
+            build/cmake/${{ matrix.preset }}/ffmpeg
+            build/cmake/${{ matrix.preset }}/ffmpeg-prefix
+            build/stub/recomp/*.dll
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: native-deps-v1-${{ matrix.preset }}-${{ runner.arch }}-${{ steps.dependency-cache-key.outputs.image }}-${{ hashFiles('.github/workflows/checks.yml', 'cmake/**', 'CMakeLists.txt', 'CMakePresets.json', 'graphics/d3d8-wgpu/Cargo.lock') }}
       - name: Install macOS parser generators
         if: runner.os == 'macOS'
         run: brew install bison flex
@@ -94,7 +118,9 @@ jobs:
           fi
       - name: Configure
         if: runner.os != 'Windows'
-        run: cmake --preset ${{ matrix.preset }} -DPython3_EXECUTABLE="$PWD/.ci/bin/python"
+        run: >-
+          cmake --preset ${{ matrix.preset }} -DPython3_EXECUTABLE="$PWD/.ci/bin/python"
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
       - name: MSYS2's make for the FFmpeg build (Windows)
         if: runner.os == 'Windows'
         run: C:\msys64\usr\bin\pacman.exe -S --noconfirm --needed make diffutils flex bison
@@ -103,9 +129,22 @@ jobs:
         run: >-
           cmake --preset ${{ matrix.preset }} -DPython3_EXECUTABLE="$PWD/.ci/Scripts/python.exe" -DRECOMP_FFMPEG_MAKE=C:/msys64/usr/bin/make.exe
           -DFLEX_EXECUTABLE=C:/msys64/usr/bin/flex.exe -DBISON_EXECUTABLE=C:/msys64/usr/bin/bison.exe
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
       - name: Build every test binary this platform has
         run: cmake --build --preset ${{ matrix.preset }} --target check_binaries
       - name: Link every host against the stub translation
         run: cmake --build --preset ${{ matrix.preset }} --target recomp_app recomp_headless recomp_smoke
       - name: Run the suites that need no game files
         run: ctest --preset ${{ matrix.preset }} -L "${{ matrix.labels }}" --output-on-failure
+      - name: Preserve dependency cache even after build failures
+        if: ${{ !cancelled() && steps.dependencies.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            build/cmake/${{ matrix.preset }}/_deps
+            build/cmake/${{ matrix.preset }}/ffmpeg
+            build/cmake/${{ matrix.preset }}/ffmpeg-prefix
+            build/stub/recomp/*.dll
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ steps.dependencies.outputs.cache-primary-key }}
