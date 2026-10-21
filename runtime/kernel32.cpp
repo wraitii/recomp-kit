@@ -2292,11 +2292,10 @@ void k_DeleteCriticalSection(X86 *c) {
 // -------------------------------------------------------------------------
 // Synchronisation objects (single threaded, counted)
 // -------------------------------------------------------------------------
-void k_FindFirstChangeNotificationA(X86 *c) {
-    const std::string guest = gm_str(arg(c, 0));
+void find_first_change_notification(X86 *c, const char *name, const std::string &guest) {
     const uint32_t filter = arg(c, 2);
     if (filter != 0x10) {
-        LOGW("FindFirstChangeNotificationA: unsupported filter %08x for %s", filter, guest.c_str());
+        LOGW("%s: unsupported filter %08x for %s", name, filter, guest.c_str());
         fflush(stderr);
         abort();
     }
@@ -2304,8 +2303,7 @@ void k_FindFirstChangeNotificationA(X86 *c) {
     OsDirectoryWatch *watch = os_directory_watch_create(path.c_str(), arg(c, 1) != 0, filter);
     if (!watch) {
         if (errno == ENOSYS || errno == ENOTSUP) {
-            LOGW("FindFirstChangeNotificationA: native directory watching unavailable for %s",
-                 path.c_str());
+            LOGW("%s: native directory watching unavailable for %s", name, path.c_str());
             fflush(stderr);
             abort();
         }
@@ -2317,6 +2315,14 @@ void k_FindFirstChangeNotificationA(X86 *c) {
     uint32_t handle = handle_new(H_CHANGE);
     handles()[handle].watch = std::shared_ptr<OsDirectoryWatch>(watch, os_directory_watch_close);
     set_eax(c, handle);
+}
+
+void k_FindFirstChangeNotificationA(X86 *c) {
+    find_first_change_notification(c, "FindFirstChangeNotificationA", gm_str(arg(c, 0)));
+}
+
+void k_FindFirstChangeNotificationW(X86 *c) {
+    find_first_change_notification(c, "FindFirstChangeNotificationW", gm_wstr(arg(c, 0)));
 }
 
 void k_FindNextChangeNotification(X86 *c) {
@@ -6107,6 +6113,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "ResetEvent", 1, k_ResetEvent},
     {"KERNEL32.dll", "CreateMutexA", 3, k_CreateMutexA},
     {"KERNEL32.dll", "FindFirstChangeNotificationA", 3, k_FindFirstChangeNotificationA},
+    {"KERNEL32.dll", "FindFirstChangeNotificationW", 3, k_FindFirstChangeNotificationW},
     {"KERNEL32.dll", "FindNextChangeNotification", 1, k_FindNextChangeNotification},
     {"KERNEL32.dll", "FindCloseChangeNotification", 1, k_FindCloseChangeNotification},
     {"KERNEL32.dll", "WaitForSingleObject", 2, k_WaitForSingleObject},

@@ -1691,6 +1691,7 @@ const ImportShim shims[] = {
     U("LoadAcceleratorsA", 2, load_accelerators),
     U("TranslateAcceleratorA", 3, translate_accelerator),
     U("TranslateAcceleratorW", 3, translate_accelerator),
+    U("SetWindowsHookExA", 4, set_hook),
     U("SetWindowsHookExW", 4, set_hook),
     U("UnhookWindowsHookEx", 1, unhook),
     U("CallNextHookEx", 4, zero),

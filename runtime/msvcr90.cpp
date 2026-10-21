@@ -568,6 +568,165 @@ void crt_memchr(X86 *c) {
     set_eax(c, 0);
 }
 
+void qsort_swap(uint32_t a, uint32_t b, uint32_t width) {
+    if (a == b || width == 0)
+        return;
+    for (uint32_t i = 0; i < width; ++i) {
+        uint8_t left = rd8(a + i), right = rd8(b + i);
+        wr8(a + i, right);
+        wr8(b + i, left);
+    }
+}
+
+int32_t qsort_compare(X86 *c, uint32_t compare, uint32_t a, uint32_t b) {
+    return (int32_t)guest_call(c, compare, a, b);
+}
+
+// The selection pass MSVCR90's qsort uses for runs of at most eight elements.
+void qsort_select(X86 *c, uint32_t low, uint32_t high, uint32_t width, uint32_t compare) {
+    if (high <= low)
+        return;
+    const uint32_t first = low + width;
+    do {
+        uint32_t best = low;
+        for (uint32_t at = first; at <= high; at += width)
+            if (qsort_compare(c, compare, at, best) > 0)
+                best = at;
+        qsort_swap(best, high, width);
+        high -= width;
+    } while (high > low);
+}
+
+// MSVCR90 qsort, ported from the shipped msvcr90.dll (base 0x78590000,
+// qsort 0x78594640). Its explicit stack and selection cutoff decide the order
+// of elements a comparator reports equal, which matters for the game's float
+// comparator that never returns zero.
+void crt_qsort(X86 *c) {
+    const uint32_t base = arg(c, 0), count = arg(c, 1);
+    const uint32_t width = arg(c, 2), compare = arg(c, 3);
+    if ((!base && count) || !width) {
+        wr32(guest_slot(g_errno_addr), EINVAL);
+        set_eax(c, 0);
+        return;
+    }
+    if (count < 2) {
+        set_eax(c, 0);
+        return;
+    }
+
+    uint32_t stack_low[30], stack_high[30];
+    int stack_count = 0;
+    uint32_t low_bound = base, high_bound = base + (count - 1) * width;
+    uint32_t low = low_bound, high = high_bound;
+    for (;;) {
+        const uint32_t length = (high - low) / width + 1;
+        uint32_t pivot;
+        if (length <= 8) {
+            qsort_select(c, low, high, width, compare);
+            goto pop;
+        }
+        pivot = low + (length / 2) * width;
+        if (qsort_compare(c, compare, low, pivot) > 0)
+            qsort_swap(low, pivot, width);
+        if (qsort_compare(c, compare, low, high) > 0)
+            qsort_swap(low, high, width);
+        if (qsort_compare(c, compare, pivot, high) > 0)
+            qsort_swap(pivot, high, width);
+
+        for (;;) {
+            if (pivot > low) {
+                bool reached_pivot = false;
+                do {
+                    low += width;
+                    if (low >= pivot) {
+                        reached_pivot = true;
+                        break;
+                    }
+                } while (qsort_compare(c, compare, low, pivot) <= 0);
+                if (!reached_pivot)
+                    goto scan_low;
+            }
+        scan_high:
+            do {
+                low += width;
+                if (low > high_bound)
+                    break;
+            } while (qsort_compare(c, compare, low, pivot) <= 0);
+        scan_low:
+            high -= width;
+            if (high > pivot)
+                while (qsort_compare(c, compare, high, pivot) > 0) {
+                    high -= width;
+                    if (high <= pivot)
+                        break;
+                }
+            if (low > high)
+                break;
+            qsort_swap(low, high, width);
+            if (pivot == high)
+                pivot = low;
+        }
+
+        high += width;
+        if (pivot < high) {
+            for (;;) {
+                high -= width;
+                if (high <= pivot)
+                    goto trim_low;
+                const int32_t r = qsort_compare(c, compare, high, pivot);
+                if (r != 0) {
+                    if (pivot < high)
+                        goto split;
+                    goto trim_low;
+                }
+            }
+        }
+    trim_low:
+        for (;;) {
+            high -= width;
+            if (high <= low_bound)
+                goto split;
+            if (qsort_compare(c, compare, high, pivot) != 0)
+                goto split;
+        }
+
+    split: {
+        const int32_t left = (int32_t)(high - low_bound);
+        const int32_t right = (int32_t)(high_bound - low);
+        if (left < right) {
+            if (low < high_bound) {
+                stack_low[stack_count] = low;
+                stack_high[stack_count] = high_bound;
+                ++stack_count;
+            }
+            if (low_bound >= high)
+                goto pop;
+            low = low_bound;
+            high_bound = high;
+        } else {
+            if (low_bound < high) {
+                stack_low[stack_count] = low_bound;
+                stack_high[stack_count] = high;
+                ++stack_count;
+            }
+            if (low >= high_bound)
+                goto pop;
+            low_bound = low;
+            high = high_bound;
+        }
+        continue;
+    }
+
+    pop:
+        if (--stack_count < 0) {
+            set_eax(c, 0);
+            return;
+        }
+        low_bound = low = stack_low[stack_count];
+        high_bound = high = stack_high[stack_count];
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Strings. Guest pointers are bounded before they are dereferenced.
 // ---------------------------------------------------------------------------
@@ -2194,6 +2353,7 @@ const ImportShim g_msvcr90_shims[] = {
     {"MSVCR90.dll", "memmove", ARGC_CDECL, crt_memmove},
     {"MSVCR90.dll", "memset", ARGC_CDECL, crt_memset},
     {"MSVCR90.dll", "memchr", ARGC_CDECL, crt_memchr},
+    {"MSVCR90.dll", "qsort", ARGC_CDECL, crt_qsort},
     {"MSVCR90.dll", "strcmp", ARGC_CDECL, crt_strcmp},
     {"MSVCR90.dll", "strncmp", ARGC_CDECL, crt_strncmp},
     {"MSVCR90.dll", "_stricmp", ARGC_CDECL, crt_stricmp},
