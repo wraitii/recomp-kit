@@ -156,6 +156,7 @@ pub fn preludes() -> Preludes {
 pub struct EmitReport {
     pub c_field_residency_violations: usize,
     pub fallbacks: BTreeSet<(Addr, String)>,
+    pub slow_ops: BTreeSet<(Addr, String)>,
 }
 
 pub fn emit_body(planned: &PlannedFunction, ctx: &EmitContext<'_>) -> Result<(Body, EmitReport)> {
@@ -165,6 +166,7 @@ pub fn emit_body(planned: &PlannedFunction, ctx: &EmitContext<'_>) -> Result<(Bo
     let report = EmitReport {
         c_field_residency_violations: emitter.residency_violations,
         fallbacks: std::mem::take(&mut emitter.fallbacks),
+        slow_ops: std::mem::take(&mut emitter.slow_ops),
     };
     Ok((Body {
         addr: planned.ssa.addr,
@@ -203,6 +205,7 @@ struct Emitter<'a> {
     in_block: Vec<bool>,
     residency_violations: usize,
     fallbacks: BTreeSet<(Addr, String)>,
+    slow_ops: BTreeSet<(Addr, String)>,
 }
 
 #[derive(Clone, Copy)]
@@ -344,6 +347,7 @@ impl<'a> Emitter<'a> {
             in_block,
             residency_violations,
             fallbacks: BTreeSet::new(),
+            slow_ops: BTreeSet::new(),
         }
     }
 
@@ -710,7 +714,13 @@ impl<'a> Emitter<'a> {
                         detail: "unsupported x87 instruction or operand".into(),
                     }));
                 }
-                self.slow(slow.family, addr)
+                let emitted = self.slow(slow.family, addr)?;
+                if emitted {
+                    if let Some(insn) = self.insn_at(addr) {
+                        self.slow_ops.insert((addr, insn.mnemonic.to_ascii_uppercase()));
+                    }
+                }
+                Ok(emitted)
             }
             Op::CallOther(userop) => {
                 self.publish(value)?;
@@ -1393,6 +1403,7 @@ impl<'a> Emitter<'a> {
             }
         }
         if cs_write {
+            self.fallbacks.insert((self.s.value_addr[value as usize], "CS write #UD".to_string()));
             self.out.push_str("recomp_int(c, 6u);\n");
         }
         let flag_fields: Fields = keys

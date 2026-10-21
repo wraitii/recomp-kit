@@ -125,9 +125,47 @@ type BodyRow = (
 );
 
 #[derive(Default)]
-struct Fallback {
+struct Sites {
     functions: usize,
     sites: Vec<Addr>,
+}
+
+fn tally(functions: &mut usize, by_reason: &mut BTreeMap<String, Sites>, found: BTreeSet<(Addr, String)>) {
+    if found.is_empty() {
+        return;
+    }
+    *functions += 1;
+    let mut reasons = BTreeSet::new();
+    for (site, reason) in found {
+        let entry = by_reason.entry(reason.clone()).or_default();
+        if reasons.insert(reason) {
+            entry.functions += 1;
+        }
+        entry.sites.push(site);
+    }
+}
+
+fn sites_json(functions: usize, by_reason: &BTreeMap<String, Sites>) -> serde_json::Value {
+    serde_json::json!({
+        "functions": functions,
+        "reasons": by_reason.iter().map(|(reason, found)| {
+            let mut sites = found.sites.clone();
+            sites.sort_unstable();
+            (reason.clone(), serde_json::json!({
+                "functions": found.functions,
+                "count": sites.len(),
+                "sites": sites.iter().map(|&site| Hex(site).to_string()).collect::<Vec<_>>(),
+            }))
+        }).collect::<BTreeMap<_, _>>(),
+    })
+}
+
+fn summary_line(by_reason: &BTreeMap<String, Sites>) -> String {
+    by_reason
+        .iter()
+        .map(|(reason, found)| format!("{reason}={}", found.functions))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[derive(Default)]
@@ -138,7 +176,9 @@ struct EmitStats {
     details: BTreeMap<String, usize>,
     detail_addrs: BTreeMap<String, Vec<Addr>>,
     fallback_functions: usize,
-    fallbacks: BTreeMap<String, Fallback>,
+    fallbacks: BTreeMap<String, Sites>,
+    slow_op_functions: usize,
+    slow_ops: BTreeMap<String, Sites>,
     c_field_residency_violations: usize,
     c_field_residency_violation_addrs: Vec<Addr>,
 }
@@ -322,17 +362,8 @@ fn account(stats: &mut EmitStats, (addr, body, reason, report): BodyRow, bodies:
             stats.c_field_residency_violations += report.c_field_residency_violations;
             stats.c_field_residency_violation_addrs.push(addr);
         }
-        if !report.fallbacks.is_empty() {
-            stats.fallback_functions += 1;
-            let mut reasons = BTreeSet::new();
-            for (site, reason) in report.fallbacks {
-                let entry = stats.fallbacks.entry(reason.clone()).or_default();
-                if reasons.insert(reason) {
-                    entry.functions += 1;
-                }
-                entry.sites.push(site);
-            }
-        }
+        tally(&mut stats.fallback_functions, &mut stats.fallbacks, report.fallbacks);
+        tally(&mut stats.slow_op_functions, &mut stats.slow_ops, report.slow_ops);
     }
     if let Some((reason, detail)) = reason {
         stats.trapping += 1;
@@ -714,6 +745,7 @@ struct ReportInputs<'a> {
     summary: &'a IrSummary,
     global: &'a rk_global::GlobalReport,
     emitted: &'a EmitStats,
+    traps: &'a BTreeMap<String, String>,
     written: &'a rk_output::Written,
     phases: &'a Phases,
 }
@@ -726,6 +758,7 @@ fn report(input: &ReportInputs<'_>) -> Result<String> {
         summary,
         global,
         emitted,
+        traps,
         written,
         phases,
     } = input;
@@ -777,17 +810,9 @@ fn report(input: &ReportInputs<'_>) -> Result<String> {
             "c_field_residency_violations": emitted.c_field_residency_violations,
             "c_field_residency_violation_addrs": emitted.c_field_residency_violation_addrs,
         },
-        "fallbacks": {
-            "functions": emitted.fallback_functions,
-            "reasons": emitted.fallbacks.iter().map(|(reason, fallback)| {
-                let mut sites = fallback.sites.clone();
-                sites.sort_unstable();
-                (reason.clone(), serde_json::json!({
-                    "functions": fallback.functions,
-                    "sites": sites.iter().map(|&site| Hex(site).to_string()).collect::<Vec<_>>(),
-                }))
-            }).collect::<BTreeMap<_, _>>(),
-        },
+        "fallbacks": sites_json(emitted.fallback_functions, &emitted.fallbacks),
+        "slow_ops": sites_json(emitted.slow_op_functions, &emitted.slow_ops),
+        "discovery_traps": traps,
         "diagnostics": diagnostics,
         "diagnostics_histogram": histogram,
         "phases": phases.seconds,
@@ -941,16 +966,21 @@ fn main() -> Result<()> {
             eprintln!("  body rejections: {}", rows.join(", "));
         }
         if emit_stats.fallback_functions != 0 {
-            let rows: Vec<String> = emit_stats
-                .fallbacks
-                .iter()
-                .map(|(reason, fallback)| format!("{reason}={}", fallback.functions))
-                .collect();
             eprintln!(
                 "  {} functions with fallbacks: {}",
                 emit_stats.fallback_functions,
-                rows.join(", ")
+                summary_line(&emit_stats.fallbacks)
             );
+        }
+        if emit_stats.slow_op_functions != 0 {
+            eprintln!(
+                "  {} functions with slow ops: {}",
+                emit_stats.slow_op_functions,
+                summary_line(&emit_stats.slow_ops)
+            );
+        }
+        if !discovered.report.traps.is_empty() {
+            eprintln!("  {} discovery traps", discovered.report.traps.len());
         }
     }
     if let Some(path) = &args.report {
@@ -966,6 +996,7 @@ fn main() -> Result<()> {
                 summary: &summary,
                 global: &global_report,
                 emitted: &emit_stats,
+                traps: &discovered.report.traps,
                 written: &written,
                 phases: &phases,
             })?,
