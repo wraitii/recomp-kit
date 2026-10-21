@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+rk-core = { path = "crates/rk-core" }
+rk-discover = { path = "crates/rk-discover" }
+rk-image = { path = "crates/rk-image" }
+rk-output = { path = "crates/rk-output" }
+rk-sleigh = { path = "crates/rk-sleigh" }
+rk-decode = { path = "crates/rk-decode" }
+rk-frontend = { path = "crates/rk-frontend" }
+rk-ir = { path = "crates/rk-ir" }
+rk-ssa = { path = "crates/rk-ssa" }
+rk-global = { path = "crates/rk-global" }
+rk-plan = { path = "crates/rk-plan" }
+rk-emit = { path = "crates/rk-emit" }
+rk-x87 = { path = "crates/rk-x87" }
+anyhow = "1"
+capstone = { version = "0.14", default-features = false, features = ["std", "full", "arch_x86"] }
+libsla = "1.2"
+sleigh-config = { version = "1.0", default-features = false, features = ["x86"] }
+clap = { version = "4", features = ["derive"] }
+goblin = { version = "0.9", default-features = false, features = ["pe32", "std"] }
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
+indexmap = { version = "2", features = ["serde"] }
+rayon = "1"
+rustc-hash = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+
+[workspace.lints.clippy]
+disallowed_types = "deny"
+
+[profile.release]
+debug = "line-tables-only"

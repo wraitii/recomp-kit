@@ -1,0 +1,13 @@
+[package]
+name = "rk-ir"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+rk-core.workspace = true
+rk-sleigh.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

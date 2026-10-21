@@ -48,6 +48,10 @@ def bundle_aux_dylibs(contents, libraries):
         return
     frameworks = contents / "Frameworks"
     frameworks.mkdir(parents=True, exist_ok=True)
+    names = {source.name for source in libraries}
+    for stale in frameworks.glob("librecomp_piece_*.dylib"):
+        if stale.name not in names:
+            stale.unlink()
     for source in libraries:
         dest = frameworks / source.name
         shutil.copy2(source, dest)

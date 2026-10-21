@@ -1,0 +1,13 @@
+[package]
+name = "rk-decode"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+rk-core.workspace = true
+capstone.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

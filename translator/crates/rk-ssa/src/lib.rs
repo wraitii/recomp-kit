@@ -1,0 +1,207 @@
+use std::collections::BTreeMap;
+
+use rk_core::contract::{Field, Fields};
+use rk_core::{Addr, Diagnostic, Lookup, Result};
+use rk_ir::{Op, SlowInsn, StateKey};
+
+mod build;
+mod canonical;
+mod coalesce;
+mod dump;
+mod flags;
+mod forward;
+mod liveness;
+mod prepare;
+mod sweep;
+mod verify;
+
+pub use build::{
+    build, BuildOptions, CallEffect, CallFacts, ConservativeCallFacts, DEFAULT_VALUE_BUDGET,
+};
+pub use canonical::canonicalize;
+pub use dump::dump;
+pub use flags::{FlagDescriptor, FlagPlan, FlagPublication, FlagSource};
+pub use forward::forward;
+pub use liveness::{live_values, simplify};
+pub use prepare::{prepare, publications, PrepareOptions};
+pub use sweep::{sweep, SweepReport};
+pub use verify::verify;
+
+pub type ValueId = u32;
+pub type BlockId = u32;
+pub type FlagId = u32;
+
+pub const DISPATCH_BLOCK: BlockId = u32::MAX;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Value {
+    pub op: Op,
+    pub size: u8,
+    pub args_start: u32,
+    pub args_len: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InsnLoc {
+    pub block: BlockId,
+    pub position: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct Block {
+    pub start: u32,
+    pub end: u32,
+    pub preds: Vec<BlockId>,
+    pub phis: Vec<ValueId>,
+    pub ops: Vec<ValueId>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Dispatch {
+    pub loads: Vec<(StateKey, ValueId)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Entry {
+    pub addr: Addr,
+    pub target: BlockId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Boundary {
+    pub at: ValueId,
+    pub state_start: u32,
+    pub state_len: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FlagKind {
+    Incoming,
+    Add,
+    Sub,
+    Adc,
+    Sbb,
+    Cmp,
+    Logic,
+    Inc,
+    Dec,
+    Join,
+}
+
+#[derive(Clone, Debug)]
+pub struct FlagRecord {
+    pub kind: FlagKind,
+    pub size: u8,
+    pub op: Option<ValueId>,
+    pub a: Option<ValueId>,
+    pub b: Option<ValueId>,
+    pub carry: Option<ValueId>,
+    pub result: Option<ValueId>,
+    pub flags: BTreeMap<Field, ValueId>,
+    pub defined: Fields,
+    pub guarded: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LaneGroup {
+    pub phi: ValueId,
+    pub block: BlockId,
+    pub lanes: Vec<LaneGroupLane>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LaneGroupLane {
+    pub key: usize,
+    pub value: ValueId,
+    pub args: Vec<ValueId>,
+}
+
+pub struct Ssa {
+    pub addr: Addr,
+    pub values: Vec<Value>,
+    pub args: Vec<ValueId>,
+    pub blocks: Vec<Block>,
+    pub dispatch: Dispatch,
+    pub entries: Vec<Entry>,
+    pub boundaries: Vec<Boundary>,
+    pub boundary_index: Lookup<ValueId, u32>,
+    pub state: Vec<(StateKey, ValueId)>,
+    pub keys: Vec<StateKey>,
+    pub field_of: Vec<Option<Field>>,
+    pub slow: Vec<SlowInsn>,
+    pub flags: Vec<FlagRecord>,
+    pub loc: Vec<Option<InsnLoc>>,
+    pub value_addr: Vec<Addr>,
+    pub(crate) phi_key: Lookup<ValueId, usize>,
+    pub(crate) entry_reads: Vec<Vec<(usize, ValueId)>>,
+    pub(crate) exit_state: Vec<Vec<Option<ValueId>>>,
+    pub(crate) lane_groups: Vec<LaneGroup>,
+}
+
+impl Ssa {
+    pub fn resolve(&self, value: ValueId) -> ValueId {
+        value
+    }
+
+    pub fn value(&self, value: ValueId) -> &Value {
+        &self.values[value as usize]
+    }
+
+    pub fn args(&self, value: ValueId) -> &[ValueId] {
+        let value = &self.values[value as usize];
+        &self.args[value.args_start as usize..(value.args_start + value.args_len) as usize]
+    }
+
+    pub fn block(&self, block: BlockId) -> Option<&Block> {
+        self.blocks.get(block as usize)
+    }
+
+    pub fn block_of_insn(&self, insn: u32) -> Option<InsnLoc> {
+        self.loc.get(insn as usize).copied().flatten()
+    }
+
+    pub fn boundary(&self, at: ValueId) -> Option<&[(StateKey, ValueId)]> {
+        let index = *self.boundary_index.get(&at)? as usize;
+        let boundary = &self.boundaries[index];
+        Some(
+            &self.state[boundary.state_start as usize
+                ..(boundary.state_start + boundary.state_len) as usize],
+        )
+    }
+
+    pub fn input(&self, key: StateKey) -> Option<ValueId> {
+        self.dispatch
+            .loads
+            .iter()
+            .find(|(candidate, _)| *candidate == key)
+            .map(|(_, value)| *value)
+    }
+
+    pub fn memory(&self) -> Option<ValueId> {
+        self.input(StateKey::Memory)
+    }
+
+    pub fn field(&self, key: StateKey) -> Option<Field> {
+        let index = self.keys.iter().position(|candidate| *candidate == key)?;
+        self.field_of[index]
+    }
+
+    pub fn slow(&self, index: u32) -> Option<&SlowInsn> {
+        self.slow.get(index as usize)
+    }
+
+    pub fn flag(&self, index: FlagId) -> Option<&FlagRecord> {
+        self.flags.get(index as usize)
+    }
+}
+
+pub fn validate(s: &Ssa) -> Result<()> {
+    for (index, value) in s.values.iter().enumerate() {
+        if value.args_start + value.args_len > s.args.len() as u32 {
+            return Err(Diagnostic::error(s.addr, rk_core::Reason::SsaBudget {
+                detail: format!("value {index} has invalid arguments"),
+            }));
+        }
+    }
+    Ok(())
+}

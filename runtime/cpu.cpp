@@ -487,6 +487,12 @@ void recomp_unmodelled(X86 *c, uint32_t addr) {
     abort();
 }
 
+void recomp_unmodelled_named(X86 *c, uint32_t addr, const char *reason) {
+    LOGW("untranslated %s at %08x (ESP=%08x, return=%08x): the translation left a trap here",
+         reason, addr, c->r[R_ESP], rd32(c->r[R_ESP]));
+    abort();
+}
+
 // INT3: a breakpoint no debugger will handle. Windows hands STATUS_BREAKPOINT
 // to the program's own handlers and ends the process when none takes it.
 void recomp_breakpoint(X86 *c, uint32_t addr) {

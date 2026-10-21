@@ -12,6 +12,7 @@
 #include "../runtime/win32.h"
 #include "../runtime/mods_seam.h"
 #include "../runtime/call_trace.h"
+#include "../runtime/linear_trace.h"
 #include "../runtime/observe.h"
 #include "../runtime/gdi32_internal.h"
 #include "../runtime/display_seam.h"
@@ -452,6 +453,7 @@ void fault_handler(const char *name) {
     // its last chance to be written: abort skips the atexit hook, and the path
     // that leads here is usually one that would have ended the run at once.
     observe_write_on_fault();
+    recomp_linear_trace_on_fault();
     sig_write("[host] no run report from a signal handler: printing one is not "
               "signal-safe and could hang instead of exiting (an OBSERVE report, "
               "if enabled, was already written)\n");
@@ -571,6 +573,7 @@ bool boot_load(const BootOptions &opts) {
     // place, so its hook chains to any mod hook on the same address rather
     // than being overwritten by it. A no-op without the variable.
     recomp_trace_calls_init();
+    recomp_linear_trace_init();
 
     g_loaded = true;
     return true;

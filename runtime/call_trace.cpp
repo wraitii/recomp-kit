@@ -438,6 +438,7 @@ void arm(const RecompModule *module, uint32_t addr, const char *label, const Dum
         slot_flag = &recomp_hooked[index];
     }
     st.next = __atomic_load_n(slot_ptr, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&recomp_hooks_ever, (uint8_t)1, __ATOMIC_RELEASE);
     __atomic_store_n(slot_ptr, kSlotFns[g_trace_count], __ATOMIC_RELEASE);
     __atomic_store_n(slot_flag, (uint8_t)1, __ATOMIC_RELEASE);
     if (!module)

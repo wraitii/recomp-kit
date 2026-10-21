@@ -5,7 +5,7 @@ set(RECOMP_RUNTIME_SOURCES
   msvcr90.cpp steam_api.cpp
   resources.cpp oleaut32.cpp mods_seam.cpp user32.cpp user32_wide.cpp user32_vcl.cpp user32_static.cpp user32_cursor.cpp user32_dialog.cpp user32_messagebox.cpp
   misc.cpp misc_dlls.cpp comctl32.cpp gdi32.cpp gdi32_draw.cpp gdi32_text.cpp gdi32_truetype.cpp msimg32.cpp
-  media_foundation.cpp layout.cpp key_names.cpp interp.cpp discovery.cpp imagehlp.cpp call_trace.cpp
+  media_foundation.cpp layout.cpp key_names.cpp interp.cpp discovery.cpp imagehlp.cpp call_trace.cpp linear_trace.cpp
   observe.cpp installation_manifest.cpp ../host/controls/json.cpp)
 
 # The faces the runtime's GDI draws Windows' own UI fonts with

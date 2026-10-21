@@ -1,0 +1,11 @@
+[package]
+name = "rk-plan"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+rk-core = { workspace = true }
+rk-ir = { workspace = true }
+rk-ssa = { workspace = true }
+rk-x87 = { workspace = true }

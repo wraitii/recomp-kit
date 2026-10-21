@@ -1,0 +1,390 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+
+use crate::{parse_hex, Addr, Error, Result};
+
+pub const INPUT_FORMAT: &str = "recomp-translate-input-v1";
+
+#[derive(Debug, Deserialize)]
+struct Input {
+    format: String,
+    dir: PathBuf,
+    exe: PathBuf,
+    code_map: Option<PathBuf>,
+    image_base: Addr,
+    sha256: String,
+    translate: Translate,
+    #[serde(default)]
+    globals: BTreeMap<String, Global>,
+    #[serde(default)]
+    curated: Curated,
+    #[serde(default)]
+    aux_modules: Vec<Module>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Translate {
+    pub fault_state: FaultState,
+    pub msvc_x87_convention: bool,
+    pub call_contracts: bool,
+    pub x87_cw_clone: bool,
+    pub private_leaf_contracts: bool,
+    pub private_input_arguments: bool,
+    pub private_input_registers: BTreeMap<String, String>,
+    pub x87_imports_preserve_pc_rc: bool,
+    pub x87_facts: Option<String>,
+    pub x87_mode_metadata: Option<String>,
+    pub indirect_targets: Option<String>,
+    pub call_effects: Vec<CallEffect>,
+    pub x87_entry_contracts: Vec<X87EntryContract>,
+    pub allocators: Vec<Allocator>,
+    pub checked_returns: Vec<Addr>,
+    pub state_contract_callers: Vec<Addr>,
+    pub alternate_entries: Vec<Addr>,
+    pub entry_points: Vec<Addr>,
+    pub discover: Option<bool>,
+    pub native: Native,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Native {
+    pub header: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FaultState {
+    #[default]
+    Relaxed,
+    Exact,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CallEffect {
+    pub site: Option<Addr>,
+    pub import: Option<String>,
+    pub regs: Option<RegsEffect>,
+    pub x87: Option<X87Effect>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegsEffect {
+    Abi,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum X87Effect {
+    Named(X87Named),
+    Masked {
+        preserved: u16,
+        known: u16,
+        value: u16,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum X87Named {
+    Preserve,
+    Unknown,
+}
+
+impl X87Effect {
+    pub fn control_word(self) -> (u16, u16, u16) {
+        match self {
+            X87Effect::Named(X87Named::Preserve) => (0xffff, 0, 0),
+            X87Effect::Named(X87Named::Unknown) => (0, 0, 0),
+            X87Effect::Masked {
+                preserved,
+                known,
+                value,
+            } => (preserved, known, value),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct X87EntryContract {
+    pub function: Addr,
+    pub mask: u16,
+    pub value: u16,
+    #[serde(default)]
+    pub verify: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Allocator {
+    pub function: Addr,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Global {
+    pub addr: Addr,
+    pub size: Option<u64>,
+    pub stride: Option<u64>,
+    pub count: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Curated {
+    pub alternates: BTreeMap<String, Addr>,
+    pub entries: BTreeMap<String, Addr>,
+    pub aliases: BTreeMap<String, Addr>,
+    pub events: BTreeMap<String, Addr>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Module {
+    pub key: String,
+    pub name: String,
+    pub base: Addr,
+    pub size: u32,
+    pub path: PathBuf,
+    pub code_map_path: PathBuf,
+    pub sha256: String,
+    #[serde(default)]
+    pub entry_points: Vec<Addr>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CallEffects {
+    pub sites: BTreeMap<Addr, CallEffect>,
+    pub imports: BTreeMap<String, CallEffect>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Settings {
+    pub game_dir: PathBuf,
+    pub exe: PathBuf,
+    pub code_map: PathBuf,
+    pub base: Addr,
+    pub sha256: String,
+    pub module: Option<Module>,
+    pub globals: BTreeMap<String, Global>,
+    pub curated: Curated,
+    pub alternate_entries: BTreeSet<Addr>,
+    pub configured_entries: BTreeSet<Addr>,
+    pub indirect_targets: Option<PathBuf>,
+    pub native_header: Option<PathBuf>,
+    pub x87_facts: Option<PathBuf>,
+    pub x87_mode_metadata: Option<PathBuf>,
+    pub allocators: BTreeSet<Addr>,
+    pub call_effects: CallEffects,
+    pub x87_imports_preserve_pc_rc: bool,
+    pub x87_entry_contracts: Vec<X87EntryContract>,
+    pub call_contracts: bool,
+    pub private_leaf_contracts: bool,
+    pub private_input_arguments: bool,
+    pub private_input_registers: BTreeMap<Addr, String>,
+    pub checked_returns: BTreeSet<Addr>,
+    pub state_contract_callers: BTreeSet<Addr>,
+    pub discover: bool,
+    pub fault_state: FaultState,
+    pub msvc_x87_convention: bool,
+    pub x87_cw_clone: bool,
+}
+
+impl Settings {
+    pub fn load(path: &Path, module: Option<&str>) -> Result<Self> {
+        let text = std::fs::read_to_string(path).map_err(|e| Error::io(path, e))?;
+        let input: Input = serde_json::from_str(&text)
+            .map_err(|e| Error::input(format!("{}: {e}", path.display())))?;
+        if input.format != INPUT_FORMAT {
+            return Err(Error::input(format!(
+                "{}: expected {INPUT_FORMAT}",
+                path.display()
+            )));
+        }
+        if module.is_none()
+            && (input.translate.x87_facts.is_some() || input.translate.x87_mode_metadata.is_some())
+        {
+            return Err(Error::input(format!(
+                "{}: the Rust translator does not yet consume translate.x87_facts or translate.x87_mode_metadata",
+                path.display()
+            )));
+        }
+        Self::resolve(input, module)
+    }
+
+    fn resolve(input: Input, module: Option<&str>) -> Result<Self> {
+        let t = input.translate;
+        let code_map = input
+            .code_map
+            .ok_or_else(|| Error::input("game.toml [translate] code_map is required"))?;
+        let module = match module {
+            None => None,
+            Some(key) => Some(
+                input
+                    .aux_modules
+                    .iter()
+                    .find(|m| m.key == key)
+                    .cloned()
+                    .ok_or_else(|| Error::input(format!("game.toml has no [modules.aux.{key}]")))?,
+            ),
+        };
+        let main = module.is_none();
+        let resolve = |name: &Option<String>| {
+            name.as_ref()
+                .filter(|_| main)
+                .map(|name| input.dir.join(name))
+        };
+        let mut sites = BTreeMap::new();
+        let mut imports = BTreeMap::new();
+        for effect in &t.call_effects {
+            match (effect.site, &effect.import) {
+                (Some(site), None) => {
+                    if main {
+                        sites.insert(site, effect.clone());
+                    }
+                }
+                (None, Some(import)) => {
+                    imports.insert(import.clone(), effect.clone());
+                }
+                _ => {
+                    return Err(Error::input(
+                        "call_effects entry must set exactly one of import or site",
+                    ))
+                }
+            }
+        }
+        let mut private_input_registers = BTreeMap::new();
+        if main {
+            for (addr, register) in &t.private_input_registers {
+                let addr = parse_hex(addr).ok_or_else(|| {
+                    Error::input(format!(
+                        "private_input_registers key {addr} is not an address"
+                    ))
+                })?;
+                private_input_registers.insert(addr, register.clone());
+            }
+        }
+        let alternate_entries: BTreeSet<Addr> = t.alternate_entries.iter().copied().collect();
+        let configured_entries = match &module {
+            Some(m) => m.entry_points.iter().copied().collect(),
+            None => alternate_entries
+                .iter()
+                .chain(&t.entry_points)
+                .copied()
+                .collect(),
+        };
+        let (exe, code_map, base, sha256) = match &module {
+            Some(m) => (
+                m.path.clone(),
+                m.code_map_path.clone(),
+                m.base,
+                m.sha256.clone(),
+            ),
+            None => (input.exe, code_map, input.image_base, input.sha256),
+        };
+        let only_main = |set: &[Addr]| -> BTreeSet<Addr> {
+            if main {
+                set.iter().copied().collect()
+            } else {
+                BTreeSet::new()
+            }
+        };
+        Ok(Settings {
+            exe,
+            code_map,
+            base,
+            sha256,
+            globals: if main { input.globals } else { BTreeMap::new() },
+            curated: if main {
+                input.curated
+            } else {
+                Curated::default()
+            },
+            alternate_entries: if main {
+                alternate_entries
+            } else {
+                BTreeSet::new()
+            },
+            configured_entries,
+            indirect_targets: resolve(&t.indirect_targets),
+            native_header: resolve(&t.native.header),
+            x87_facts: resolve(&t.x87_facts),
+            x87_mode_metadata: resolve(&t.x87_mode_metadata),
+            allocators: if main {
+                t.allocators.iter().map(|a| a.function).collect()
+            } else {
+                BTreeSet::new()
+            },
+            call_effects: CallEffects { sites, imports },
+            x87_imports_preserve_pc_rc: t.x87_imports_preserve_pc_rc,
+            x87_entry_contracts: if main {
+                t.x87_entry_contracts.clone()
+            } else {
+                Vec::new()
+            },
+            call_contracts: t.call_contracts,
+            private_leaf_contracts: t.private_leaf_contracts && main,
+            private_input_arguments: t.private_input_arguments && main,
+            private_input_registers,
+            checked_returns: only_main(&t.checked_returns),
+            state_contract_callers: only_main(&t.state_contract_callers),
+            discover: t.discover.unwrap_or(true),
+            fault_state: t.fault_state,
+            msvc_x87_convention: t.msvc_x87_convention,
+            x87_cw_clone: t.x87_cw_clone,
+            game_dir: input.dir,
+            module,
+        })
+    }
+}
+
+impl Settings {
+    pub fn native_replaced(&self) -> Result<BTreeSet<Addr>> {
+        let mut named = BTreeSet::new();
+        let Some(header) = &self.native_header else {
+            return Ok(named);
+        };
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![header.clone()];
+        while let Some(path) = stack.pop() {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(e) if path == *header => return Err(Error::io(&path, e)),
+                Err(_) => continue,
+            };
+            for (i, _) in text.match_indices("FN_") {
+                if let Some(addr) = text.get(i + 3..i + 11).and_then(|hex| {
+                    hex.bytes()
+                        .all(|b| b.is_ascii_hexdigit())
+                        .then(|| Addr::from_str_radix(hex, 16).ok())
+                        .flatten()
+                }) {
+                    named.insert(addr);
+                }
+            }
+            let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+            for line in text.lines() {
+                let line = line.trim_start();
+                let Some(rest) = line.strip_prefix('#') else {
+                    continue;
+                };
+                let Some(rest) = rest.trim_start().strip_prefix("include") else {
+                    continue;
+                };
+                if let Some(name) = rest
+                    .trim()
+                    .strip_prefix('"')
+                    .and_then(|r| r.split('"').next())
+                {
+                    stack.push(dir.join(name));
+                }
+            }
+        }
+        Ok(named)
+    }
+}

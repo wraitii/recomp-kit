@@ -711,6 +711,7 @@ void recomp_int(X86 *c, uint32_t vec);
  * image, because a listing routinely decodes the data past a function's last
  * instruction as code. Reaching one is fatal and says where. */
 void recomp_unmodelled(X86 *c, uint32_t addr);
+void recomp_unmodelled_named(X86 *c, uint32_t addr, const char *reason);
 void recomp_x87_contract_violation(X86 *c, uint32_t addr, uint16_t mask, uint16_t value);
 void recomp_breakpoint(X86 *c, uint32_t addr);
 
@@ -1397,6 +1398,32 @@ static inline void x86_popad(X86 *c) {
     c->r[R_ECX] = rd32(sp + 24);
     c->r[R_EAX] = rd32(sp + 28);
     c->r[R_ESP] = sp + 32;
+}
+
+static inline void recomp_pushfd(X86 *c) {
+    c->r[R_ESP] -= 4;
+    wr32(c->r[R_ESP], x86_get_eflags(c));
+}
+static inline void recomp_popfd(X86 *c) {
+    x86_set_eflags(c, rd32(c->r[R_ESP]));
+    c->r[R_ESP] += 4;
+}
+static inline void recomp_pushf(X86 *c) {
+    c->r[R_ESP] -= 2;
+    wr16(c->r[R_ESP], (uint16_t)x86_get_eflags(c));
+}
+static inline void recomp_popf(X86 *c) {
+    x86_set_eflags(c, (x86_get_eflags(c) & 0xffff0000u) | rd16(c->r[R_ESP]));
+    c->r[R_ESP] += 2;
+}
+static inline void recomp_insn_in(X86 *c, uint32_t port, int size, uint32_t *dst, unsigned shift,
+                                  uint32_t mask) {
+    uint32_t v = recomp_in(c, port, size);
+    *dst = (*dst & ~(mask << shift)) | ((v & mask) << shift);
+}
+static inline void recomp_insn_out(X86 *c, uint32_t port, const uint32_t *src, unsigned shift,
+                                   uint32_t mask, int size) {
+    recomp_out(c, port, (*src >> shift) & mask, size);
 }
 
 /* ---------------------------------------------------------- string ops

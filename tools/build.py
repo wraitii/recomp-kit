@@ -337,7 +337,133 @@ def sync_tree(src, dst):
         sync_file(sp, dst / rel)
 
 
-def translation_fingerprints(cfg):
+def translation_input(cfg):
+    """The resolved game configuration the Rust translator reads instead of game.toml."""
+    def stable(value):
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, bytes):
+            return value.hex()
+        if isinstance(value, dict):
+            return {("%08x" % key if isinstance(key, int) else key): stable(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return [stable(item) for item in value]
+        return value
+
+    return {"format": "recomp-translate-input-v1", "dir": str(cfg["dir"]),
+            "exe": str(cfg["developer_exe_path"]),
+            "code_map": str(cfg["code_map_path"]) if cfg.get("code_map_path") else None,
+            "image_base": cfg["game"]["image_base"], "sha256": cfg["game"]["sha256"],
+            "translate": stable(cfg["translate"]), "globals": stable(cfg["globals"]),
+            "curated": stable(cfg["curated"]), "aux_modules": stable(cfg["aux_modules"])}
+
+
+def rust_translator(build_root):
+    """Build the Rust translator into the build root and return its executable."""
+    target = Path(build_root) / "recomp/cargo"
+    subprocess.run(["cargo", "build", "--release", "--quiet", "-p", "recomp-translate",
+                    "--manifest-path", str(ROOT / "translator/Cargo.toml"), "--target-dir", str(target)],
+                   check=True)
+    return target / "release" / ("recomp-translate.exe" if os.name == "nt" else "recomp-translate")
+
+
+def write_translation_input(cfg, build_root):
+    path = Path(build_root) / "recomp/translate-input.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(translation_input(cfg), indent=1, sort_keys=True) + "\n"
+    if not path.is_file() or path.read_text() != text:
+        path.write_text(text)
+    return path
+
+
+def rust_translation_fingerprints(cfg, build_root):
+    binary = rust_translator(build_root)
+    common = hashlib.sha256(b"recomp-translate-rust-v1\n")
+    common.update(json.dumps(translation_input(cfg), sort_keys=True).encode())
+    common.update(binary.read_bytes())
+    for path in sorted((ROOT / "tools").glob("*game_config.py")):
+        common.update(path.name.encode() + b"\0" + path.read_bytes())
+    images = ["main"] + [module["key"] for module in cfg["aux_modules"]]
+    fingerprints = {}
+    for key in images:
+        h = common.copy()
+        h.update(b"\0" + key.encode())
+        h.update(rust_translation_dependencies(cfg, key))
+        for name in sorted(code_map_files(cfg, key)):
+            h.update(name.name.encode() + b"\0" + name.read_bytes())
+        fingerprints[key] = h.hexdigest()
+    return fingerprints
+
+
+def rust_translation_dependencies(cfg, key):
+    """Hash external Rust inputs and the generation switches that affect output."""
+    translate = cfg["translate"]
+    digest = hashlib.sha256()
+    if key == "main":
+        for name in ("x87_facts", "x87_mode_metadata", "indirect_targets"):
+            value = translate.get(name)
+            digest.update(name.encode() + b"\0")
+            if value:
+                path = Path(cfg["dir"]) / value
+                digest.update(path.as_posix().encode() + b"\0" + path.read_bytes())
+            else:
+                digest.update(b"<unset>")
+            digest.update(b"\0")
+
+        native = translate.get("native") or {}
+        header = native.get("header")
+        digest.update(b"native-header\0")
+        if header:
+            root = Path(cfg["dir"]) / header
+            pending = [(root, True)]
+            seen = set()
+            while pending:
+                path, required = pending.pop()
+                if path in seen:
+                    continue
+                seen.add(path)
+                try:
+                    data = path.read_bytes()
+                except OSError:
+                    if required:
+                        raise
+                    continue
+                digest.update(path.as_posix().encode() + b"\0" + data + b"\0")
+                parent = path.parent
+                for line in data.decode(errors="replace").splitlines():
+                    line = line.lstrip()
+                    if not line.startswith("#"):
+                        continue
+                    rest = line[1:].lstrip()
+                    if not rest.startswith("include"):
+                        continue
+                    include = rest[len("include"):].strip()
+                    if include.startswith('"') and '"' in include[1:]:
+                        pending.append((parent / include[1:].split('"', 1)[0], False))
+
+    digest.update(b"rust-generation-env\0")
+    for name in ("RK_NO_DESCRIPTORS", "RK_NO_PRIVATE", "RK_X87_DYNAMIC", "RK_NO_ROOTS"):
+        digest.update(name.encode() + b"=" + (b"1" if os.environ.get(name) is not None else b"0") + b"\0")
+    return digest.digest()
+
+
+def code_map_files(cfg, key):
+    if key == "main":
+        root, exe = cfg["code_map_path"], cfg["developer_exe_path"]
+    else:
+        module = next(module for module in cfg["aux_modules"] if module["key"] == key)
+        root, exe = module["code_map_path"], module["path"]
+    files = [path for path in Path(root).iterdir() if path.is_file()] if root and Path(root).is_dir() else []
+    return files + [Path(exe)]
+
+
+def translation_fingerprints(cfg, build_root=None):
+    if cfg.get("translate_engine") == "rust":
+        return rust_translation_fingerprints(cfg, build_root)
+    return python_translation_fingerprints(cfg)
+
+
+def python_translation_fingerprints(cfg):
     """Per-image hashes of everything that can change that image's translated sources.
 
     Each image owns its executable, code map and translation settings. Runtime
@@ -491,8 +617,25 @@ def build_diff_harness(build_root, out):
     print("built diff harness: %s" % out)
 
 
+def run_rust_translator(stage, cfg, build_root, aux_modules=(), main=True):
+    binary = rust_translator(build_root)
+    source = write_translation_input(cfg, build_root)
+    images = ([(None, Path(stage))] if main else []) + [
+        (module["key"], Path(stage) / ("aux-" + module["key"])) for module in aux_modules]
+    for key, destination in images:
+        destination.mkdir(parents=True, exist_ok=True)
+        report = "recomp/translate-report.json" if key is None else "recomp/translate-%s-report.json" % key
+        command = [str(binary), "--input", str(source), "--out", str(destination),
+                   "--report", str(Path(build_root) / report)]
+        if key is not None:
+            command += ["--module", key]
+        subprocess.run(command, cwd=ROOT, check=True)
+
+
 def run_translator(stage, game_dir, build_root, aux_modules=(), regen_functions=(), main=True,
-                   cache_emission=True):
+                   cache_emission=True, cfg=None):
+    if cfg is not None and cfg["translate_engine"] == "rust":
+        return run_rust_translator(stage, cfg, build_root, aux_modules, main)
     if main:
         command = [sys.executable, str(ROOT / "tools/recomp/driver.py"), "--out", str(stage),
                    "--game", str(game_dir),
@@ -524,6 +667,8 @@ def parse_args(argv, system=None):
     parser.add_argument("--regenerate", nargs="?", const="all", default=None, metavar="MODULES",
                         help="Regenerate translated C: all images, or only the named auxiliary modules "
                              "(comma-separated; 'main' names the game image)")
+    parser.add_argument("--engine", choices=("python", "rust"), default=None,
+                        help="Translator to regenerate with (default: [translate] engine, else python)")
     parser.add_argument("--no-emission-cache", action="store_true",
                         help="Disable prepared-body reuse and selected-function regeneration")
     parser.add_argument("--regen-function", action="append", default=[], metavar="HEX_ADDR",
@@ -541,6 +686,8 @@ def parse_args(argv, system=None):
     parser.add_argument("--corpus-trials", type=int, default=9)
     parser.add_argument("--target", choices=sorted(TARGETS), default="app")
     parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 2, 8))
+    parser.add_argument("--translation-piece-mb", type=int,
+                        help="Generated C source MB per macOS translation dylib (CMake default: 160)")
     parser.add_argument("--preset", default=default_preset(system), help="CMake configure preset")
     parser.add_argument("--config", choices=("Release", "Debug"), default="Release")
     parser.add_argument("--package-toolkit", action="store_true")
@@ -584,6 +731,8 @@ def parse_args(argv, system=None):
         parser.error("--target web needs the Emscripten SDK's environment (source emsdk_env.sh)")
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
+    if args.translation_piece_mb is not None and args.translation_piece_mb < 1:
+        parser.error("--translation-piece-mb must be at least 1")
     if args.function_corpus and any((args.regenerate, args.stub,
                                       args.config != "Release", args.target != "app")):
         parser.error("--function-corpus is an isolated native Release build mode")
@@ -637,6 +786,9 @@ def main():
                        args.corpus_trial_ms, args.corpus_trials, asan=args.corpus_asan)
         return
     cfg = game_config.load(args.game_dir, args.build_root)
+    cfg["translate_engine"] = args.engine or cfg["translate"].get("engine", "python")
+    if args.regen_function and cfg["translate_engine"] == "rust":
+        parser.error("--regen-function is not available with the Rust translator")
     if args.regen_function:
         args.regenerate = "all"
         if cfg["aux_modules"]:
@@ -648,6 +800,8 @@ def main():
     defines = game_defines(args.game_dir, args.build_root) + [
         "-DRECOMP_CHECK_CALL_FACTS=" + ("ON" if args.check_call_facts else "OFF"),
         "-DRECOMP_OBSERVE=" + ("OFF" if args.no_observe else "ON")]
+    if args.translation_piece_mb is not None:
+        defines.append("-DRECOMP_GEN_PIECE_BUDGET=" + str(args.translation_piece_mb * 1000000))
     try:
         # The lock lives at <build root>/recomp/.lock: BuildLock joins build/recomp/.lock onto its argument.
         with buildlock.BuildLock(args.build_root.parent, "tools/build.py"):
@@ -655,7 +809,7 @@ def main():
                 if not cfg.get("code_map_path"):
                     parser.error("Translation needs the game's code map: set [translate] code_map in game.toml")
                 selection = regenerate_selection(args.regenerate, cfg, parser)
-                fingerprints = translation_fingerprints(cfg)
+                fingerprints = translation_fingerprints(cfg, args.build_root)
                 stamp = args.build_root / "recomp/translate.stamp"
                 stamped = read_translation_stamp(stamp)
                 translated = (args.build_root / "recomp/gen/table.c").is_file()
@@ -670,7 +824,8 @@ def main():
                     stamped.pop("main", None)
                     write_translation_stamp(stamp, stamped)
                 elif selection is None:
-                    cache_ready = not args.cache_emission or (args.build_root / "recomp/emission-cache/index.pickle").is_file()
+                    cache_ready = (cfg["translate_engine"] == "rust" or not args.cache_emission
+                                   or (args.build_root / "recomp/emission-cache/index.pickle").is_file())
                     current = (set(stamped) == set(fingerprints)
                                and all(stamped[key] == value and image_generated(args.build_root, key)
                                        for key, value in fingerprints.items()))
@@ -680,7 +835,8 @@ def main():
                         publish_generated(args.build_root,
                                           lambda stage: run_translator(stage, args.game_dir, args.build_root,
                                                                        aux_modules=cfg["aux_modules"],
-                                                                       cache_emission=args.cache_emission))
+                                                                       cache_emission=args.cache_emission,
+                                                                       cfg=cfg))
                         write_translation_stamp(stamp, fingerprints)
                 else:
                     if not translated:
@@ -690,7 +846,8 @@ def main():
                     publish_generated(args.build_root,
                                       lambda stage: run_translator(stage, args.game_dir, args.build_root,
                                                                    aux_modules=aux, main=main_image,
-                                                                   cache_emission=args.cache_emission),
+                                                                   cache_emission=args.cache_emission,
+                                                                   cfg=cfg),
                                       partial=True, main=main_image)
                     stamped.update((key, fingerprints[key]) for key in selection if key in fingerprints)
                     write_translation_stamp(stamp, {key: value for key, value in stamped.items()

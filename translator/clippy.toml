@@ -1,0 +1,6 @@
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order is not deterministic; use BTreeMap, IndexMap or rk_core::Lookup" },
+    { path = "std::collections::HashSet", reason = "iteration order is not deterministic; use BTreeSet, IndexSet or rk_core::LookupSet" },
+    { path = "rustc_hash::FxHashMap", reason = "use rk_core::Lookup, which cannot be iterated" },
+    { path = "rustc_hash::FxHashSet", reason = "use rk_core::LookupSet, which cannot be iterated" },
+]

@@ -186,6 +186,12 @@ void recomp_unmodelled(X86 *c, uint32_t a) {
     fprintf(stderr, "unmodelled %08x\n", a);
     abort();
 }
+void recomp_unmodelled_named(X86 *c, uint32_t a, const char *reason) {
+    (void)c;
+    harness_escape("unmodelled", a);
+    fprintf(stderr, "unmodelled %s %08x\n", reason, a);
+    abort();
+}
 
 /* --- driver interface ---------------------------------------------------- */
 

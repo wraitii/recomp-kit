@@ -1,0 +1,195 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::{Deserialize, Serialize};
+
+use crate::Addr;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Space {
+    Const,
+    Ram,
+    Register,
+    Unique,
+    Stin,
+    Stout,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Varnode {
+    pub space: Space,
+    pub offset: u64,
+    pub size: u32,
+}
+
+impl Varnode {
+    pub const fn new(space: Space, offset: u64, size: u32) -> Self {
+        Self { space, offset, size }
+    }
+
+    pub const fn constant(value: u64, size: u32) -> Self {
+        Self::new(Space::Const, value, size)
+    }
+
+    pub const fn register(offset: u64, size: u32) -> Self {
+        Self::new(Space::Register, offset, size)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum OpCode {
+    Copy,
+    Load,
+    Store,
+    Branch,
+    CBranch,
+    BranchInd,
+    Call,
+    CallInd,
+    CallOther,
+    Return,
+    IntEqual,
+    IntNotEqual,
+    IntSLess,
+    IntSLessEqual,
+    IntLess,
+    IntLessEqual,
+    IntZExt,
+    IntSExt,
+    IntAdd,
+    IntSub,
+    IntCarry,
+    IntSCarry,
+    IntSBorrow,
+    Int2Comp,
+    IntNegate,
+    IntXor,
+    IntAnd,
+    IntOr,
+    IntLeft,
+    IntRight,
+    IntSRight,
+    IntMult,
+    IntDiv,
+    IntSDiv,
+    IntRem,
+    IntSRem,
+    BoolNegate,
+    BoolXor,
+    BoolAnd,
+    BoolOr,
+    FloatEqual,
+    FloatNotEqual,
+    FloatLess,
+    FloatLessEqual,
+    FloatNan,
+    FloatAdd,
+    FloatDiv,
+    FloatMult,
+    FloatSub,
+    FloatNeg,
+    FloatAbs,
+    FloatSqrt,
+    FloatInt2Float,
+    FloatFloat2Float,
+    FloatTrunc,
+    FloatCeil,
+    FloatFloor,
+    FloatRound,
+    Piece,
+    SubPiece,
+    PopCount,
+    LzCount,
+    Unknown,
+}
+
+impl OpCode {
+    pub fn is_branch(self) -> bool {
+        matches!(
+            self,
+            OpCode::Branch
+                | OpCode::CBranch
+                | OpCode::BranchInd
+                | OpCode::Call
+                | OpCode::CallInd
+                | OpCode::Return
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PcodeOp {
+    pub opcode: OpCode,
+    pub output: Option<Varnode>,
+    pub inputs: Vec<Varnode>,
+    #[serde(default)]
+    pub userop: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Insn {
+    pub addr: Addr,
+    pub length: u8,
+    pub mnemonic: String,
+    pub operands: String,
+    pub text: String,
+    pub ops: Vec<PcodeOp>,
+    pub internal_flow: bool,
+    pub x87: bool,
+    pub x87_delta: i8,
+    #[serde(default)]
+    pub userops: Vec<u64>,
+}
+
+impl Insn {
+    pub fn end(&self) -> Addr {
+        self.addr + self.length as Addr
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SehEffect {
+    Landing,
+    Enter,
+    Leave,
+    Adopt,
+    Orphan,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FunctionIr {
+    pub addr: Addr,
+    pub insns: Vec<Insn>,
+    pub succ: Vec<Vec<u32>>,
+    pub exits: BTreeMap<u32, Vec<Addr>>,
+    pub tables: BTreeSet<u32>,
+    pub dynamic: BTreeSet<u32>,
+    pub noreturn: BTreeMap<u32, Addr>,
+    pub entries: Vec<Addr>,
+    pub dead: BTreeSet<u32>,
+    #[serde(default)]
+    pub call_returns: BTreeSet<Addr>,
+    #[serde(default)]
+    pub seh: BTreeMap<u32, Vec<SehEffect>>,
+    #[serde(default)]
+    pub seh_handlers: BTreeMap<u32, Addr>,
+    #[serde(default)]
+    pub seh_unwind_only: BTreeSet<u32>,
+    #[serde(default)]
+    pub import_tails: BTreeMap<u32, Addr>,
+}
+
+impl FunctionIr {
+    pub fn index_of(&self, addr: Addr) -> Option<u32> {
+        self.insns
+            .binary_search_by_key(&addr, |insn| insn.addr)
+            .ok()
+            .map(|i| i as u32)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Policy {
+    #[default]
+    Optimizing,
+    Conservative,
+}

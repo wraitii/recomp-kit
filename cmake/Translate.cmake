@@ -82,7 +82,7 @@ endif()
 # and the app keeps only the dispatch table. Other platforms link the whole
 # translation as one archive, where the branch range is not a limit.
 set(RECOMP_GEN_PIECES "")
-set(RECOMP_GEN_PIECE_BUDGET 160000000)
+set(RECOMP_GEN_PIECE_BUDGET 160000000 CACHE STRING "C source bytes per translated dylib")
 
 function(recomp_make_piece index)
   set(target recomp_piece_${index})
@@ -139,6 +139,13 @@ function(recomp_split_main_gen result)
     recomp_make_piece(${index} ${sources})
     list(APPEND targets recomp_piece_${index})
   endif()
+  file(GLOB built ${CMAKE_BINARY_DIR}/librecomp_piece_*.dylib)
+  foreach(path IN LISTS built)
+    get_filename_component(name "${path}" NAME)
+    if(name MATCHES "^librecomp_piece_([0-9]+)\\.dylib$" AND CMAKE_MATCH_1 GREATER index)
+      file(REMOVE "${path}")
+    endif()
+  endforeach()
   set(${result} ${targets} PARENT_SCOPE)
 endfunction()
 

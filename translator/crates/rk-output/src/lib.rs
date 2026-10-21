@@ -1,0 +1,433 @@
+mod symbols;
+mod table;
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
+use std::path::Path;
+
+use rayon::prelude::*;
+use rk_core::program::Program;
+use rk_core::settings::Settings;
+use rk_core::{Addr, Error, Result};
+
+pub use symbols::{symbol_rows, SymbolRow};
+
+pub const CHUNK_ADDRESS_BITS: u32 = 16;
+pub const CHUNK_SOURCE_BUDGET: usize = 4 * 1024 * 1024;
+pub const ENTRY_ADDRESS_BITS: u32 = 16;
+
+const BODY_HEADER: &str = r#"/* generated -- translated bodies do not depend on replacement policy */
+#ifndef RECOMP_BODY_H
+#define RECOMP_BODY_H
+#include "x86.h"
+#include "intrinsics.h"
+#include "seh.h"
+#define RECOMP_ENTRY_CAT_(a, b) a##b
+#define RECOMP_ENTRY_CAT(a, b) RECOMP_ENTRY_CAT_(a, b)
+#define CALL_FN(a) RECOMP_ENTRY_CAT(entry_, a)(c)
+#define CALL_FN_CHECKED(a, expected) RECOMP_ENTRY_CAT(entry_checked_, a)(c, expected)
+#endif
+"#;
+
+const ENTRY_STUB_INCLUDES: &str = r#"#include "x86.h"
+#ifdef RECOMP_OVERRIDE_HEADER
+#include RECOMP_OVERRIDE_HEADER
+#endif
+"#;
+
+const ENTRY_STUB_PRELUDE: &str = r#"void recomp_enter(X86 *c, uint32_t index);
+#define RECOMP_SLOW_(i) RECOMP_UNLIKELY(__atomic_load_n(&recomp_slow[i], __ATOMIC_RELAXED))
+#define RECOMP_ENTER(i, base) \
+    do { recomp_execution_checkpoint(c); if (RECOMP_SLOW_(i)) recomp_enter(c, i); else base; } while (0)
+#define RECOMP_ENTER_CHECKED(i, body, base) \
+    do { recomp_execution_checkpoint(c); \
+         if (RECOMP_SLOW_(i)) recomp_enter_checked(c, i, expected, body); else base; } while (0)
+"#;
+
+const MODULE_ENTRY_STUB_PRELUDE: &str = r#"
+extern uint8_t recomp_{key}_hooked[];
+void recomp_enter_{key}(X86 *c, uint32_t index);
+void recomp_hook_{key}(X86 *c, uint32_t index);
+#define RECOMP_ENTER(i, base) \
+    do { \
+        if (RECOMP_UNLIKELY(recomp_profile_enabled || recomp_frame_watch)) \
+            recomp_enter_{key}(c, i); \
+        else { \
+            recomp_execution_checkpoint(c); \
+            if (RECOMP_UNLIKELY(__atomic_load_n(&recomp_{key}_hooked[i], __ATOMIC_ACQUIRE))) \
+                recomp_hook_{key}(c, i); \
+            else base; \
+        } \
+    } while (0)
+"#;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Declaration {
+    Entry(Addr),
+    Checked(Addr),
+    PrivatePrepare(Addr),
+    PrivateContract {
+        addr: Addr,
+        mask: u16,
+        input_argument: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Preludes {
+    pub memory_helpers: String,
+    pub return_helpers: String,
+    pub float_helpers: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Requires {
+    pub arena: bool,
+    pub return_fast: bool,
+    pub fcom: bool,
+    pub icaches: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Body {
+    pub addr: Addr,
+    pub insns: usize,
+    pub first: Addr,
+    pub last: Addr,
+    pub text: String,
+    pub requires: Requires,
+    pub declarations: BTreeSet<Declaration>,
+    pub private_mask: Option<u16>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Region {
+    pub start: Addr,
+    pub end: Addr,
+    pub symbol: String,
+}
+
+pub struct Translation<'a> {
+    pub settings: &'a Settings,
+    pub program: &'a Program,
+    pub bodies: Vec<Body>,
+    pub preludes: Preludes,
+    pub call_returns: Vec<Addr>,
+    pub regions: Vec<Region>,
+    pub call_facts: BTreeMap<Addr, Vec<Addr>>,
+    pub cw_effects: BTreeMap<Addr, (u16, u16, u16)>,
+    pub checked_returns: BTreeSet<Addr>,
+    pub private_masks: BTreeMap<Addr, BTreeSet<u16>>,
+    pub private_input_arguments: BTreeMap<Addr, String>,
+    pub known_modes: BTreeSet<Addr>,
+}
+
+pub struct Written {
+    pub chunks: usize,
+    pub entry_chunks: usize,
+    pub symbols: Vec<SymbolRow>,
+}
+
+fn write_file(path: &Path, text: &str) -> Result<()> {
+    std::fs::write(path, text).map_err(|e| Error::io(path, e))
+}
+
+pub fn write(out: &Path, t: &Translation) -> Result<Written> {
+    std::fs::create_dir_all(out).map_err(|e| Error::io(out, e))?;
+    let entry_names: Vec<Addr> = t.program.entries.keys().copied().collect();
+    let symbols = symbol_rows(t.settings, t.program, &entry_names)?;
+    let module = t.settings.module.as_ref().map(|m| m.key.as_str());
+
+    write_file(&out.join("funcs.h"), &funcs_header(&entry_names))?;
+    write_file(&out.join("body.h"), BODY_HEADER)?;
+    let chunks = partition_chunks(&t.bodies, CHUNK_SOURCE_BUDGET);
+    let chunk_count = chunks.len();
+    chunks
+        .into_par_iter()
+        .map(|(name, group)| write_file(&out.join(&name), &body_chunk(t, &group, module)))
+        .collect::<Result<()>>()?;
+    let entry_chunks = entry_chunks(&entry_names, module, t);
+    let entry_chunk_count = entry_chunks.len();
+    for (name, text) in entry_chunks {
+        write_file(&out.join(name), &text)?;
+    }
+    let table = match &t.settings.module {
+        Some(m) => table::module_table(&entry_names, &symbols, &t.call_returns, m),
+        None => table::main_table(
+            &entry_names,
+            &symbols,
+            &t.call_returns,
+            &t.regions,
+            &t.private_masks,
+        ),
+    };
+    write_file(&out.join("table.c"), &table)?;
+    write_file(
+        &out.join("call_facts.c"),
+        &table::call_facts(&t.call_facts, &t.cw_effects),
+    )?;
+    write_file(
+        &out.join("symbols.json"),
+        &symbols::symbols_json(t.settings, t.program, &symbols)?,
+    )?;
+    Ok(Written {
+        chunks: chunk_count,
+        entry_chunks: entry_chunk_count,
+        symbols,
+    })
+}
+
+fn partition_chunks(bodies: &[Body], budget: usize) -> Vec<(String, Vec<&Body>)> {
+    let weight = |b: &Body| b.text.len() + usize::from(!b.text.is_empty());
+    let mut result = Vec::new();
+    let mut by_address: BTreeMap<Addr, Vec<&Body>> = BTreeMap::new();
+    for body in bodies {
+        by_address.entry(body.addr).or_default().push(body);
+    }
+    let mut buckets: BTreeMap<Addr, Vec<Vec<&Body>>> = BTreeMap::new();
+    for (addr, group) in by_address {
+        if group.iter().map(|body| weight(body)).sum::<usize>() >= budget {
+            result.push((format!("chunk_fn_{addr:08x}.c"), group));
+        } else {
+            buckets
+                .entry(addr >> CHUNK_ADDRESS_BITS)
+                .or_default()
+                .push(group);
+        }
+    }
+    fn split<'a>(
+        group: Vec<Vec<&'a Body>>,
+        base: Addr,
+        bits: u32,
+        budget: usize,
+        weight: &dyn Fn(&Body) -> usize,
+        result: &mut Vec<(String, Vec<&'a Body>)>,
+    ) {
+        let total = group
+            .iter()
+            .flatten()
+            .map(|body| weight(body))
+            .sum::<usize>();
+        if group.len() == 1 || total <= budget || bits == 0 {
+            result.push((
+                format!("chunk_{base:08x}_{bits:02}.c"),
+                group.into_iter().flatten().collect(),
+            ));
+            return;
+        }
+        let half = base + (1 << (bits - 1));
+        let (low, high): (Vec<_>, Vec<_>) =
+            group.into_iter().partition(|b| b[0].addr < half);
+        for (children, start) in [(low, base), (high, half)] {
+            if !children.is_empty() {
+                split(children, start, bits - 1, budget, weight, result);
+            }
+        }
+    }
+    for (bucket, group) in buckets {
+        split(
+            group,
+            bucket << CHUNK_ADDRESS_BITS,
+            CHUNK_ADDRESS_BITS,
+            budget,
+            &weight,
+            &mut result,
+        );
+    }
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
+}
+
+fn body_chunk(t: &Translation, group: &[&Body], module: Option<&str>) -> String {
+    let mut s = String::new();
+    s.push_str("/* generated by recomp-translate -- do not edit */\n#include \"body.h\"\n");
+    if group.iter().any(|b| b.requires.arena) {
+        s.push_str(&t.preludes.memory_helpers);
+    }
+    if group.iter().any(|b| b.requires.return_fast) {
+        let prefix = module.map_or("recomp_".to_string(), |key| format!("recomp_{key}_"));
+        s.push_str(
+            &t.preludes
+                .return_helpers
+                .replace("recomp_call_return_", &format!("{prefix}call_return_")),
+        );
+    }
+    if group.iter().any(|b| b.requires.fcom) {
+        s.push_str(&t.preludes.float_helpers);
+    }
+    let caches: BTreeSet<&String> = group.iter().flat_map(|b| &b.requires.icaches).collect();
+    for cache in caches {
+        let _ = writeln!(s, "static RecompICache {cache};");
+    }
+    let declarations: BTreeSet<&Declaration> = group.iter().flat_map(|b| &b.declarations).collect();
+    let mut entries = BTreeSet::new();
+    let mut checked = BTreeSet::new();
+    let mut prepare = BTreeSet::new();
+    let mut private = BTreeSet::new();
+    for declaration in declarations {
+        match declaration {
+            Declaration::Entry(addr) => {
+                entries.insert(*addr);
+            }
+            Declaration::Checked(addr) => {
+                checked.insert(*addr);
+            }
+            Declaration::PrivatePrepare(addr) => {
+                prepare.insert(*addr);
+            }
+            Declaration::PrivateContract {
+                addr,
+                mask,
+                input_argument,
+            } => {
+                private.insert((*addr, *mask, input_argument.clone()));
+            }
+        }
+    }
+    for addr in entries {
+        let _ = writeln!(s, "void entry_{addr:08x}(X86 *c);");
+    }
+    for addr in checked {
+        let _ = writeln!(
+            s,
+            "void entry_checked_{addr:08x}(X86 *c, uint32_t expected);"
+        );
+    }
+    for addr in prepare {
+        let _ = writeln!(
+            s,
+            "void fn_{addr:08x}(X86 *c);\nextern void (*const entry_contract_base_{addr:08x})(X86 *);"
+        );
+        s.push_str(&contract_prepare(addr, t.known_modes.contains(&addr)));
+    }
+    for (addr, mask, input_argument) in private {
+        let parameter = input_argument.as_deref().map_or(String::new(), |name| {
+            format!("uint32_t {}_, ", name.to_lowercase())
+        });
+        let _ = writeln!(
+            s,
+            "void entry_contract_{addr:08x}_{mask:04x}(X86 *c, {parameter}uint32_t expected);"
+        );
+    }
+    s.push('\n');
+    for body in group {
+        let _ = write!(
+            s,
+            "/* FUN_{:08x}  {} insns  {:08x}..{:08x}",
+            body.addr, body.insns, body.first, body.last
+        );
+        if let Some(entries) = t.program.interior_by_function.get(&body.addr) {
+            s.push_str("  entries:");
+            for entry in entries {
+                let _ = write!(s, " {entry:08x}");
+            }
+        }
+        s.push_str(" */\n");
+        s.push_str(&body.text);
+        s.push_str("\n\n");
+    }
+    s
+}
+
+fn contract_prepare(addr: Addr, known_mode: bool) -> String {
+    let unused_mode = if known_mode {
+        ""
+    } else {
+        "    (void)mode_proven;\n"
+    };
+    let mode_guard = if known_mode {
+        "        (!mode_proven && (c->fpu_cw & 0x0f00u) != 0u) ||\n"
+    } else {
+        ""
+    };
+    format!(
+        "static inline int entry_contract_prepare_{addr:08x}(X86 *c, int mode_proven)\n{{\n{unused_mode}    if (RECOMP_UNLIKELY(recomp_hooks_ever || recomp_profile_enabled || recomp_frame_watch ||\n{mode_guard}        c->checkpoint_countdown == 0u || entry_contract_base_{addr:08x} != fn_{addr:08x}))\n        return 0;\n    --c->checkpoint_countdown;\n    return 1;\n}}\n"
+    )
+}
+
+fn entry_chunks(
+    entry_names: &[Addr],
+    module: Option<&str>,
+    t: &Translation,
+) -> Vec<(String, String)> {
+    let mut groups: BTreeMap<Addr, Vec<(usize, Addr)>> = BTreeMap::new();
+    for (index, &addr) in entry_names.iter().enumerate() {
+        groups
+            .entry(addr >> ENTRY_ADDRESS_BITS)
+            .or_default()
+            .push((index, addr));
+    }
+    groups
+        .into_iter()
+        .map(|(bucket, entries)| {
+            let mut s = String::from("/* generated stable entry thunks -- do not edit */\n");
+            s.push_str(ENTRY_STUB_INCLUDES);
+            match module {
+                Some(key) => s.push_str(&MODULE_ENTRY_STUB_PRELUDE.replace("{key}", key)),
+                None => s.push_str(ENTRY_STUB_PRELUDE),
+            }
+            for (index, addr) in &entries {
+                let _ = write!(
+                    s,
+                    "#ifndef FN_{addr:08x}\n#define FN_{addr:08x} fn_{addr:08x}\n#define RECOMP_RAW_{addr:08x}\n#endif\n\
+                     void FN_{addr:08x}(X86 *c);\n\
+                     void entry_{addr:08x}(X86 *c) {{ RECOMP_ENTER({index}u, FN_{addr:08x}(c)); }}\n"
+                );
+            }
+            for (_, addr) in &entries {
+                for mask in t.private_masks.get(addr).into_iter().flatten() {
+                    let input = t.private_input_arguments.get(addr);
+                    let parameter = input.map_or(String::new(), |name| format!("uint32_t {}_, ", name.to_lowercase()));
+                    let argument = input.map_or("c, expected".to_string(), |name| format!("c, {}_, expected", name.to_lowercase()));
+                    let _ = writeln!(s, "void fn_contract_{addr:08x}_{mask:04x}(X86 *c, {parameter}uint32_t expected);");
+                    let _ = writeln!(s, "void entry_contract_{addr:08x}_{mask:04x}(X86 *c, {parameter}uint32_t expected) {{ fn_contract_{addr:08x}_{mask:04x}({argument}); }}");
+                }
+            }
+            let checked: Vec<&(usize, Addr)> = entries
+                .iter()
+                .filter(|(_, addr)| t.checked_returns.contains(addr))
+                .collect();
+            if !checked.is_empty() {
+                s.push_str("void recomp_enter_checked(X86 *c, uint32_t index, uint32_t expected, void (*body)(X86 *, uint32_t));\n");
+                for (index, addr) in checked {
+                    let _ = writeln!(s, "void fn_checked_{addr:08x}(X86 *c, uint32_t expected);");
+                    if module.is_some() {
+                        let _ = writeln!(s, "void entry_checked_{addr:08x}(X86 *c, uint32_t expected) {{ recomp_enter_checked(c, {index}u, expected, fn_checked_{addr:08x}); }}");
+                    } else {
+                        let _ = write!(s, "void entry_checked_{addr:08x}(X86 *c, uint32_t expected) {{\n#ifdef RECOMP_RAW_{addr:08x}\n    RECOMP_ENTER_CHECKED({index}u, fn_checked_{addr:08x}, fn_checked_{addr:08x}(c, expected));\n#else\n    RECOMP_ENTER_CHECKED({index}u, fn_checked_{addr:08x}, FN_{addr:08x}(c));\n#endif\n}}\n");
+                    }
+                }
+            }
+            (format!("chunk_entries_{:08x}.c", bucket << ENTRY_ADDRESS_BITS), s)
+        })
+        .collect()
+}
+
+fn funcs_header(entry_names: &[Addr]) -> String {
+    let mut s = String::with_capacity(entry_names.len() * 160);
+    s.push_str("/* generated by recomp-translate -- do not edit */\n");
+    s.push_str("#ifndef RECOMP_FUNCS_H\n#define RECOMP_FUNCS_H\n");
+    s.push_str("#include \"x86.h\"\n#include \"intrinsics.h\"\n#include \"seh.h\"\n");
+    s.push_str("/* Define FN_<addr> in RECOMP_OVERRIDE_HEADER to select a native\n * base in table.c. Stable entries route direct and computed calls\n * through that selection without recompiling their callers. */\n");
+    s.push_str("#ifdef RECOMP_OVERRIDE_HEADER\n#include RECOMP_OVERRIDE_HEADER\n#endif\n");
+    s.push_str("#define FN_CAT_(a, b) a##b\n#define FN_CAT(a, b) FN_CAT_(a, b)\n");
+    s.push_str("#define FN(a) FN_CAT(FN_, a)\n#define FIDX(a) FN_CAT(FIDX_, a)\n");
+    s.push_str("#include \"body.h\"\n");
+    for (i, a) in entry_names.iter().enumerate() {
+        let _ = writeln!(s, "#define FIDX_{a:08x} {i}u");
+    }
+    for a in entry_names {
+        let _ = write!(
+            s,
+            "#ifndef FN_{a:08x}\n#define FN_{a:08x} fn_{a:08x}\n#endif\n"
+        );
+    }
+    for a in entry_names {
+        let _ = write!(
+            s,
+            "void fn_{a:08x}(X86 *c);\nvoid FN({a:08x})(X86 *c);\nvoid entry_{a:08x}(X86 *c);\n"
+        );
+    }
+    s.push_str("#endif\n");
+    s
+}

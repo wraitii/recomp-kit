@@ -1,0 +1,12 @@
+[package]
+name = "rk-image"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+rk-core.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

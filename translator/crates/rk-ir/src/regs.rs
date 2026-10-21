@@ -1,0 +1,82 @@
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
+use rk_core::ir::{Space, Varnode};
+use rk_sleigh::Lifter;
+
+#[derive(Debug)]
+pub struct Registers {
+    map: BTreeMap<String, Varnode>,
+}
+
+static REGISTERS: OnceLock<Registers> = OnceLock::new();
+
+impl Registers {
+    pub fn get() -> &'static Registers {
+        REGISTERS.get_or_init(|| Self::scan().expect("SLEIGH x86 register table"))
+    }
+
+    fn scan() -> Result<Self, String> {
+        let lifter = Lifter::new().map_err(|e| e.to_string())?;
+        let mut map = BTreeMap::new();
+        for size in [1u32, 2, 4, 8, 10, 16] {
+            for offset in 0..0x2000u64 {
+                if let Some(name) = lifter.register_name(offset, size) {
+                    map.entry(name.to_string())
+                        .or_insert_with(|| Varnode::new(Space::Register, offset, size));
+                }
+            }
+        }
+        Ok(Self { map })
+    }
+
+    pub fn register(&self, name: &str) -> Option<Varnode> {
+        self.map.get(name).copied()
+    }
+
+    pub fn covering(&self, offset: u64) -> Option<(&str, Varnode)> {
+        self.map
+            .iter()
+            .filter(|(_, v)| v.space == Space::Register && v.offset <= offset && offset < v.offset + v.size as u64)
+            .min_by_key(|(_, v)| (v.size, v.offset))
+            .map(|(name, v)| (name.as_str(), *v))
+    }
+
+    pub fn require(&self, name: &str) -> Varnode {
+        self.register(name)
+            .unwrap_or_else(|| panic!("SLEIGH x86 register {name}"))
+    }
+}
+
+use rk_core::contract::Field;
+
+use crate::StateKey;
+
+static LANES: OnceLock<[Vec<StateKey>; 14]> = OnceLock::new();
+
+pub fn lanes(field: Field) -> &'static [StateKey] {
+    let lanes = LANES.get_or_init(|| {
+        std::array::from_fn(|index| {
+            let field = Field::ALL[index];
+            Registers::get()
+                .register(field.name())
+                .filter(|register| register.space == Space::Register)
+                .map(|register| {
+                    (0..register.size)
+                        .map(|n| StateKey::Register((register.offset + n as u64) as u32))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    });
+    &lanes[field as usize]
+}
+
+pub fn field_lane(key: StateKey) -> Option<(Field, u8)> {
+    for field in Field::ALL {
+        if let Some(lane) = lanes(field).iter().position(|candidate| *candidate == key) {
+            return Some((field, lane as u8));
+        }
+    }
+    None
+}

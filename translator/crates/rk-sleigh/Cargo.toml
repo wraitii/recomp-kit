@@ -1,0 +1,14 @@
+[package]
+name = "rk-sleigh"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+rk-core.workspace = true
+libsla.workspace = true
+sleigh-config.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

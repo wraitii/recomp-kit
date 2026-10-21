@@ -24,7 +24,7 @@ owns. Compile the runtime with `-I<repo root>` so `guest.h` can find it.
 | `misc.cpp`, `misc_dlls.cpp` | ADVAPI32 registry, SHELL32, ole32, IMM32, WSOCK32, WINMM, and small optional-DLL probes |
 | `comctl32.cpp`, `imagehlp.cpp`, `media_foundation.cpp`, `msimg32.cpp`, `oleaut32.cpp` | common controls, DbgHelp, Media Foundation, msimg32 and automation shims |
 | `seh.cpp`, `interp.cpp`, `thunks.cpp` | guest exception checkpoints, the interpreter and thunk dispatch |
-| `call_trace.cpp`, `discovery.cpp`, `observe.cpp`, `profile.cpp` | call tracing, discovery and profiling diagnostics |
+| `call_trace.cpp`, `linear_trace.cpp`, `discovery.cpp`, `observe.cpp`, `profile.cpp` | call tracing, discovery and profiling diagnostics |
 | `installation_manifest.cpp`, `layout.cpp`, `key_names.cpp`, `resources.cpp` | installation, input layout, key names and resource helpers |
 | `mods_seam.cpp`, `native_seam.h` | the mod and native-override seams |
 | `win32.h` | what the host app and the DirectX shims call into |

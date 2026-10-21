@@ -1,0 +1,13 @@
+[package]
+name = "rk-emit"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+rk-core = { workspace = true }
+rk-ir = { workspace = true }
+rk-output = { workspace = true }
+rk-plan = { workspace = true }
+rk-ssa = { workspace = true }
+rk-x87 = { workspace = true }

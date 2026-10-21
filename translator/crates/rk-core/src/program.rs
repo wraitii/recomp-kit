@@ -1,0 +1,180 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::Serialize;
+
+use crate::{Addr, Error, Hex, Result};
+
+#[derive(Clone, Debug)]
+pub struct Image {
+    pub base: Addr,
+    pub size: u32,
+    pub data: Vec<u8>,
+    pub exec_ranges: Vec<(Addr, Addr)>,
+    pub imports: BTreeMap<Addr, Import>,
+    pub relocations: Vec<Relocation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Import {
+    pub dll: String,
+    pub name: String,
+}
+
+impl Import {
+    pub fn key(&self) -> String {
+        format!("{}!{}", self.dll, self.name)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Relocation {
+    pub target: Addr,
+    pub site: Addr,
+}
+
+impl Image {
+    pub fn end(&self) -> Addr {
+        self.base + self.size
+    }
+
+    pub fn is_exec(&self, va: Addr) -> bool {
+        self.exec_ranges.iter().any(|&(lo, hi)| lo <= va && va < hi)
+    }
+
+    pub fn bytes(&self, va: Addr, len: usize) -> Option<&[u8]> {
+        let lo = va.checked_sub(self.base)? as usize;
+        self.data.get(lo..lo.checked_add(len)?)
+    }
+
+    pub fn bytes_at(&self, va: Addr, len: usize) -> Result<&[u8]> {
+        self.bytes(va, len)
+            .ok_or_else(|| Error::input(format!("{}: outside the image", Hex(va))))
+    }
+
+    pub fn rd8(&self, va: Addr) -> Option<u8> {
+        self.bytes(va, 1).map(|b| b[0])
+    }
+
+    pub fn rd32(&self, va: Addr) -> Option<u32> {
+        self.bytes(va, 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    pub fn relocated_pointers(&self) -> BTreeMap<Addr, Addr> {
+        let mut out = BTreeMap::new();
+        for r in &self.relocations {
+            out.entry(r.target).or_insert(r.site);
+        }
+        out
+    }
+
+    pub fn relocated_data_pointers(&self) -> BTreeMap<Addr, Addr> {
+        let mut out = BTreeMap::new();
+        for r in self.relocations.iter().filter(|r| !self.is_exec(r.site)) {
+            out.entry(r.target).or_insert(r.site);
+        }
+        out
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Span {
+    pub start: Addr,
+    pub size: u32,
+    pub lengths: Option<Vec<u8>>,
+}
+
+impl Span {
+    pub fn end(&self) -> Addr {
+        self.start + self.size
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Function {
+    pub addr: Addr,
+    pub spans: Vec<Span>,
+    pub noreturn: bool,
+    pub provisional: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteriorKind {
+    Branch,
+    Data,
+    Table,
+    Discovered,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryKind {
+    Function,
+    Table,
+    Branch,
+    Data,
+    Discovered,
+    Thunk,
+    Reloc,
+    Config,
+}
+
+impl EntryKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            EntryKind::Function => "function",
+            EntryKind::Table => "table",
+            EntryKind::Branch => "branch",
+            EntryKind::Data => "data",
+            EntryKind::Discovered => "discovered",
+            EntryKind::Thunk => "thunk",
+            EntryKind::Reloc => "reloc",
+            EntryKind::Config => "config",
+        }
+    }
+}
+
+impl From<InteriorKind> for EntryKind {
+    fn from(kind: InteriorKind) -> Self {
+        match kind {
+            InteriorKind::Branch => EntryKind::Branch,
+            InteriorKind::Data => EntryKind::Data,
+            InteriorKind::Table => EntryKind::Table,
+            InteriorKind::Discovered => EntryKind::Discovered,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Program {
+    pub image: Image,
+    pub metadata: BTreeMap<String, String>,
+    pub functions: BTreeMap<Addr, Function>,
+    pub tables: BTreeMap<(Addr, Addr), Vec<Addr>>,
+    pub interior: BTreeMap<Addr, (Addr, InteriorKind)>,
+    pub noreturn_calls: BTreeSet<Addr>,
+    pub configured_entries: BTreeSet<Addr>,
+    pub entries: BTreeMap<Addr, EntryKind>,
+    pub interior_by_function: BTreeMap<Addr, Vec<Addr>>,
+    pub spans: Vec<(Addr, Addr, Addr)>,
+}
+
+impl Program {
+    pub fn containing(&self, addr: Addr) -> Option<Addr> {
+        let k = self.spans.partition_point(|&(start, _, _)| start <= addr);
+        let &(_, end, owner) = self.spans.get(k.checked_sub(1)?)?;
+        (addr < end).then_some(owner)
+    }
+
+    pub fn is_noreturn(&self, addr: Addr) -> bool {
+        self.functions.get(&addr).is_some_and(|f| f.noreturn)
+    }
+
+    pub fn entry_owner(&self, addr: Addr) -> Option<Addr> {
+        if self.functions.contains_key(&addr) {
+            Some(addr)
+        } else {
+            self.containing(addr)
+        }
+    }
+}
