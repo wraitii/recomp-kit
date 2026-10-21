@@ -35,17 +35,19 @@ The app includes the other build dependencies; GOG installer imports also need
 
 ## Games
 
-The games below are playable in single player, with Spore still in development.
-Networking is currently unsupported across the toolkit. Each game's page lists
-the required release and preparation steps.
+All ports below except Spore are intended to be fully playable in single player.
+The testing labels describe gameplay testing coverage. Spore reaches the menus,
+but in-game play is largely untested and some quirks remain. Networking is
+currently unsupported across the toolkit. Each game's page lists the required
+release and preparation steps.
 
 | Game | Status | Required version |
 | --- | --- | --- |
-| [Black & White](games/black-and-white/README.md) | Playable | CD with Fan Patch 1.42 |
-| [Tom Clancy's Ghost Recon](games/ghost-recon/README.md) | Playable | GOG 1.4 |
-| [Civilization IV: Beyond the Sword](games/civ4-bts/README.md) | Playable | GOG 3.19; additional DLL required |
-| [4x4 Evolution 2](games/4x4-evo2/README.md) | Playable | PC 1.00.139 with matching renderer DLLs |
-| [Railroad Tycoon 3](games/railroad-tycoon-3/README.md) | Playable | GOG 1.05 |
+| [Black & White](games/black-and-white/README.md) | Playable (lightly tested) | CD with Fan Patch 1.42 |
+| [Tom Clancy's Ghost Recon](games/ghost-recon/README.md) | Playable (well tested) | GOG 1.4 |
+| [Civilization IV: Beyond the Sword](games/civ4-bts/README.md) | Playable (lightly tested) | GOG 3.19; additional DLL required |
+| [4x4 Evolution 2](games/4x4-evo2/README.md) | Playable (lightly tested) | PC 1.00.139 with matching renderer DLLs |
+| [Railroad Tycoon 3](games/railroad-tycoon-3/README.md) | Playable (well tested) | GOG 1.05 |
 | [Spore](games/spore/README.md) | Work in progress | GOG Collection, Galactic Adventures 3.1.0.22 |
 
 Performance is generally good, with occasional slowdowns still being worked on,
