@@ -155,6 +155,7 @@ pub fn preludes() -> Preludes {
 
 pub struct EmitReport {
     pub c_field_residency_violations: usize,
+    pub fallbacks: BTreeSet<(Addr, String)>,
 }
 
 pub fn emit_body(planned: &PlannedFunction, ctx: &EmitContext<'_>) -> Result<(Body, EmitReport)> {
@@ -163,6 +164,7 @@ pub fn emit_body(planned: &PlannedFunction, ctx: &EmitContext<'_>) -> Result<(Bo
     let ir = ctx.ir;
     let report = EmitReport {
         c_field_residency_violations: emitter.residency_violations,
+        fallbacks: std::mem::take(&mut emitter.fallbacks),
     };
     Ok((Body {
         addr: planned.ssa.addr,
@@ -200,6 +202,7 @@ struct Emitter<'a> {
     inlined: Vec<bool>,
     in_block: Vec<bool>,
     residency_violations: usize,
+    fallbacks: BTreeSet<(Addr, String)>,
 }
 
 #[derive(Clone, Copy)]
@@ -340,6 +343,7 @@ impl<'a> Emitter<'a> {
             inlined: vec![false; s.blocks.len()],
             in_block,
             residency_violations,
+            fallbacks: BTreeSet::new(),
         }
     }
 
@@ -778,6 +782,7 @@ impl<'a> Emitter<'a> {
 
     fn slow_trap(&mut self, addr: Addr, reason: &str) {
         let reason = reason.replace(['"', '\\'], "_");
+        self.fallbacks.insert((addr, reason.clone()));
         let _ = writeln!(
             self.out,
             "recomp_unmodelled_named(c, 0x{addr:08x}u, \"{reason}\"); return;"

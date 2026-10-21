@@ -587,7 +587,6 @@ dependencies = [
 name = "rk-ssa"
 version = "0.1.0"
 dependencies = [
- "rayon",
  "rk-core",
  "rk-ir",
  "serde",
@@ -598,10 +597,8 @@ dependencies = [
 name = "rk-x87"
 version = "0.1.0"
 dependencies = [
- "rayon",
  "rk-core",
  "rk-decode",
- "rk-frontend",
  "rk-ir",
  "rk-ssa",
 ]

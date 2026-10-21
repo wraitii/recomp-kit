@@ -37,8 +37,6 @@ struct Args {
     dump: Vec<Stage>,
     #[arg(long, value_enum, default_value_t = X87Mode::Auto)]
     x87_mode: X87Mode,
-    #[arg(long, help = "run whole-image SSA and x87 verification sweeps")]
-    check: bool,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -127,12 +125,20 @@ type BodyRow = (
 );
 
 #[derive(Default)]
+struct Fallback {
+    functions: usize,
+    sites: Vec<Addr>,
+}
+
+#[derive(Default)]
 struct EmitStats {
     emitted: usize,
     trapping: usize,
     rejections: BTreeMap<String, usize>,
     details: BTreeMap<String, usize>,
     detail_addrs: BTreeMap<String, Vec<Addr>>,
+    fallback_functions: usize,
+    fallbacks: BTreeMap<String, Fallback>,
     c_field_residency_violations: usize,
     c_field_residency_violation_addrs: Vec<Addr>,
 }
@@ -278,7 +284,7 @@ fn emit_row(
 ) -> BodyRow {
     let emit_ctx = ctx.emit_context(ir, None);
     match rk_emit::emit_body(planned, &emit_ctx) {
-        Ok((mut body, emit_report)) => {
+        Ok((mut body, mut emit_report)) => {
             let covered: BTreeSet<Addr> =
                 planned.ssa.entries.iter().map(|entry| entry.addr).collect();
             for entry in ctx
@@ -289,6 +295,7 @@ fn emit_row(
                 .flatten()
             {
                 if !covered.contains(entry) {
+                    emit_report.fallbacks.insert((*entry, "uncovered entry".to_string()));
                     body.text.push_str(&format!(
                         "\nvoid fn_{entry:08x}(X86 *c) {{ recomp_unmodelled(c, 0x{entry:08x}u); }}"
                     ));
@@ -314,6 +321,17 @@ fn account(stats: &mut EmitStats, (addr, body, reason, report): BodyRow, bodies:
         if report.c_field_residency_violations != 0 {
             stats.c_field_residency_violations += report.c_field_residency_violations;
             stats.c_field_residency_violation_addrs.push(addr);
+        }
+        if !report.fallbacks.is_empty() {
+            stats.fallback_functions += 1;
+            let mut reasons = BTreeSet::new();
+            for (site, reason) in report.fallbacks {
+                let entry = stats.fallbacks.entry(reason.clone()).or_default();
+                if reasons.insert(reason) {
+                    entry.functions += 1;
+                }
+                entry.sites.push(site);
+            }
         }
     }
     if let Some((reason, detail)) = reason {
@@ -694,9 +712,7 @@ struct ReportInputs<'a> {
     program: &'a Program,
     analysis: &'a rk_frontend::Analysis,
     summary: &'a IrSummary,
-    ssa: &'a rk_ssa::SweepReport,
     global: &'a rk_global::GlobalReport,
-    x87: Option<&'a rk_x87::X87Report>,
     emitted: &'a EmitStats,
     written: &'a rk_output::Written,
     phases: &'a Phases,
@@ -708,9 +724,7 @@ fn report(input: &ReportInputs<'_>) -> Result<String> {
         program,
         analysis,
         summary,
-        ssa,
         global,
-        x87,
         emitted,
         written,
         phases,
@@ -741,21 +755,6 @@ fn report(input: &ReportInputs<'_>) -> Result<String> {
         "instructions": instructions,
         "call_returns": call_returns,
         "seh_helpers": analysis.seh_helpers.len(),
-        "ssa": {
-            "built": ssa.built,
-            "failed": ssa.failed,
-            "values": ssa.values,
-            "verify_failed": ssa.verify_failed,
-            "prepared": ssa.prepared,
-            "prepared_failed": ssa.prepared_failed,
-            "prepared_verify_failed": ssa.prepared_verify_failed,
-            "prepared_values": ssa.prepared_values,
-            "live_raw": ssa.live_raw,
-            "live_prepared": ssa.live_prepared,
-            "slow": ssa.slow,
-            "lowering_diagnostics": ssa.diagnostics,
-            "errors": ssa.errors,
-        },
         "global": {
             "contracts": global.contracts,
             "contract_excluded": global.contract_excluded,
@@ -769,25 +768,6 @@ fn report(input: &ReportInputs<'_>) -> Result<String> {
             "instruction_checks": global.instruction_checks,
             "instruction_mismatches": global.instruction_mismatches.len(),
         },
-        "x87": x87.map(|x87| serde_json::json!({
-            "functions": x87.functions,
-            "built": x87.built,
-            "failed": x87.failed,
-            "recipes": x87.recipes,
-            "residual": x87.residual,
-            "residual_total": x87.residual_total,
-            "build_failed": x87.build_failed,
-            "verify_failed": x87.verify_failed,
-            "prepare_failed": x87.prepare_failed,
-            "prepared_verify_failed": x87.prepared_verify_failed,
-            "plans": x87.plans,
-            "plan_skipped": x87.plan_skipped,
-            "plan_failed": x87.plan_failed,
-            "plan_panics": x87.plan_panics,
-            "plan_errors": x87.plan_errors,
-            "errors": x87.errors,
-            "seconds": x87.seconds,
-        })),
         "bodies": {
             "trapping": emitted.trapping,
             "emitted": emitted.emitted,
@@ -796,6 +776,17 @@ fn report(input: &ReportInputs<'_>) -> Result<String> {
             "detail_addrs": emitted.detail_addrs,
             "c_field_residency_violations": emitted.c_field_residency_violations,
             "c_field_residency_violation_addrs": emitted.c_field_residency_violation_addrs,
+        },
+        "fallbacks": {
+            "functions": emitted.fallback_functions,
+            "reasons": emitted.fallbacks.iter().map(|(reason, fallback)| {
+                let mut sites = fallback.sites.clone();
+                sites.sort_unstable();
+                (reason.clone(), serde_json::json!({
+                    "functions": fallback.functions,
+                    "sites": sites.iter().map(|&site| Hex(site).to_string()).collect::<Vec<_>>(),
+                }))
+            }).collect::<BTreeMap<_, _>>(),
         },
         "diagnostics": diagnostics,
         "diagnostics_histogram": histogram,
@@ -830,17 +821,6 @@ fn main() -> Result<()> {
     phases.mark("facts");
     let whole = args.out.is_some() || args.dump.is_empty();
     let wants_global = whole || args.wants(Stage::Global);
-    let ssa = if whole && args.check {
-        rk_ssa::sweep(
-            &analysis.ir,
-            &program.image,
-            &rk_ssa::ConservativeCallFacts,
-            &rk_ir::NoX87,
-        )?
-    } else {
-        rk_ssa::SweepReport::default()
-    };
-    phases.mark("ssa");
     let global = if wants_global {
         rk_global::GlobalFacts::analyze(&rk_global::GlobalInput {
             settings: &settings,
@@ -852,12 +832,6 @@ fn main() -> Result<()> {
         rk_global::GlobalFacts::default()
     };
     phases.mark("global");
-    let x87 = if whole && args.check {
-        Some(rk_x87::sweep(&analysis, &program.image))
-    } else {
-        None
-    };
-    phases.mark("x87");
     let only = if whole { &[][..] } else { &args.only[..] };
     let wants_bodies = whole || args.wants(Stage::Bodies);
     let owned = (wants_bodies && args.dump.is_empty()).then(|| std::mem::take(&mut analysis.ir));
@@ -966,6 +940,18 @@ fn main() -> Result<()> {
                 .collect();
             eprintln!("  body rejections: {}", rows.join(", "));
         }
+        if emit_stats.fallback_functions != 0 {
+            let rows: Vec<String> = emit_stats
+                .fallbacks
+                .iter()
+                .map(|(reason, fallback)| format!("{reason}={}", fallback.functions))
+                .collect();
+            eprintln!(
+                "  {} functions with fallbacks: {}",
+                emit_stats.fallback_functions,
+                rows.join(", ")
+            );
+        }
     }
     if let Some(path) = &args.report {
         let mut global_report = global.report.clone();
@@ -978,9 +964,7 @@ fn main() -> Result<()> {
                 program: &program,
                 analysis: &analysis,
                 summary: &summary,
-                ssa: &ssa,
                 global: &global_report,
-                x87: x87.as_ref(),
                 emitted: &emit_stats,
                 written: &written,
                 phases: &phases,

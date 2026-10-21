@@ -12,7 +12,6 @@ mod flags;
 mod forward;
 mod liveness;
 mod prepare;
-mod sweep;
 mod verify;
 
 pub use build::{
@@ -24,7 +23,6 @@ pub use flags::{FlagDescriptor, FlagPlan, FlagPublication, FlagSource};
 pub use forward::forward;
 pub use liveness::{live_values, simplify};
 pub use prepare::{prepare, publications, PrepareOptions};
-pub use sweep::{sweep, SweepReport};
 pub use verify::verify;
 
 pub type ValueId = u32;

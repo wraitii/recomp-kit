@@ -9,8 +9,6 @@ rk-core.workspace = true
 rk-ir.workspace = true
 rk-ssa.workspace = true
 rk-decode.workspace = true
-rk-frontend.workspace = true
-rayon.workspace = true
 
 [lints]
 workspace = true
