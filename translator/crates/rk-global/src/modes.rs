@@ -143,7 +143,7 @@ pub(crate) fn analyze(
             let addr = graph.nodes[node as usize];
             let prep = &prepared[&addr];
             for &root in &prep.roots {
-                entries.push((addr, root, prep.sites[prep.order[root as usize] as usize]));
+                entries.push((addr, root, prep.sites[root as usize]));
             }
         }
         entries.sort_by_key(|&(addr, root, _)| (addr, root));
@@ -441,18 +441,8 @@ fn prepare(fir: &FunctionIr, indirect: &BTreeMap<Addr, Vec<Addr>>) -> Option<Mod
     }) {
         return None;
     }
-    if tails.is_empty() && !closed(fir, &tails) {
+    if !closed(fir, &tails) {
         return None;
-    }
-    for (index, insn) in fir.insns.iter().enumerate() {
-        let index = index as u32;
-        if fir.succ[index as usize].is_empty()
-            && !tails.contains(&index)
-            && !fir.noreturn.contains_key(&index)
-            && !is_return(insn)
-        {
-            return None;
-        }
     }
     let entry = fir.index_of(fir.addr)?;
     let mut roots = vec![entry];
@@ -463,23 +453,7 @@ fn prepare(fir: &FunctionIr, indirect: &BTreeMap<Addr, Vec<Addr>>) -> Option<Mod
     }
     roots.sort_unstable();
     roots.dedup();
-    let mut successors: Vec<Vec<u32>> = fir
-        .succ
-        .iter()
-        .enumerate()
-        .map(|(index, targets)| {
-            if tails.contains(&(index as u32)) {
-                Vec::new()
-            } else {
-                targets.clone()
-            }
-        })
-        .collect();
-    for &index in fir.exits.keys() {
-        if tails.contains(&index) {
-            successors[index as usize].clear();
-        }
-    }
+    let successors = fir.succ.clone();
     let mut seen = vec![false; fir.insns.len()];
     let mut pending = roots.clone();
     while let Some(index) = pending.pop() {
