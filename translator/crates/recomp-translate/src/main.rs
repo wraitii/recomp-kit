@@ -37,6 +37,10 @@ struct Args {
     dump: Vec<Stage>,
     #[arg(long, value_enum, default_value_t = X87Mode::Auto)]
     x87_mode: X87Mode,
+    #[arg(long, help = "withhold part of the code map, run discovery alone and write how it compares")]
+    discovery_eval: Option<PathBuf>,
+    #[arg(long, default_value_t = 0.0, help = "fraction of code-map functions --discovery-eval keeps")]
+    map_keep: f64,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -830,6 +834,35 @@ fn report(input: &ReportInputs<'_>) -> Result<String> {
     Ok(serde_json::to_string_pretty(&json)? + "\n")
 }
 
+fn discovery_eval(
+    settings: &Settings,
+    program: &Program,
+    lengths: &SleighLengths,
+    keep: f64,
+    path: &std::path::Path,
+) -> Result<()> {
+    let sample = rk_discover::eval::withhold(program, keep)?;
+    let started = std::time::Instant::now();
+    let discovered = rk_discover::discover_with(settings, &sample, Some(lengths))?;
+    let seconds = started.elapsed().as_secs_f64();
+    let evaluation = rk_discover::eval::evaluate(program, &sample, keep, &discovered, Some(lengths))?;
+    let mut json = serde_json::to_value(&evaluation)?;
+    json["discover_seconds"] = seconds.into();
+    std::fs::write(path, serde_json::to_string_pretty(&json)? + "\n")
+        .with_context(|| path.display().to_string())?;
+    let w = &evaluation.withheld_functions;
+    let k = &evaluation.kept;
+    eprintln!(
+        "keep {keep}: {} of {} functions withheld; found {} as functions, {} as entries, {} as instructions, {} misaligned, {} missed",
+        w.total, evaluation.reference_functions, w.found_as_function, w.found_as_entry, w.instruction_start, w.misaligned, w.missed
+    );
+    eprintln!(
+        "  kept instructions {}: recall {:.4}, precision {:.4}, {} misaligned, {} outside the map ({} bytes); {seconds:.2}s",
+        k.total, k.recall, k.precision, k.misaligned, k.outside_reference, k.outside_reference_bytes
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     if let Some(jobs) = args.jobs {
@@ -845,6 +878,9 @@ fn main() -> Result<()> {
     let lengths = SleighLengths {
         cache: Default::default(),
     };
+    if let Some(path) = &args.discovery_eval {
+        return discovery_eval(&settings, &program, &lengths, args.map_keep, path);
+    }
     let discovered = rk_discover::discover_with(&settings, &program, Some(&lengths))?;
     rk_discover::merge(&mut program, &discovered)?;
     phases.mark("discover");

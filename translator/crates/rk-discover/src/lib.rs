@@ -1,11 +1,14 @@
+pub mod eval;
 pub mod report;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::Path;
+
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use rk_core::program::{Function, Image, InteriorKind, Program, Span};
 use rk_core::settings::Settings;
 use rayon::prelude::*;
-use rk_core::{Addr, Error, Hex, Result};
+use rk_core::{parse_hex, Addr, Error, Hex, Result};
 
 use report::{
     Conflict, DiscardedSeed, DiscoveryReport, EntryReject, EntryRejection, FunctionReject,
@@ -14,12 +17,32 @@ use report::{
 
 const RANK_TRUSTED: u16 = 100;
 const RANK_MAPPED_FLOW: u16 = 90;
+const RANK_OBSERVED: u16 = 80;
 const RANK_RELOCATED_FLOW: u16 = 70;
 const RANK_RELOCATION: u16 = 60;
 const RANK_RELOCATED_IMMEDIATE: u16 = 55;
+const RANK_IMMEDIATE: u16 = 45;
+const RANK_POINTER: u16 = 40;
 const RANK_SWEEP: u16 = 30;
-const RANK_POINTER: u16 = 20;
+const RANK_INTERIOR_POINTER: u16 = 20;
+const RANK_SINGLE_POINTER: u16 = 15;
 const BODY_BYTES: Addr = 4096;
+const SWITCH_LOOKBACK: usize = 6;
+const SWITCH_SLOTS: u32 = 4096;
+const SWITCH_REACH: u32 = 0x10000;
+const NORETURN_IMPORTS: &[&str] = &[
+    "ExitProcess",
+    "ExitThread",
+    "FreeLibraryAndExitThread",
+    "_exit",
+    "exit",
+    "abort",
+    "_amsg_exit",
+    "_CxxThrowException",
+    "longjmp",
+    "_endthread",
+    "_endthreadex",
+];
 
 type Functions = BTreeMap<Addr, Vec<Span>>;
 type Entries = BTreeMap<Addr, (Addr, InteriorKind)>;
@@ -77,6 +100,10 @@ impl Insn {
         self.flow == FlowControl::Return
     }
 
+    fn end(&self) -> Addr {
+        self.addr + self.size as u32
+    }
+
     fn seeds_flow(&self) -> bool {
         self.is_call()
             || (self.is_jump()
@@ -87,6 +114,47 @@ impl Insn {
         self.is_ret()
             || matches!(self.mnemonic, Mnemonic::Jmp | Mnemonic::Int3 | Mnemonic::Ud0 | Mnemonic::Ud1 | Mnemonic::Ud2)
     }
+
+    fn flow_target(&self) -> Option<(Addr, bool)> {
+        self.direct.filter(|_| self.seeds_flow())
+    }
+
+    fn absolute_slot(&self) -> Option<Addr> {
+        match self.ops[0] {
+            SimpleOp::Mem(m) if m.base == Register::None && m.index == Register::None => Some(m.displacement),
+            _ => None,
+        }
+    }
+
+    fn pointer_immediate(&self) -> Option<Addr> {
+        matches!(self.mnemonic, Mnemonic::Push | Mnemonic::Mov)
+            .then_some(self.imm4)
+            .flatten()
+            .map(|(_, value)| value)
+    }
+
+    fn switch_jump(&self) -> Option<(Register, Addr)> {
+        if self.flow != FlowControl::IndirectBranch || self.op_count != 1 {
+            return None;
+        }
+        match self.ops[0] {
+            SimpleOp::Mem(m) if m.base == Register::None && m.index != Register::None && m.scale == 4 && m.size == 4 => {
+                Some((m.index.full_register(), m.displacement))
+            }
+            _ => None,
+        }
+    }
+
+    fn writes(&self, register: Register) -> bool {
+        !matches!(self.mnemonic, Mnemonic::Cmp | Mnemonic::Test | Mnemonic::Push)
+            && matches!(self.ops[0], SimpleOp::Reg(r) if r.full_register() == register)
+    }
+}
+
+struct Switch {
+    table: Addr,
+    slots: u32,
+    index_table: Option<(Addr, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -126,12 +194,13 @@ pub fn discover_with(
     }
     let details = rk_image::details::load(&settings.exe, program.image.base)?;
     let mut recovery = Recovery::new(program, details, check);
+    recovery.map_lengths()?;
     recovery.initial_seeds();
-    recovery.mapped_flow_seeds()?;
+    recovery.observed_seeds(settings)?;
+    recovery.mapped_flow_seeds();
     recovery.pointer_tables();
-    recovery.index_tables();
-    recovery.sweep()?;
-    recovery.index_tables();
+    recovery.sweep();
+    recovery.finish();
     let (functions, entries) = recovery.code_map_rows()?;
     let (functions, entries) = recovery.filter(functions, entries)?;
     let report = recovery.report();
@@ -166,9 +235,8 @@ struct Recovery<'a> {
     check: Option<&'a dyn DecodeCheck>,
     delta: u32,
     instructions: BTreeMap<Addr, Insn>,
-    covered: BTreeMap<Addr, Addr>,
+    covered: Vec<Addr>,
     speculative: BTreeSet<Addr>,
-    speculative_seeds: BTreeSet<Addr>,
     trusted_seeds: BTreeSet<Addr>,
     seed_rank: BTreeMap<Addr, u16>,
     instruction_rank: BTreeMap<Addr, u16>,
@@ -176,15 +244,20 @@ struct Recovery<'a> {
     ghidra_spans: Vec<(Addr, Addr, Addr)>,
     ghidra_lengths: BTreeMap<Addr, Vec<u8>>,
     ghidra_entries: BTreeMap<Addr, Addr>,
+    mapped_starts: BTreeSet<Addr>,
+    mapped_ends: BTreeSet<Addr>,
+    mapped_tables: BTreeMap<Addr, BTreeSet<Addr>>,
+    noreturn_functions: BTreeSet<Addr>,
+    noreturn_calls: BTreeSet<Addr>,
     seeds: BTreeMap<Addr, BTreeSet<String>>,
     pending: VecDeque<Addr>,
     roots: BTreeSet<Addr>,
     tables: Vec<(Addr, Addr)>,
+    switches: BTreeMap<Addr, (Addr, Addr, Vec<Addr>)>,
     gaps: Vec<(Addr, Addr, &'static str)>,
     traps: BTreeMap<Addr, String>,
     data_ranges: Vec<(Addr, Addr, &'static str)>,
     known_mask: Vec<u8>,
-    data_mask: Vec<u8>,
     data_owner: Vec<i32>,
     conflicts: BTreeSet<(Addr, Addr, String)>,
     reloc_slots: BTreeSet<Addr>,
@@ -202,7 +275,6 @@ impl<'a> Recovery<'a> {
         let mut ghidra_spans = Vec::new();
         let mut ghidra_lengths = BTreeMap::new();
         let mut known_mask = vec![0u8; image.size as usize];
-        let mut data_ranges = details.data_ranges.clone();
         let mut excluded_bytes = 0u64;
         for function in program.functions.values() {
             for span in &function.spans {
@@ -216,22 +288,24 @@ impl<'a> Recovery<'a> {
                     let hi = hi.min(known_mask.len());
                     known_mask[lo..hi].fill(1);
                 }
-                data_ranges.push((span.start, span.end(), "Ghidra code map"));
                 excluded_bytes += span.size as u64;
             }
         }
         ghidra_spans.sort_unstable();
-        let reloc_slots = image.relocations.iter().map(|r| r.site).collect();
-        let known_entries = program.entries.keys().copied().collect();
-        Self {
+        let mapped_ends = ghidra_spans.iter().map(|&(_, end, _)| end).collect();
+        let mut mapped_tables: BTreeMap<Addr, BTreeSet<Addr>> = BTreeMap::new();
+        for (&(_, site), targets) in &program.tables {
+            mapped_tables.entry(site).or_default().extend(targets);
+        }
+        let mut recovery = Self {
             image,
             delta: details.delta,
+            data_ranges: Vec::new(),
             details,
             check,
             instructions: BTreeMap::new(),
-            covered: BTreeMap::new(),
+            covered: vec![0; image.size as usize],
             speculative: BTreeSet::new(),
-            speculative_seeds: BTreeSet::new(),
             trusted_seeds: BTreeSet::new(),
             seed_rank: BTreeMap::new(),
             instruction_rank: BTreeMap::new(),
@@ -239,25 +313,45 @@ impl<'a> Recovery<'a> {
             ghidra_spans,
             ghidra_lengths,
             ghidra_entries: BTreeMap::new(),
+            mapped_starts: BTreeSet::new(),
+            mapped_ends,
+            mapped_tables,
+            noreturn_functions: program.functions.values().filter(|f| f.noreturn).map(|f| f.addr).collect(),
+            noreturn_calls: program.noreturn_calls.clone(),
             seeds: BTreeMap::new(),
             pending: VecDeque::new(),
             roots: BTreeSet::new(),
             tables: Vec::new(),
+            switches: BTreeMap::new(),
             gaps: Vec::new(),
             traps: BTreeMap::new(),
-            data_ranges,
             known_mask,
-            data_mask: Vec::new(),
-            data_owner: Vec::new(),
+            data_owner: vec![-1; image.size as usize],
             conflicts: BTreeSet::new(),
-            reloc_slots,
-            known_entries,
+            reloc_slots: image.relocations.iter().map(|r| r.site).collect(),
+            known_entries: program.entries.keys().copied().collect(),
             excluded_bytes,
             kept_functions: 0,
             kept_entries: 0,
             function_rejections: Vec::new(),
             entry_rejections: Vec::new(),
+        };
+        for (lo, hi, kind) in recovery.details.data_ranges.clone() {
+            recovery.add_data(lo, hi, kind);
         }
+        recovery
+    }
+
+    fn offset(&self, at: Addr) -> Option<usize> {
+        at.checked_sub(self.image.base).map(|off| off as usize).filter(|&off| off < self.covered.len())
+    }
+
+    fn owner_at(&self, at: Addr) -> Option<Addr> {
+        self.offset(at).map(|off| self.covered[off]).filter(|&owner| owner != 0)
+    }
+
+    fn rank_of(&self, at: Addr) -> u16 {
+        self.instruction_rank.get(&at).copied().unwrap_or(0)
     }
 
     fn decode_at(&self, at: Addr) -> Option<Insn> {
@@ -265,53 +359,91 @@ impl<'a> Recovery<'a> {
     }
 
     fn at_known_data(&self, at: Addr) -> bool {
-        at.checked_sub(self.image.base)
-            .and_then(|off| self.known_mask.get(off as usize))
-            .is_some_and(|&b| b != 0)
+        self.offset(at).is_some_and(|off| self.known_mask[off] != 0)
     }
 
-    fn ghidra_owner(&mut self, target: Addr) -> Option<Addr> {
-        let index = self
-            .ghidra_spans
-            .partition_point(|&(start, _, _)| start <= target)
-            .checked_sub(1)?;
-        let &(start, end, owner) = self.ghidra_spans.get(index)?;
-        if target >= end {
-            return None;
-        }
-        let lengths = self.span_lengths(start, end).ok()?;
-        let mut at = start;
-        for length in lengths {
-            if at == target {
-                return Some(owner);
-            }
-            at += length as u32;
-            if at > target {
-                return None;
+    fn in_data(&self, at: Addr) -> bool {
+        self.offset(at).is_some_and(|off| self.data_owner[off] >= 0)
+    }
+
+    fn add_data(&mut self, lo: Addr, hi: Addr, kind: &'static str) {
+        let index = self.data_ranges.len() as i32;
+        self.data_ranges.push((lo, hi, kind));
+        let size = self.data_owner.len();
+        let start = (lo.saturating_sub(self.image.base) as usize).min(size);
+        let end = (hi.saturating_sub(self.image.base) as usize).min(size);
+        for owner in &mut self.data_owner[start..end] {
+            if *owner < 0 {
+                *owner = index;
             }
         }
-        None
     }
 
-    fn span_lengths(&mut self, start: Addr, end: Addr) -> Result<Vec<u8>> {
-        if let Some(lengths) = self.ghidra_lengths.get(&start) {
-            return Ok(lengths.clone());
+    fn ghidra_owner(&self, target: Addr) -> Option<Addr> {
+        let (_, _, owner) = self.mapped_span_at(target)?;
+        self.mapped_starts.contains(&target).then_some(owner)
+    }
+
+    fn noreturn_import(&self, slot: Addr) -> bool {
+        self.image
+            .imports
+            .get(&slot)
+            .is_some_and(|import| NORETURN_IMPORTS.contains(&import.name.as_str()))
+    }
+
+    fn calls_noreturn(&self, ins: &Insn) -> bool {
+        if !ins.is_call() {
+            return false;
         }
-        let lengths = span_lengths(self.image, self.check, start, end)?;
-        self.ghidra_lengths.insert(start, lengths.clone());
-        Ok(lengths)
+        if self.noreturn_calls.contains(&ins.addr) {
+            return true;
+        }
+        match ins.direct {
+            Some((target, _)) => {
+                self.noreturn_functions.contains(&target)
+                    || self
+                        .image
+                        .bytes(target, 6)
+                        .filter(|b| b[0] == 0xff && b[1] == 0x25)
+                        .and_then(|_| self.image.rd32(target + 2))
+                        .is_some_and(|slot| self.noreturn_import(slot))
+            }
+            None => ins.absolute_slot().is_some_and(|slot| self.noreturn_import(slot)),
+        }
     }
 
-    fn seed(&mut self, target: Addr, evidence: &str, rank: u16, root: bool) {
+    fn stops(&self, ins: &Insn) -> bool {
+        ins.ends_flow() || self.calls_noreturn(ins)
+    }
+
+    fn clean_start(&self, target: Addr) -> bool {
+        self.image.is_exec(target)
+            && (target % 16 == 0
+                || matches!(self.image.rd8(target.wrapping_sub(1)), Some(0xcc | 0x90))
+                || self.mapped_ends.contains(&target)
+                || self
+                    .owner_at(target.wrapping_sub(1))
+                    .and_then(|owner| self.instructions.get(&owner))
+                    .is_some_and(|ins| ins.end() == target && self.stops(ins)))
+    }
+
+    fn seed_from(&mut self, source: Addr, target: Addr, kind: &str, rank: u16, root: bool) {
         if !self.image.is_exec(target) {
             return;
         }
-        if evidence.starts_with("direct:") && self.at_known_data(target) {
+        if self.at_known_data(target) {
             if let Some(owner) = self.ghidra_owner(target) {
                 if owner != target {
                     self.ghidra_entries.insert(target, owner);
                 }
             }
+            return;
+        }
+        self.seed(target, &format!("{kind}:{source:08x}"), rank, root);
+    }
+
+    fn seed(&mut self, target: Addr, evidence: &str, rank: u16, root: bool) {
+        if !self.image.is_exec(target) {
             return;
         }
         if root {
@@ -323,30 +455,27 @@ impl<'a> Recovery<'a> {
         self.seeds.entry(target).or_default().insert(evidence.to_string());
         self.seed_rank.insert(target, effective);
         if effective >= RANK_TRUSTED {
-            self.speculative_seeds.remove(&target);
             self.trusted_seeds.insert(target);
-        } else if !self.trusted_seeds.contains(&target) {
-            self.speculative_seeds.insert(target);
         }
-        let mut owner = self.covered.get(&target).copied();
+        let mut owner = self.owner_at(target);
         while let Some(current) = owner {
-            if current == target || self.instruction_rank.get(&current).copied().unwrap_or(0) >= effective {
+            if current == target || self.rank_of(current) >= effective {
                 break;
             }
             self.retract(current);
-            owner = self.covered.get(&target).copied();
+            owner = self.owner_at(target);
             first = true;
         }
         if owner == Some(target) {
-            if self.instruction_rank.get(&target).copied().unwrap_or(0) < effective {
+            if self.rank_of(target) < effective {
                 self.retract(target);
                 first = true;
             }
         } else if let Some(current) = owner {
             if effective >= RANK_TRUSTED {
                 self.conflicts.insert((target, current, evidence.to_string()));
-            } else if effective < self.instruction_rank.get(&current).copied().unwrap_or(0) {
-                self.discard_seed(target, &format!("covered by {current:08x} rank {}", self.instruction_rank[&current]));
+            } else if effective < self.rank_of(current) {
+                self.discard_seed(target, &format!("covered by {current:08x} rank {}", self.rank_of(current)));
             }
             return;
         }
@@ -360,7 +489,6 @@ impl<'a> Recovery<'a> {
             return;
         };
         self.seed_rank.remove(&target);
-        self.speculative_seeds.remove(&target);
         self.trusted_seeds.remove(&target);
         self.roots.remove(&target);
         self.discarded_seeds.push((target, reason.to_string(), evidence.into_iter().collect()));
@@ -372,9 +500,11 @@ impl<'a> Recovery<'a> {
         let Some(ins) = self.instructions.remove(&address) else {
             return;
         };
-        for at in address..address + ins.size as u32 {
-            if self.covered.get(&at) == Some(&address) {
-                self.covered.remove(&at);
+        for at in address..ins.end() {
+            if let Some(off) = self.offset(at) {
+                if self.covered[off] == address {
+                    self.covered[off] = 0;
+                }
             }
         }
     }
@@ -388,19 +518,19 @@ impl<'a> Recovery<'a> {
     }
 
     fn record(&mut self, ins: &Insn, rank: u16, flow: bool) -> bool {
-        let speculative = rank < RANK_TRUSTED;
         if self.pointer_run_at(ins.addr) {
             return false;
         }
-        let end = ins.addr + ins.size as u32;
-        if (ins.addr..end).any(|at| self.at_known_data(at)) {
+        let speculative = rank < RANK_TRUSTED;
+        let end = ins.end();
+        if (ins.addr..end).any(|at| self.at_known_data(at) || self.in_data(at)) {
             return false;
         }
         let mut retract = BTreeSet::new();
         for at in ins.addr..end {
-            if let Some(&owner) = self.covered.get(&at) {
+            if let Some(owner) = self.owner_at(at) {
                 if owner != ins.addr {
-                    let owner_rank = self.instruction_rank.get(&owner).copied().unwrap_or(0);
+                    let owner_rank = self.rank_of(owner);
                     if owner_rank > rank
                         || (owner_rank == rank && !(flow && self.speculative.contains(&owner)))
                     {
@@ -431,26 +561,164 @@ impl<'a> Recovery<'a> {
         }
         for owner in retract {
             let keep = self.instructions.contains_key(&owner)
-                && (self.instruction_rank.get(&owner).copied().unwrap_or(0) < rank
-                    || (flow && self.speculative.contains(&owner)));
+                && (self.rank_of(owner) < rank || (flow && self.speculative.contains(&owner)));
             if keep {
                 self.retract(owner);
             }
         }
         self.instructions.insert(ins.addr, ins.clone());
         for at in ins.addr..end {
-            self.covered.insert(at, ins.addr);
+            if let Some(off) = self.offset(at) {
+                self.covered[off] = ins.addr;
+            }
         }
         self.instruction_rank.insert(ins.addr, rank);
         if speculative {
             self.speculative.insert(ins.addr);
         }
-        if ins.seeds_flow() {
-            if let Some((target, call)) = ins.direct {
-                self.seed(target, &format!("direct:{:08x}", ins.addr), rank, call && rank >= RANK_MAPPED_FLOW);
+        if let Some((target, call)) = ins.flow_target() {
+            self.seed_from(ins.addr, target, "direct", rank, call && rank >= RANK_MAPPED_FLOW);
+        }
+        if let Some(target) = ins.pointer_immediate().filter(|&t| self.clean_start(t)) {
+            self.seed_from(ins.addr, target, "immediate", rank.min(RANK_IMMEDIATE), true);
+        }
+        if let Some((index, table)) = ins.switch_jump() {
+            let previous = self.previous_instructions(ins.addr);
+            if let Some(switch) = self.switch_extent(&previous, index, table, None) {
+                self.register_switch(ins.addr, switch, rank);
             }
         }
         true
+    }
+
+    fn previous_instructions(&self, at: Addr) -> Vec<Insn> {
+        let mut out = Vec::new();
+        let mut next = at;
+        for (&addr, ins) in self.instructions.range(..at).rev().take(SWITCH_LOOKBACK) {
+            if ins.end() != next {
+                break;
+            }
+            out.push(ins.clone());
+            next = addr;
+        }
+        out
+    }
+
+    fn switch_extent(
+        &self,
+        previous: &[Insn],
+        index: Register,
+        table: Addr,
+        known: Option<&BTreeSet<Addr>>,
+    ) -> Option<Switch> {
+        if !self.image.is_exec(table) {
+            return None;
+        }
+        let mut index = index;
+        let mut index_table = None;
+        let mut bound = None;
+        let mut inclusive = true;
+        for ins in previous {
+            match (ins.mnemonic, ins.ops[0], ins.ops[1]) {
+                (Mnemonic::Movzx | Mnemonic::Mov, SimpleOp::Reg(dest), SimpleOp::Mem(m))
+                    if index_table.is_none() && dest.full_register() == index && m.size == 1 && m.scale <= 1 =>
+                {
+                    let register = match (m.base, m.index) {
+                        (base, Register::None) if base != Register::None => base,
+                        (Register::None, index) if index != Register::None => index,
+                        _ => return None,
+                    };
+                    index_table = Some(m.displacement);
+                    index = register.full_register();
+                }
+                (Mnemonic::Cmp, SimpleOp::Reg(left), SimpleOp::Imm(right)) => {
+                    if left.full_register() == index {
+                        bound = Some(right);
+                    }
+                    break;
+                }
+                (Mnemonic::Jae | Mnemonic::Jb, _, _) => inclusive = false,
+                (Mnemonic::Ja | Mnemonic::Jbe, _, _) => inclusive = true,
+                _ if ins.flow != FlowControl::Next || ins.writes(index) => break,
+                _ => {}
+            }
+        }
+        let cases = bound.map(|bound| if inclusive { bound.saturating_add(1) } else { bound });
+        let slots = match (cases, index_table) {
+            (Some(cases), Some(bytes)) => {
+                let values = self.image.bytes(bytes, cases.min(SWITCH_SLOTS) as usize)?;
+                values.iter().map(|&v| v as u32 + 1).max()?
+            }
+            (Some(cases), None) => cases,
+            (None, Some(_)) => return None,
+            (None, None) => {
+                let fits = |value: Addr| match known {
+                    Some(targets) => targets.contains(&value),
+                    None => self.image.is_exec(value) && value < table && table - value < SWITCH_REACH,
+                };
+                let mut count = 0;
+                while count < SWITCH_SLOTS && self.image.rd32(table + count * 4).is_some_and(fits) {
+                    count += 1;
+                }
+                if count < 2 && known.is_none() {
+                    return None;
+                }
+                count
+            }
+        };
+        if slots == 0 || slots > SWITCH_SLOTS {
+            return None;
+        }
+        if !(0..slots).all(|i| self.image.rd32(table + i * 4).is_some_and(|t| self.image.is_exec(t))) {
+            return None;
+        }
+        if let Some(targets) = known {
+            if !(0..slots).all(|i| self.image.rd32(table + i * 4).is_some_and(|t| targets.contains(&t))) {
+                return self.switch_extent(&[], index, table, known);
+            }
+        }
+        Some(Switch { table, slots, index_table: index_table.zip(cases) })
+    }
+
+    fn claim_data(&mut self, lo: Addr, hi: Addr, kind: &'static str, rank: u16) -> bool {
+        let mut owners = BTreeSet::new();
+        for at in lo..hi {
+            if self.at_known_data(at) || !self.image.is_exec(at) {
+                return false;
+            }
+            if let Some(owner) = self.owner_at(at) {
+                if self.rank_of(owner) >= rank {
+                    self.conflicts.insert((lo, owner, kind.into()));
+                    return false;
+                }
+                owners.insert(owner);
+            }
+        }
+        for owner in owners {
+            self.retract(owner);
+        }
+        self.add_data(lo, hi, kind);
+        true
+    }
+
+    fn register_switch(&mut self, site: Addr, switch: Switch, rank: u16) {
+        if self.switches.contains_key(&site) {
+            return;
+        }
+        let end = switch.table + switch.slots * 4;
+        if !self.claim_data(switch.table, end, "switch table", rank) {
+            return;
+        }
+        if let Some((bytes, count)) = switch.index_table {
+            self.claim_data(bytes, bytes + count, "switch index table", rank);
+        }
+        let targets: BTreeSet<Addr> = (0..switch.slots)
+            .filter_map(|i| self.image.rd32(switch.table + i * 4))
+            .collect();
+        self.switches.insert(site, (switch.table, end, targets.iter().copied().collect()));
+        for target in targets {
+            self.seed_from(site, target, "switch", rank.min(RANK_MAPPED_FLOW), false);
+        }
     }
 
     fn trace(&mut self) {
@@ -470,8 +738,8 @@ impl<'a> Recovery<'a> {
                     }
                     break;
                 }
-                if let Some(&owner) = self.covered.get(&at) {
-                    let owner_rank = self.instruction_rank.get(&owner).copied().unwrap_or(0);
+                if let Some(owner) = self.owner_at(at) {
+                    let owner_rank = self.rank_of(owner);
                     if rank > owner_rank
                         || (rank == owner_rank && owner != at && self.speculative.contains(&owner))
                     {
@@ -486,15 +754,38 @@ impl<'a> Recovery<'a> {
                 let Some(ins) = self.decode_at(at) else {
                     break;
                 };
-                if !self.record(&ins, rank, true) {
+                if !self.record(&ins, rank, true) || self.stops(&ins) {
                     break;
                 }
-                if ins.ends_flow() {
-                    break;
-                }
-                at += ins.size as u32;
+                at = ins.end();
             }
         }
+    }
+
+    fn map_lengths(&mut self) -> Result<()> {
+        let missing: Vec<(Addr, Addr)> = self
+            .ghidra_spans
+            .iter()
+            .filter(|(start, _, _)| !self.ghidra_lengths.contains_key(start))
+            .map(|&(start, end, _)| (start, end))
+            .collect();
+        let image = self.image;
+        let check = self.check;
+        let computed: Vec<(Addr, Result<Vec<u8>>)> = missing
+            .par_iter()
+            .map(|&(start, end)| (start, span_lengths(image, check, start, end)))
+            .collect();
+        for (start, lengths) in computed {
+            self.ghidra_lengths.insert(start, lengths?);
+        }
+        for &(start, _, _) in &self.ghidra_spans {
+            let mut at = start;
+            for &length in &self.ghidra_lengths[&start] {
+                self.mapped_starts.insert(at);
+                at += length as u32;
+            }
+        }
+        Ok(())
     }
 
     fn initial_seeds(&mut self) {
@@ -520,7 +811,7 @@ impl<'a> Recovery<'a> {
         }
         self.trace();
         for r in &relocations {
-            let Some(&owner) = self.covered.get(&r.site) else {
+            let Some(owner) = self.owner_at(r.site) else {
                 continue;
             };
             let Some(ins) = self.instructions.get(&owner) else {
@@ -539,45 +830,82 @@ impl<'a> Recovery<'a> {
         self.trace();
     }
 
-    fn mapped_flow_seeds(&mut self) -> Result<()> {
-        let spans = self.ghidra_spans.clone();
-        let missing: Vec<(Addr, Addr)> = spans
-            .iter()
-            .filter(|(start, _, _)| !self.ghidra_lengths.contains_key(start))
-            .map(|&(start, end, _)| (start, end))
-            .collect();
-        let image = self.image;
-        let check = self.check;
-        let computed: Vec<(Addr, Result<Vec<u8>>)> = missing
-            .par_iter()
-            .map(|&(start, end)| (start, span_lengths(image, check, start, end)))
-            .collect();
-        for (start, lengths) in computed {
-            self.ghidra_lengths.insert(start, lengths?);
+    fn observed_seeds(&mut self, settings: &Settings) -> Result<()> {
+        let mut observed = Vec::new();
+        if let Some(path) = &settings.indirect_targets {
+            for fields in rows(path)?.iter().skip(2) {
+                let [site, kind, targets] = &fields[..] else {
+                    return Err(Error::input(format!("{}: invalid indirect target row", path.display())));
+                };
+                for target in targets.split(',') {
+                    observed.push((address(path, site)?, address(path, target)?, kind == "call"));
+                }
+            }
         }
+        if let Some(path) = &settings.discovery_evidence {
+            for fields in rows(path)?.iter().filter(|f| !f[0].starts_with('#')) {
+                let [target, kind, site, _] = &fields[..] else {
+                    return Err(Error::input(format!("{}: invalid discovery row", path.display())));
+                };
+                observed.push((address(path, site)?, address(path, target)?, kind == "call"));
+            }
+        }
+        for (site, target, call) in observed {
+            self.seed_from(site, target, "observed", RANK_OBSERVED, call);
+        }
+        self.trace();
+        Ok(())
+    }
+
+    fn mapped_flow_seeds(&mut self) {
         let mut instructions = Vec::new();
-        for (start, end, _) in spans {
-            let lengths = self.span_lengths(start, end)?;
+        for &(start, _, _) in &self.ghidra_spans {
             let mut at = start;
-            for size in lengths {
+            for &size in &self.ghidra_lengths[&start] {
                 instructions.push((at, size));
                 at += size as u32;
             }
         }
-        let mut targets: Vec<(Addr, Option<(Addr, bool)>)> = instructions
+        instructions.sort_unstable();
+        let image = self.image;
+        let check = self.check;
+        let decoded: Vec<Option<Insn>> = instructions
             .par_iter()
-            .map(|&(at, size)| (at, direct_flow_target(image, check, at, size)))
+            .map(|&(at, size)| decode_at(image, check, at).filter(|ins| ins.size == size))
             .collect();
-        targets.sort_by_key(|(at, _)| *at);
-        for (at, target) in targets {
-            if let Some((target, call)) = target {
+        for (position, ins) in decoded.iter().enumerate() {
+            let Some(ins) = ins else {
+                continue;
+            };
+            if let Some((target, call)) = ins.flow_target() {
                 if !self.at_known_data(target) {
-                    self.seed(target, &format!("mapped-flow:{at:08x}"), RANK_MAPPED_FLOW, call);
+                    self.seed_from(ins.addr, target, "mapped-flow", RANK_MAPPED_FLOW, call);
+                }
+            }
+            if let Some(target) = ins.pointer_immediate() {
+                if !self.at_known_data(target) && self.clean_start(target) {
+                    self.seed_from(ins.addr, target, "immediate", RANK_IMMEDIATE, true);
+                }
+            }
+            if let Some((index, table)) = ins.switch_jump() {
+                let mut previous = Vec::new();
+                let mut next = ins.addr;
+                for earlier in decoded[..position].iter().rev().take(SWITCH_LOOKBACK) {
+                    match earlier {
+                        Some(earlier) if earlier.end() == next => {
+                            next = earlier.addr;
+                            previous.push(earlier.clone());
+                        }
+                        _ => break,
+                    }
+                }
+                let known = self.mapped_tables.get(&ins.addr).cloned();
+                if let Some(switch) = self.switch_extent(&previous, index, table, known.as_ref()) {
+                    self.register_switch(ins.addr, switch, RANK_MAPPED_FLOW);
                 }
             }
         }
         self.trace();
-        Ok(())
     }
 
     fn pointer_tables(&mut self) {
@@ -589,14 +917,6 @@ impl<'a> Recovery<'a> {
             let hi = high.saturating_sub(base) as usize;
             if lo < size {
                 executable[lo..hi.min(size)].fill(1);
-            }
-        }
-        let mut blocked = vec![0u8; size];
-        for &at in self.covered.keys() {
-            if let Some(off) = at.checked_sub(base) {
-                if let Some(slot) = blocked.get_mut(off as usize) {
-                    *slot = 1;
-                }
             }
         }
         let sections = self.details.sections.clone();
@@ -619,22 +939,19 @@ impl<'a> Recovery<'a> {
                 let mut offset = alignment;
                 while offset + 4 <= stop {
                     let target = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+                    let image_offset = lo + offset;
+                    let absolute = base + image_offset as u32;
+                    offset += 4;
                     let Some(relative) = target.checked_sub(base) else {
-                        offset += 4;
                         continue;
                     };
                     if relative as usize >= size || executable[relative as usize] == 0 {
-                        offset += 4;
                         continue;
                     }
-                    let image_offset = lo + offset;
-                    let absolute = base + image_offset as u32;
                     if executable_section && !self.reloc_slots.contains(&absolute) {
-                        offset += 4;
                         continue;
                     }
-                    if blocked[image_offset..image_offset + 4].iter().any(|&b| b != 0) {
-                        offset += 4;
+                    if self.covered[image_offset..image_offset + 4].iter().any(|&b| b != 0) {
                         continue;
                     }
                     let original = self
@@ -645,12 +962,11 @@ impl<'a> Recovery<'a> {
                     if original == Some(target) {
                         candidates.insert(absolute, target);
                     }
-                    offset += 4;
                 }
             }
             let mut next_at = start;
             for &site in candidates.keys() {
-                if site < next_at || site + 8 > end {
+                if site < next_at {
                     continue;
                 }
                 let mut at = site;
@@ -659,23 +975,37 @@ impl<'a> Recovery<'a> {
                     slots.push((at, target));
                     at += 4;
                 }
-                if slots.len() >= 2 {
+                if slots.len() >= 2 && at <= end {
                     self.tables.push((slots[0].0, at));
                     for (slot, target) in slots {
                         if !self.at_known_data(target) && self.pointer_source(slot, target) {
-                            self.seed(target, &format!("pointer-run:{slot:08x}"), RANK_POINTER, false);
+                            let (rank, root) = if self.clean_start(target) {
+                                (RANK_POINTER, true)
+                            } else {
+                                (RANK_INTERIOR_POINTER, false)
+                            };
+                            self.seed(target, &format!("pointer-run:{slot:08x}"), rank, root);
                         }
                     }
                     next_at = at;
                 } else {
-                    next_at = slots[0].0 + 1;
+                    let (slot, target) = slots[0];
+                    let single = !executable_section
+                        && slot % 4 == 0
+                        && !self.at_known_data(target)
+                        && self.clean_start(target)
+                        && self.pointer_source(slot, target);
+                    if single {
+                        self.seed(target, &format!("pointer:{slot:08x}"), RANK_SINGLE_POINTER, true);
+                    }
+                    next_at = slot + 1;
                 }
             }
         }
         self.trace();
     }
 
-    fn pointer_source(&mut self, slot: Addr, target: Addr) -> bool {
+    fn pointer_source(&self, slot: Addr, target: Addr) -> bool {
         let index = self
             .ghidra_spans
             .partition_point(|&(start, _, _)| start <= slot + 3)
@@ -686,15 +1016,11 @@ impl<'a> Recovery<'a> {
         if end <= slot {
             return true;
         }
-        let lengths = match self.span_lengths(start, end) {
-            Ok(lengths) => lengths,
-            Err(_) => return false,
-        };
         if slot < start || slot + 4 > end {
             return false;
         }
         let mut at = start;
-        for length in lengths {
+        for &length in &self.ghidra_lengths[&start] {
             let size = length as u32;
             if at + size > slot {
                 let Some(ins) = self.decode_at(at) else {
@@ -713,136 +1039,29 @@ impl<'a> Recovery<'a> {
         false
     }
 
-    fn index_tables(&mut self) {
-        let ordered: Vec<Addr> = self.instructions.keys().copied().collect();
-        let pointer_tables: BTreeMap<Addr, Addr> = self.tables.iter().copied().collect();
-        for (position, &at) in ordered.iter().enumerate() {
-            let ins = &self.instructions[&at];
-            if ins.mnemonic != Mnemonic::Movzx || ins.op_count != 2 {
-                continue;
-            }
-            let (SimpleOp::Reg(dest), SimpleOp::Mem(source)) = (ins.ops[0], ins.ops[1]) else {
-                continue;
-            };
-            if source.size != 1 {
-                continue;
-            }
-            let index = if source.base != Register::None {
-                if source.index != Register::None {
-                    continue;
-                }
-                source.base
-            } else {
-                source.index
-            };
-            if index == Register::None || source.scale != 1 {
-                continue;
-            }
-            let lo = source.displacement;
-            let next_at = at + ins.size as u32;
-            let Some(jump) = self.instructions.get(&next_at) else {
-                continue;
-            };
-            if !jump.is_jump() || jump.op_count == 0 {
-                continue;
-            }
-            let SimpleOp::Mem(dispatch) = jump.ops[0] else {
-                continue;
-            };
-            let table = dispatch.displacement;
-            if dispatch.base != Register::None
-                || dispatch.index != dest
-                || dispatch.scale != 4
-                || !pointer_tables.contains_key(&table)
-            {
-                continue;
-            }
-            let mut bound = None;
-            let from = position.saturating_sub(5);
-            for &previous in ordered[from..position].iter().rev() {
-                let compare = &self.instructions[&previous];
-                if compare.mnemonic == Mnemonic::Cmp && compare.op_count == 2 {
-                    if let (SimpleOp::Reg(left), SimpleOp::Imm(right)) = (compare.ops[0], compare.ops[1]) {
-                        if left == index {
-                            bound = Some(right);
-                        }
-                    }
-                    break;
-                }
-                if !matches!(compare.mnemonic, Mnemonic::Ja | Mnemonic::Push | Mnemonic::Nop) {
-                    break;
-                }
-            }
-            let Some(bound) = bound else {
-                continue;
-            };
-            if bound >= 65536 || !self.image.is_exec(lo) {
-                continue;
-            }
-            let hi = lo + bound + 1;
-            let count = (pointer_tables[&table] - table) / 4;
-            if !self.image.is_exec(hi - 1) {
-                continue;
-            }
-            if (lo..hi).any(|p| self.covered.contains_key(&p)) {
-                continue;
-            }
-            let Some(values) = self.image.bytes(lo, (hi - lo) as usize) else {
-                continue;
-            };
-            if values.iter().any(|&value| value as u32 >= count) {
-                continue;
-            }
-            self.data_ranges.push((lo, hi, "switch byte table"));
-        }
-    }
-
-    fn build_data_mask(&mut self) {
-        let size = self.image.size as usize;
-        self.data_mask = vec![0u8; size];
-        self.data_owner = vec![-1; size];
-        for (index, &(lo, hi, _)) in self.data_ranges.iter().enumerate() {
-            let start = lo.saturating_sub(self.image.base) as usize;
-            let end = (hi.saturating_sub(self.image.base) as usize).min(size);
-            for offset in start.min(size)..end {
-                if self.data_mask[offset] == 0 {
-                    self.data_mask[offset] = 1;
-                    self.data_owner[offset] = index as i32;
-                }
-            }
-        }
-    }
-
     fn data_containing(&self, at: Addr) -> Option<(Addr, Addr, &'static str)> {
-        let offset = at.checked_sub(self.image.base)? as usize;
-        if self.data_mask.get(offset).copied().unwrap_or(0) == 0 {
-            return None;
-        }
-        let index = self.data_owner[offset] as usize;
-        Some(self.data_ranges[index])
+        let index = self.offset(at).map(|off| self.data_owner[off]).filter(|&i| i >= 0)?;
+        Some(self.data_ranges[index as usize])
     }
 
     fn first_data_start(&self, at: Addr, size: u8) -> Option<Addr> {
-        let offset = at.checked_sub(self.image.base)? as usize;
-        (1..size as usize).find_map(|step| {
-            self.data_mask
-                .get(offset + step)
-                .is_some_and(|&b| b != 0)
-                .then_some(at + step as u32)
-        })
+        (1..size as u32).map(|step| at + step).find(|&inner| self.in_data(inner) || self.at_known_data(inner))
     }
 
-    fn sweep(&mut self) -> Result<()> {
+    fn sweep(&mut self) {
         let tables: BTreeMap<Addr, Addr> = self.tables.iter().copied().collect();
         let table_starts: Vec<Addr> = tables.keys().copied().collect();
-        self.build_data_mask();
         let ranges = self.image.exec_ranges.clone();
         for (start, end) in ranges {
             let mut at = start;
             while at < end {
-                if let Some(&owner) = self.covered.get(&at) {
+                if let Some(owner) = self.owner_at(at) {
                     let size = self.instructions.get(&owner).map_or(1, |ins| ins.size as u32);
                     at = owner + size;
+                    continue;
+                }
+                if let Some((_, hi, _)) = self.mapped_span_at(at) {
+                    at = hi.min(end);
                     continue;
                 }
                 if let Some((_, hi, kind)) = self.data_containing(at) {
@@ -873,21 +1092,10 @@ impl<'a> Recovery<'a> {
                     continue;
                 }
                 let rank = RANK_SWEEP.max(self.seed_rank.get(&at).copied().unwrap_or(0));
-                let mut blocked = false;
-                for inner in at + 1..at + size {
-                    if self
-                        .covered
-                        .get(&inner)
-                        .is_some_and(|owner| self.instruction_rank.get(owner).copied().unwrap_or(0) >= rank)
-                    {
-                        blocked = true;
-                        break;
-                    }
-                    if self.seed_rank.get(&inner).is_some_and(|&rank| rank >= RANK_SWEEP) {
-                        blocked = true;
-                        break;
-                    }
-                }
+                let blocked = (at + 1..at + size).any(|inner| {
+                    self.owner_at(inner).is_some_and(|owner| self.rank_of(owner) >= rank)
+                        || self.seed_rank.get(&inner).is_some_and(|&rank| rank >= RANK_SWEEP)
+                });
                 if blocked {
                     self.gaps.push((at, at + 1, "sweep-padding"));
                     at += 1;
@@ -901,10 +1109,12 @@ impl<'a> Recovery<'a> {
                 at += size;
             }
         }
-        let instructions: Vec<(Addr, Insn)> = self.instructions.iter().map(|(&a, i)| (a, i.clone())).collect();
-        for (at, ins) in instructions {
-            if !self.speculative.contains(&at) && ins.seeds_flow() {
-                if let Some((target, _)) = ins.direct {
+    }
+
+    fn finish(&mut self) {
+        for (&at, ins) in &self.instructions {
+            if !self.speculative.contains(&at) {
+                if let Some((target, _)) = ins.flow_target() {
                     if !self.instructions.contains_key(&target) {
                         self.traps.insert(at, format!("direct transfer to unmapped instruction {target:08x}"));
                     }
@@ -916,48 +1126,48 @@ impl<'a> Recovery<'a> {
                 && !self.instructions.contains_key(&target)
                 && !self.at_known_data(target)
             {
-                let owner = self.covered.get(&target).copied().unwrap_or(target);
+                let owner = self.owner_at(target).unwrap_or(target);
                 let joined = evidence.iter().cloned().collect::<Vec<_>>().join("; ");
                 self.conflicts.insert((target, owner, joined));
             }
         }
-        Ok(())
     }
 
     fn code_map_rows(&self) -> Result<(Functions, Entries)> {
+        let mut roots = self.roots.clone();
+        for ins in self.instructions.values() {
+            if let Some((target, true)) = ins.flow_target() {
+                if self.instructions.contains_key(&target) {
+                    roots.insert(target);
+                }
+            }
+        }
         let mut groups: BTreeMap<Addr, Vec<(Addr, u8)>> = BTreeMap::new();
-        let mut window = None;
-        let mut previous: Option<(Addr, Addr)> = None;
-        let mut flows_into = None;
+        let mut owner: Option<Addr> = None;
+        let mut previous: Option<(Addr, bool)> = None;
+        let mut targets = BTreeSet::new();
         for (&at, ins) in &self.instructions {
-            if Some(at) != flows_into
-                && !self.seeds.contains_key(&at)
-                && ins.padding
-            {
+            let falls = previous.is_some_and(|(end, stops)| end == at && !stops);
+            if !falls && !self.seeds.contains_key(&at) && ins.padding {
+                previous = None;
                 continue;
             }
-            flows_into = if ins.ends_flow() { None } else { Some(at + ins.size as u32) };
-            let owner = if let Some((next, owner)) = previous {
-                if next == at && self.roots.contains(&at) {
-                    Some(owner)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let owner = owner.unwrap_or_else(|| {
-                if window.is_none()
-                    || previous.is_some_and(|(_, owner)| Some(owner) != window)
-                    || self.roots.contains(&at)
-                    || at >= window.unwrap_or(0) + BODY_BYTES
-                {
-                    window = Some(at);
-                }
-                window.unwrap()
+            let joins = owner.is_some_and(|current| {
+                falls || (!roots.contains(&at) && targets.contains(&at) && at < current + BODY_BYTES)
             });
-            groups.entry(owner).or_default().push((at, ins.size));
-            previous = Some((at + ins.size as u32, owner));
+            if !joins {
+                owner = Some(at);
+                targets.clear();
+            }
+            let current = owner.unwrap();
+            if let Some((target, false)) = ins.flow_target() {
+                targets.insert(target);
+            }
+            if let Some((_, _, cases)) = self.switches.get(&at) {
+                targets.extend(cases);
+            }
+            groups.entry(current).or_default().push((at, ins.size));
+            previous = Some((ins.end(), self.stops(ins)));
         }
         let mut functions = BTreeMap::new();
         let mut entries = BTreeMap::new();
@@ -1004,22 +1214,7 @@ impl<'a> Recovery<'a> {
         (at < end).then_some((start, end, owner))
     }
 
-    fn mapped_instructions(&mut self) -> Result<BTreeSet<Addr>> {
-        let spans = self.ghidra_spans.clone();
-        let mut starts = BTreeSet::new();
-        for (start, end, _) in spans {
-            let lengths = self.span_lengths(start, end)?;
-            let mut at = start;
-            for length in lengths {
-                starts.insert(at);
-                at += length as u32;
-            }
-        }
-        Ok(starts)
-    }
-
     fn filter(&mut self, functions: Functions, entries: Entries) -> Result<(Functions, Entries)> {
-        let mapped_starts = self.mapped_instructions()?;
         let mut discovered_spans: Vec<(Addr, Addr, Addr)> = functions
             .iter()
             .flat_map(|(&owner, spans)| spans.iter().map(move |span| (span.start, span.end(), owner)))
@@ -1034,7 +1229,7 @@ impl<'a> Recovery<'a> {
         valid_entries.extend(functions.keys().copied());
         for (&addr, &(owner, _)) in &entries {
             let valid = if let Some((_, _, mapped_owner)) = self.mapped_span_at(addr) {
-                mapped_starts.contains(&addr) && owner == mapped_owner
+                self.mapped_starts.contains(&addr) && owner == mapped_owner
             } else {
                 self.instructions.contains_key(&addr) && discovered_at(addr) == Some(owner)
             };
@@ -1047,7 +1242,7 @@ impl<'a> Recovery<'a> {
         for (&owner, spans) in &functions {
             let mut reason = None;
             if self.mapped_span_at(owner).is_some() {
-                if !mapped_starts.contains(&owner) {
+                if !self.mapped_starts.contains(&owner) {
                     reason = Some(FunctionReject::StartsInsideMappedInstruction);
                 } else if !self.known_entries.contains(&owner) {
                     reason = Some(FunctionReject::StartsInMappedFunction);
@@ -1066,33 +1261,41 @@ impl<'a> Recovery<'a> {
                                 break 'spans;
                             }
                         }
-                        if let Some(ins) = self.instructions.get(&at) {
-                            if ins.seeds_flow() {
-                                if let Some((target, call)) = ins.direct {
-                                    if self.mapped_span_at(target).is_some() {
-                                        if !mapped_starts.contains(&target) {
-                                            reason = Some(FunctionReject::FlowsIntoMappedInstruction);
-                                            break 'spans;
-                                        }
-                                        if !valid_entries.contains(&target) {
-                                            reason = Some(FunctionReject::FlowsToMappedInterior);
-                                            break 'spans;
-                                        }
-                                    } else if call {
-                                        if !valid_entries.contains(&target) {
-                                            if discovered_at(target).is_some() {
-                                                reason = Some(FunctionReject::CallsToDiscoveredInterior);
-                                            } else {
-                                                reason = Some(FunctionReject::CallsToUngroundedTarget);
-                                            }
-                                            break 'spans;
-                                        }
-                                    } else if let Some(other) = discovered_at(target) {
-                                        if other != owner && !valid_entries.contains(&target) {
-                                            reason = Some(FunctionReject::JumpsToDiscoveredInterior);
-                                            break 'spans;
-                                        }
+                        let falls = self.instructions.get(&at).filter(|ins| !self.stops(ins)).map(Insn::end);
+                        if let Some(next) = falls.filter(|&next| self.mapped_span_at(next).is_some()) {
+                            if !self.mapped_starts.contains(&next) {
+                                reason = Some(FunctionReject::FlowsIntoMappedInstruction);
+                                break 'spans;
+                            }
+                            if !valid_entries.contains(&next) {
+                                reason = Some(FunctionReject::FlowsToMappedInterior);
+                                break 'spans;
+                            }
+                        }
+                        if let Some((target, call)) = self.instructions.get(&at).and_then(Insn::flow_target) {
+                            if self.mapped_span_at(target).is_some() {
+                                if !self.mapped_starts.contains(&target) {
+                                    reason = Some(FunctionReject::FlowsIntoMappedInstruction);
+                                    break 'spans;
+                                }
+                                if !valid_entries.contains(&target) {
+                                    reason = Some(FunctionReject::FlowsToMappedInterior);
+                                    break 'spans;
+                                }
+                            } else if call {
+                                let entry = valid_entries.contains(&target);
+                                if !entry {
+                                    if discovered_at(target).is_some() {
+                                        reason = Some(FunctionReject::CallsToDiscoveredInterior);
+                                    } else {
+                                        reason = Some(FunctionReject::CallsToUngroundedTarget);
                                     }
+                                    break 'spans;
+                                }
+                            } else if let Some(other) = discovered_at(target) {
+                                if other != owner && !valid_entries.contains(&target) {
+                                    reason = Some(FunctionReject::JumpsToDiscoveredInterior);
+                                    break 'spans;
                                 }
                             }
                         }
@@ -1117,7 +1320,7 @@ impl<'a> Recovery<'a> {
         let mut remaining = BTreeMap::new();
         for (addr, (owner, kind)) in entries {
             let reason = if self.mapped_span_at(addr).is_some() {
-                if !mapped_starts.contains(&addr) {
+                if !self.mapped_starts.contains(&addr) {
                     Some(EntryReject::EntryInsideMappedInstruction)
                 } else if !valid_entries.contains(&addr) {
                     Some(EntryReject::EntryInMappedFunction)
@@ -1143,11 +1346,9 @@ impl<'a> Recovery<'a> {
     }
 
     fn report(&self) -> DiscoveryReport {
-        let pointer_runs = self
-            .tables
-            .iter()
-            .map(|&(start, end)| PointerRun { start: Hex(start).to_string(), end: Hex(end).to_string() })
-            .collect();
+        let run = |&(start, end): &(Addr, Addr)| PointerRun { start: Hex(start).to_string(), end: Hex(end).to_string() };
+        let pointer_runs = self.tables.iter().map(run).collect();
+        let switch_tables = self.switches.values().map(|&(start, end, _)| run(&(start, end))).collect();
         let gaps = self
             .gaps
             .iter()
@@ -1234,6 +1435,7 @@ impl<'a> Recovery<'a> {
             rejected_entries: entry_rejections,
             rejection_counts,
             pointer_runs,
+            switch_tables,
             gaps,
             traps,
             conflicts,
@@ -1242,6 +1444,19 @@ impl<'a> Recovery<'a> {
             discarded_seeds,
         }
     }
+}
+
+fn rows(path: &Path) -> Result<Vec<Vec<String>>> {
+    let text = std::fs::read_to_string(path).map_err(|e| Error::io(path, e))?;
+    Ok(text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.split(['\t', ' ']).filter(|f| !f.is_empty()).map(str::to_string).collect())
+        .collect())
+}
+
+fn address(path: &Path, text: &str) -> Result<Addr> {
+    parse_hex(text).ok_or_else(|| Error::input(format!("{}: invalid address {text:?}", path.display())))
 }
 
 fn span_lengths(
@@ -1297,19 +1512,6 @@ fn decode_between(
         }
     }
     Some(found)
-}
-
-fn direct_flow_target(
-    image: &Image,
-    check: Option<&dyn DecodeCheck>,
-    at: Addr,
-    size: u8,
-) -> Option<(Addr, bool)> {
-    let ins = decode_at(image, check, at)?;
-    if !ins.seeds_flow() || ins.size != size {
-        return None;
-    }
-    ins.direct
 }
 
 fn decode_one(bytes: &[u8], at: Addr, folded: Option<u8>) -> Option<Insn> {

@@ -93,6 +93,7 @@ pub struct DiscoveryReport {
     pub rejected_entries: Vec<EntryRejection>,
     pub rejection_counts: RejectionCounts,
     pub pointer_runs: Vec<PointerRun>,
+    pub switch_tables: Vec<PointerRun>,
     pub gaps: Vec<Gap>,
     pub traps: BTreeMap<String, String>,
     pub conflicts: Vec<Conflict>,

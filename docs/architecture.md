@@ -208,9 +208,14 @@ entry of its owner. Provisional bodies are emitted as decoded regions; a provisi
 jump into mapped code dispatches at run time, and one into unmapped code traps.
 Ghidra stays the authority: the sweep's bodies are evidence, and the fix for any of
 them is to create the function or entry in Ghidra, re-export and regenerate.
+`recomp-translate --discovery-eval OUT.json --map-keep F` withholds all but a fraction
+`F` of the code map, runs the sweep alone and reports how much of the withheld code it
+recovers.
 
 `RECOMP_DISCOVERY=<file>` writes the addresses the translation still does not carry,
-with the instruction that named them (`runtime/discovery.h`). Meanwhile
+with the instruction that named them (`runtime/discovery.h`); naming such a file as
+`discovery_evidence` in `[translate]` seeds the next sweep with them, as
+`indirect_targets` already does. Meanwhile
 `runtime/interp.cpp` runs what the translation lacks, so a gap costs speed rather
 than correctness.
 

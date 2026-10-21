@@ -507,6 +507,8 @@ def load(game_dir, build_root=None):
         raise ValueError("%s: x87_facts must name a compiler fact file" % source)
     if translate.get("indirect_targets") is not None and (not isinstance(translate["indirect_targets"], str) or not translate["indirect_targets"]):
         raise ValueError("%s: indirect_targets must name an indirect target file" % source)
+    if translate.get("discovery_evidence") is not None and (not isinstance(translate["discovery_evidence"], str) or not translate["discovery_evidence"]):
+        raise ValueError("%s: discovery_evidence must name a RECOMP_DISCOVERY file" % source)
     effects = translate.setdefault("call_effects", [])
     if not isinstance(effects, list):
         raise ValueError("%s: call_effects must be an array of tables" % source)
