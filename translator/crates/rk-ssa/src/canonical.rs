@@ -5,7 +5,50 @@ use rk_ir::Op;
 
 use crate::{Ssa, ValueId};
 
-pub(crate) fn rewrite_aliases(s: &mut Ssa, alias: &Lookup<ValueId, ValueId>) {
+pub(crate) trait Aliases {
+    fn target(&self, value: ValueId) -> Option<ValueId>;
+    fn is_empty(&self) -> bool;
+}
+
+impl Aliases for Lookup<ValueId, ValueId> {
+    fn target(&self, value: ValueId) -> Option<ValueId> {
+        self.get(&value).copied()
+    }
+
+    fn is_empty(&self) -> bool {
+        Lookup::is_empty(self)
+    }
+}
+
+#[derive(Default)]
+struct DenseAliases {
+    targets: Vec<ValueId>,
+    len: usize,
+}
+
+impl DenseAliases {
+    fn insert(&mut self, value: ValueId, target: ValueId) {
+        if self.targets.len() <= value as usize {
+            self.targets.resize(value as usize + 1, ValueId::MAX);
+        }
+        if self.targets[value as usize] == ValueId::MAX {
+            self.len += 1;
+        }
+        self.targets[value as usize] = target;
+    }
+}
+
+impl Aliases for DenseAliases {
+    fn target(&self, value: ValueId) -> Option<ValueId> {
+        self.targets.get(value as usize).copied().filter(|&target| target != ValueId::MAX)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+pub(crate) fn rewrite_aliases(s: &mut Ssa, alias: &impl Aliases) {
     if alias.is_empty() {
         return;
     }
@@ -42,8 +85,8 @@ pub(crate) fn rewrite_aliases(s: &mut Ssa, alias: &Lookup<ValueId, ValueId>) {
         }
     }
     for block in &mut s.blocks {
-        block.phis.retain(|value| !alias.contains_key(value));
-        block.ops.retain(|value| !alias.contains_key(value));
+        block.phis.retain(|value| alias.target(*value).is_none());
+        block.ops.retain(|value| alias.target(*value).is_none());
         for phi in &mut block.phis {
             *phi = resolve_alias(alias, *phi);
         }
@@ -66,8 +109,8 @@ pub(crate) fn rewrite_aliases(s: &mut Ssa, alias: &Lookup<ValueId, ValueId>) {
     }
 }
 
-pub(crate) fn resolve_alias(alias: &Lookup<ValueId, ValueId>, mut value: ValueId) -> ValueId {
-    while let Some(&next) = alias.get(&value) {
+pub(crate) fn resolve_alias(alias: &impl Aliases, mut value: ValueId) -> ValueId {
+    while let Some(next) = alias.target(value) {
         if next == value {
             break;
         }
@@ -76,7 +119,7 @@ pub(crate) fn resolve_alias(alias: &Lookup<ValueId, ValueId>, mut value: ValueId
     value
 }
 
-fn same_packed(s: &Ssa, alias: &Lookup<ValueId, ValueId>, left: ValueId, right: ValueId) -> bool {
+fn same_packed(s: &Ssa, alias: &DenseAliases, left: ValueId, right: ValueId) -> bool {
     let left = resolve_alias(alias, left);
     let right = resolve_alias(alias, right);
     if left == right {
@@ -92,7 +135,7 @@ fn same_packed(s: &Ssa, alias: &Lookup<ValueId, ValueId>, left: ValueId, right: 
     a_args.iter().zip(b_args).all(|(&x, &y)| resolve_alias(alias, x) == resolve_alias(alias, y))
 }
 
-fn signed_sub_parts(s: &Ssa, alias: &Lookup<ValueId, ValueId>, id: ValueId) -> Option<(ValueId, ValueId, ValueId)> {
+fn signed_sub_parts(s: &Ssa, alias: &DenseAliases, id: ValueId) -> Option<(ValueId, ValueId, ValueId)> {
     use rk_core::ir::OpCode as C;
     let value = &s.values[id as usize];
     if value.size != 1 || !matches!(value.op, Op::P(C::IntXor | C::IntNotEqual | C::IntEqual | C::BoolXor)) {
@@ -134,7 +177,7 @@ fn signed_sub_parts(s: &Ssa, alias: &Lookup<ValueId, ValueId>, id: ValueId) -> O
     None
 }
 
-fn signed_sub_le(s: &Ssa, alias: &Lookup<ValueId, ValueId>, id: ValueId) -> Option<(ValueId, ValueId)> {
+fn signed_sub_le(s: &Ssa, alias: &DenseAliases, id: ValueId) -> Option<(ValueId, ValueId)> {
     use rk_core::ir::OpCode as C;
     let value = &s.values[id as usize];
     if value.size != 1 || !matches!(value.op, Op::P(C::IntOr | C::BoolOr)) || value.args_len != 2 {
@@ -305,15 +348,30 @@ pub fn canonicalize(s: &mut Ssa, signed_sub: bool) {
             cache.entry((value.size, data)).or_insert(index as ValueId);
         }
     }
-    let mut alias: Lookup<ValueId, ValueId> = Lookup::default();
-    let mut users = vec![Vec::new(); s.values.len()];
-    for (index, value) in s.values.iter().enumerate() {
+    let mut alias = DenseAliases::default();
+    let count = s.values.len();
+    let mut user_start = vec![0u32; count + 1];
+    for value in &s.values {
         for &arg in &s.args[value.args_start as usize..(value.args_start + value.args_len) as usize] {
-            if (arg as usize) < users.len() {
-                users[arg as usize].push(index as ValueId);
+            if (arg as usize) < count {
+                user_start[arg as usize + 1] += 1;
             }
         }
     }
+    for index in 0..count {
+        user_start[index + 1] += user_start[index];
+    }
+    let mut users = vec![0 as ValueId; user_start[count] as usize];
+    let mut fill = user_start.clone();
+    for (index, value) in s.values.iter().enumerate() {
+        for &arg in &s.args[value.args_start as usize..(value.args_start + value.args_len) as usize] {
+            if (arg as usize) < count {
+                users[fill[arg as usize] as usize] = index as ValueId;
+                fill[arg as usize] += 1;
+            }
+        }
+    }
+    let mut args = Vec::new();
     let mut queued = vec![false; s.values.len()];
     let mut work = VecDeque::new();
     for (index, item) in queued.iter_mut().enumerate() {
@@ -322,13 +380,13 @@ pub fn canonicalize(s: &mut Ssa, signed_sub: bool) {
     }
     while let Some(id) = work.pop_front() {
         queued[id as usize] = false;
-        if alias.contains_key(&id) {
+        if alias.target(id).is_some() {
             continue;
         }
         let value = s.values[id as usize];
         let start = value.args_start as usize;
         let end = start + value.args_len as usize;
-        let mut args = Vec::with_capacity(end - start);
+        args.clear();
         for &arg in &s.args[start..end] {
             args.push(resolve_alias(&alias, arg));
         }
@@ -483,7 +541,10 @@ pub fn canonicalize(s: &mut Ssa, signed_sub: bool) {
             let end = start + s.values[id as usize].args_len as usize;
             let touched = s.args[start..end].iter().copied().chain(std::iter::once(id));
             for arg in touched {
-                let Some(arg_users) = users.get(arg as usize) else { continue };
+                if arg as usize >= count {
+                    continue;
+                }
+                let arg_users = &users[user_start[arg as usize] as usize..user_start[arg as usize + 1] as usize];
                 for &user in arg_users {
                     if !queued[user as usize] {
                         queued[user as usize] = true;

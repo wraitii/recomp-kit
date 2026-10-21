@@ -7,6 +7,7 @@ use rk_sleigh::Lifter;
 #[derive(Debug)]
 pub struct Registers {
     map: BTreeMap<String, Varnode>,
+    covering: Vec<Option<(String, Varnode)>>,
 }
 
 static REGISTERS: OnceLock<Registers> = OnceLock::new();
@@ -27,7 +28,16 @@ impl Registers {
                 }
             }
         }
-        Ok(Self { map })
+        let end = map.values().filter(|v| v.space == Space::Register).map(|v| v.offset + v.size as u64).max().unwrap_or(0);
+        let covering = (0..end)
+            .map(|offset| {
+                map.iter()
+                    .filter(|(_, v)| v.space == Space::Register && v.offset <= offset && offset < v.offset + v.size as u64)
+                    .min_by_key(|(_, v)| (v.size, v.offset))
+                    .map(|(name, v)| (name.clone(), *v))
+            })
+            .collect();
+        Ok(Self { map, covering })
     }
 
     pub fn register(&self, name: &str) -> Option<Varnode> {
@@ -35,11 +45,8 @@ impl Registers {
     }
 
     pub fn covering(&self, offset: u64) -> Option<(&str, Varnode)> {
-        self.map
-            .iter()
-            .filter(|(_, v)| v.space == Space::Register && v.offset <= offset && offset < v.offset + v.size as u64)
-            .min_by_key(|(_, v)| (v.size, v.offset))
-            .map(|(name, v)| (name.as_str(), *v))
+        let (name, v) = self.covering.get(usize::try_from(offset).ok()?)?.as_ref()?;
+        Some((name.as_str(), *v))
     }
 
     pub fn require(&self, name: &str) -> Varnode {

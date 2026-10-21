@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use rk_core::contract::{Field, Fields};
 use rk_core::ir::{OpCode, Space, Varnode};
@@ -115,12 +116,9 @@ struct PendingPhi {
     positions: Vec<usize>,
 }
 
-impl<'a> Builder<'a> {
-    fn new(
-        cg: &CgFunction,
-        opts: &'a BuildOptions<'a>,
-        fault_state: FaultState,
-    ) -> Result<Self, Diagnostic> {
+fn base_layout() -> &'static (Vec<StateKey>, Vec<Option<Field>>) {
+    static LAYOUT: OnceLock<(Vec<StateKey>, Vec<Option<Field>>)> = OnceLock::new();
+    LAYOUT.get_or_init(|| {
         let regs = Registers::get();
         let mut keys = Vec::new();
         let mut fields = Vec::new();
@@ -144,6 +142,25 @@ impl<'a> Builder<'a> {
                 fields.push(field.copied());
             }
         }
+        (keys, fields)
+    })
+}
+
+fn cf_register() -> Varnode {
+    static CF: OnceLock<Varnode> = OnceLock::new();
+    *CF.get_or_init(|| Registers::get().require("CF"))
+}
+
+impl<'a> Builder<'a> {
+    fn new(
+        cg: &CgFunction,
+        opts: &'a BuildOptions<'a>,
+        fault_state: FaultState,
+    ) -> Result<Self, Diagnostic> {
+        let regs = Registers::get();
+        let (base_keys, base_fields) = base_layout();
+        let mut keys = base_keys.clone();
+        let mut fields = base_fields.clone();
         let mut extra = std::collections::BTreeSet::new();
         for insn in &cg.insns {
             for op in &insn.ops {
@@ -373,7 +390,7 @@ impl<'a> Builder<'a> {
                     shape: insn.flag,
                     ..Pending::default()
                 };
-                let cf = Registers::get().require("CF");
+                let cf = cf_register();
                 let touches_cf = |v: Varnode| {
                     v.space == Space::Register && v.offset == cf.offset && v.size == 1
                 };
@@ -604,9 +621,8 @@ impl<'a> Builder<'a> {
         if varnode.space != Space::Register {
             return false;
         }
-        Registers::get().register("CF").is_some_and(|cf| {
-            varnode.offset >= cf.offset && varnode.offset < cf.offset + 6
-        })
+        let cf = cf_register();
+        varnode.offset >= cf.offset && varnode.offset < cf.offset + 6
     }
 
     fn record_flags(

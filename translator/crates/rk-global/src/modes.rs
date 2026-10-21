@@ -234,25 +234,23 @@ fn defs_of(insn: &rk_core::ir::Insn) -> BTreeMap<Varnode, (OpCode, Vec<Varnode>)
     defs
 }
 
+#[derive(Clone, PartialEq, Eq)]
+enum AddressKey {
+    Leaf(Varnode),
+    Op(OpCode, Vec<AddressKey>),
+}
+
 fn key_of(
     varnode: Varnode,
     defs: &BTreeMap<Varnode, (OpCode, Vec<Varnode>)>,
     depth: u32,
-) -> String {
-    if depth == 0 {
-        return format!("{:?}:{:x}:{}", varnode.space, varnode.offset, varnode.size);
-    }
-    match defs.get(&varnode) {
-        Some((opcode, inputs)) => format!(
-            "{:?}({})",
-            opcode,
-            inputs
-                .iter()
-                .map(|input| key_of(*input, defs, depth - 1))
-                .collect::<Vec<_>>()
-                .join(",")
+) -> AddressKey {
+    match defs.get(&varnode).filter(|_| depth > 0) {
+        Some((opcode, inputs)) => AddressKey::Op(
+            *opcode,
+            inputs.iter().map(|input| key_of(*input, defs, depth - 1)).collect(),
         ),
-        None => format!("{:?}:{:x}:{}", varnode.space, varnode.offset, varnode.size),
+        None => AddressKey::Leaf(varnode),
     }
 }
 
@@ -293,48 +291,56 @@ fn traces_to(varnode: Varnode, target: Varnode, defs: &BTreeMap<Varnode, (OpCode
     false
 }
 
-type StoreKey = (String, BTreeSet<Varnode>, bool);
-type LoadKey = (String, BTreeSet<Varnode>);
+type StoreKey = (AddressKey, BTreeSet<Varnode>, bool);
+type LoadKey = (AddressKey, BTreeSet<Varnode>);
 
-fn stack_keys(insn: &rk_core::ir::Insn) -> (Vec<StoreKey>, Vec<LoadKey>) {
-    if !insn.ops.iter().any(|op| matches!(op.opcode, OpCode::Store | OpCode::Load)) {
-        return (Vec::new(), Vec::new());
+fn store_keys(insn: &rk_core::ir::Insn) -> Vec<StoreKey> {
+    if !insn.ops.iter().any(|op| op.opcode == OpCode::Store) {
+        return Vec::new();
     }
     let defs = defs_of(insn);
     let mut stores = Vec::new();
-    let mut loads = Vec::new();
     for op in &insn.ops {
-        match op.opcode {
-            OpCode::Store if op.inputs.len() >= 2 => {
-                let address = op.inputs[0];
-                let value = op.inputs[1];
-                let mut regs = BTreeSet::new();
-                key_registers(address, &defs, &mut regs, 8);
-                stores.push((
-                    key_of(address, &defs, 8),
-                    regs,
-                    control_word().is_some_and(|cw| traces_to(value, cw, &defs)),
-                ));
-            }
-            OpCode::Load if op.output.is_some() => {
-                let address = op.inputs.first().copied().unwrap_or(Varnode::constant(0, 0));
-                let loaded = op.output.unwrap();
-                if control_word().is_none_or(|cw| {
-                    !insn
-                        .ops
-                        .iter()
-                        .any(|candidate| candidate.output == Some(cw) && traces_to(candidate.inputs.first().copied().unwrap_or(loaded), loaded, &defs))
-                }) {
-                    continue;
-                }
-                let mut regs = BTreeSet::new();
-                key_registers(address, &defs, &mut regs, 8);
-                loads.push((key_of(address, &defs, 8), regs));
-            }
-            _ => {}
+        if op.opcode == OpCode::Store && op.inputs.len() >= 2 {
+            let address = op.inputs[0];
+            let value = op.inputs[1];
+            let mut regs = BTreeSet::new();
+            key_registers(address, &defs, &mut regs, 8);
+            stores.push((
+                key_of(address, &defs, 8),
+                regs,
+                control_word().is_some_and(|cw| traces_to(value, cw, &defs)),
+            ));
         }
     }
-    (stores, loads)
+    stores
+}
+
+fn load_keys(insn: &rk_core::ir::Insn) -> Vec<LoadKey> {
+    if !insn.ops.iter().any(|op| op.opcode == OpCode::Load) {
+        return Vec::new();
+    }
+    let defs = defs_of(insn);
+    let mut loads = Vec::new();
+    for op in &insn.ops {
+        if op.opcode != OpCode::Load {
+            continue;
+        }
+        let Some(loaded) = op.output else { continue };
+        let address = op.inputs.first().copied().unwrap_or(Varnode::constant(0, 0));
+        if control_word().is_none_or(|cw| {
+            !insn
+                .ops
+                .iter()
+                .any(|candidate| candidate.output == Some(cw) && traces_to(candidate.inputs.first().copied().unwrap_or(loaded), loaded, &defs))
+        }) {
+            continue;
+        }
+        let mut regs = BTreeSet::new();
+        key_registers(address, &defs, &mut regs, 8);
+        loads.push((key_of(address, &defs, 8), regs));
+    }
+    loads
 }
 
 fn saved_restores(
@@ -343,17 +349,13 @@ fn saved_restores(
     preds: &[Vec<u32>],
     roots: &[u32],
 ) -> BTreeMap<u32, u32> {
-    let mut rows: Vec<Option<_>> = vec![None; fir.insns.len()];
-    for &index in order {
-        rows[index as usize] = Some(stack_keys(&fir.insns[index as usize]));
-    }
+    let mut stores: Vec<Option<Vec<StoreKey>>> = vec![None; fir.insns.len()];
     let mut restores = BTreeMap::new();
     for &index in order {
-        let (_, loads) = rows[index as usize].as_ref().unwrap();
-        if loads.is_empty() || roots.contains(&index) {
+        if roots.contains(&index) {
             continue;
         }
-        for (key, key_regs) in loads {
+        for (key, key_regs) in load_keys(&fir.insns[index as usize]) {
             let mut cur = index;
             let mut seen = BTreeSet::new();
             let mut found = None;
@@ -363,7 +365,7 @@ fn saved_restores(
                     break;
                 }
                 let prev = previous[0];
-                let (some_stores, _) = rows[prev as usize].as_ref().unwrap();
+                let some_stores = stores[prev as usize].get_or_insert_with(|| store_keys(&fir.insns[prev as usize]));
                 let writes_key = fir.insns[prev as usize].ops.iter().any(|op| {
                     op.output.is_some_and(|output| {
                         output.space == Space::Register && key_regs.contains(&output)
@@ -372,11 +374,11 @@ fn saved_restores(
                 if writes_key {
                     break;
                 }
-                if let Some((_, _, true)) = some_stores.iter().find(|(candidate, _, _)| candidate == key) {
+                if let Some((_, _, true)) = some_stores.iter().find(|(candidate, _, _)| *candidate == key) {
                     found = Some(prev);
                     break;
                 }
-                if some_stores.iter().any(|(candidate, _, _)| candidate == key) {
+                if some_stores.iter().any(|(candidate, _, _)| *candidate == key) {
                     break;
                 }
                 if fir.insns[prev as usize].ops.iter().any(|op| {
