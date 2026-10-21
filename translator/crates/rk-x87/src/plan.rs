@@ -514,7 +514,9 @@ fn lower_clone(
         let mut end = Vec::new();
         if !terminated {
             let targets = succ.get(&id).cloned().unwrap_or_default();
-            if carry_mode {
+            if targets.is_empty() {
+                end.extend(scalar.flush());
+            } else if carry_mode {
                 if linear.get(targets.first().unwrap_or(&id)).copied() != Some(id) {
                     transition(scalar, &targets, entry, &mut end)?;
                 }
