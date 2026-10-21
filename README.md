@@ -10,12 +10,19 @@ The desktop app handles setup and builds, with a library view for convenience.
 ## Platforms
 
 Apple silicon (ARM) Macs are the main target. Recompiling these 32-bit x86 games
-as native ARM apps is where the toolkit is most useful.
+as native ARM apps avoids reliance on Rosetta as Apple
+[phases out its general-purpose support](https://support.apple.com/en-gb/102527).
 
-Intel Macs should also work by building the toolkit and its dependencies from
-source. Windows and Linux builds should generally work too. On x86 machines,
-recompiling x86 back to x86 adds overhead without the benefit of moving to a new
-CPU architecture, so further work is required.
+Intel Mac, Windows and Linux targets are available through source builds but
+are untested.
+
+### Optimizing for x86
+
+Better performance on x86 hosts is a goal, likely by retaining most of the
+original x86 code and rewriting only where necessary. This work is not yet
+implemented. Wine likely outperforms the recompilation on these hosts today,
+though the toolkit's graphics backend may offer advantages. These performance
+comparisons have not been benchmarked.
 
 ## Get started
 
@@ -35,8 +42,8 @@ The app includes the other build dependencies; GOG installer imports also need
 
 ## Games
 
-All ports below except Spore are intended to be fully playable in single player.
-The testing labels describe gameplay testing coverage. Spore reaches the menus,
+The testing labels below describe single-player gameplay testing coverage.
+Spore reaches the menus,
 but in-game play is largely untested and some quirks remain. Networking is
 currently unsupported across the toolkit. Each game's page lists the required
 release and preparation steps.
@@ -86,6 +93,18 @@ graphics and audio interfaces the game expects. The resulting app runs without
 a CPU emulator or JIT, using your game's original data. Each port includes
 translation metadata for the exact executable it supports.
 
+### How this differs from Wine
+
+Wine and bottle-based ports run the original Windows executable through a
+compatibility layer. The toolkit instead recompiles it for your CPU, allowing
+32-bit x86 games to run natively on other architectures—for example, on ARM
+without an x86 translation layer. Its own runtime and graphics adapters focus
+on Direct3D 7–9-era games, using modern backends such as Vulkan and Metal.
+Both approaches support game-specific workarounds, but the kit also makes
+individual game functions directly replaceable
+with native code for deeper optimizations and new features. This requires dedicated
+work for each supported version; performance and compatibility depend on the port.
+
 ## Development and porting
 
 The desktop app is the recommended way to install supported games. To work on
@@ -96,5 +115,6 @@ the toolkit or bring another game to it, start with [Contributing](CONTRIBUTING.
 - Explore the [architecture](docs/architecture.md), [code guide](docs/code-guide.md)
   and [translator](docs/ir.md).
 
-Source builds cover Intel Macs, Windows and Linux, plus iOS and Android targets.
+Source build targets also include Intel Macs, Windows, Linux, iOS and Android;
+these are untested.
 The packaged desktop app targets Apple silicon Macs.
