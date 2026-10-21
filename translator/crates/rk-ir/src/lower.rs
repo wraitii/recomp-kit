@@ -222,6 +222,10 @@ impl Lowerer<'_> {
         if mnem == "INT3" {
             return Ok((vec![cg(Op::Breakpoint)], false, None));
         }
+        if mnem == "MOV" && insn.operands.split(',').next().is_some_and(|op| op.trim().eq_ignore_ascii_case("CS")) {
+            let op = self.slow(insn, SlowFamily::Segment);
+            return Ok((vec![cg(op)], false, None));
+        }
         if insn.x87 || mnem.starts_with('F') {
             let mut unique = self.unique;
             let lowering = {

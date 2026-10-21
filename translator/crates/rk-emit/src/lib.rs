@@ -1576,23 +1576,10 @@ impl<'a> Emitter<'a> {
             .filter(|(_, value)| flags_action || self.available(*value))
             .collect();
         let mut locations = BTreeSet::new();
-        let mut cs_write = false;
         for key in keys {
-            if let StateKey::Register(offset) = key {
-                if Registers::get()
-                    .covering(*offset as u64)
-                    .is_some_and(|(name, _)| name == "CS")
-                {
-                    cs_write = true;
-                }
-            }
             if let Some(Some(location)) = self.key_location.get(key) {
                 locations.insert(*location);
             }
-        }
-        if cs_write {
-            self.fallbacks.insert((self.s.value_addr[value as usize], "CS write #UD".to_string()));
-            self.out.push_str("recomp_int(c, 6u);\n");
         }
         let flag_fields: Fields = keys
             .iter()

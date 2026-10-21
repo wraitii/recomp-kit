@@ -38,7 +38,10 @@ static uint32_t bridge_result(X86 *c, const recomp::d3d::Status &status) {
     if (status.code == recomp::d3d::StatusCode::Ok)
         return D3D_OK9;
     std::string message(status.message.data(), status.message.size());
-    LOGW("d3d9: %s", message.c_str());
+    if (status.code == recomp::d3d::StatusCode::NotAvailable)
+        log_once(("d3d9:not-available:" + message).c_str(), "d3d9: %s", message.c_str());
+    else
+        LOGW("d3d9: %s", message.c_str());
     if (status.code == recomp::d3d::StatusCode::Unsupported ||
         status.code == recomp::d3d::StatusCode::NotImplemented)
         imports_unsupported(c);
