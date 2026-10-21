@@ -148,7 +148,8 @@ pub fn lower(fir: &FunctionIr, image: &Image, x87: &dyn X87Recipes) -> rk_core::
     };
     let mut insns = Vec::with_capacity(fir.insns.len());
     for (index, insn) in fir.insns.iter().enumerate() {
-        let (ops, is_x87, flag_operands) = lowerer.lower_insn(fir, index as u32, insn)?;
+        let (mut ops, is_x87, flag_operands) = lowerer.lower_insn(fir, index as u32, insn)?;
+        lowerer.add_tail(fir, index as u32, &mut ops);
         let flag = if is_x87 {
             None
         } else {
@@ -269,9 +270,7 @@ impl Lowerer<'_> {
         if let Some(call) = raw_ops.iter().find(|op| op.opcode == OpCode::CallOther) {
             let family = call_other_family(&mnem, call.userop);
             let op = self.slow(insn, family);
-            let mut out = vec![cg(op)];
-            self.add_tail(fir, index, &mut out);
-            return Ok((out, false, None));
+            return Ok((vec![cg(op)], false, None));
         }
         let divide_by_zero = matches!(mnem.as_str(), "AAM")
             && self.image.bytes(insn.addr, insn.length as usize).and_then(|b| b.last()) == Some(&0);
@@ -288,9 +287,7 @@ impl Lowerer<'_> {
             Ok(ops) => ops,
             Err(reason) => {
                 let op = self.reject(insn, reason, SlowFamily::Unmodelled);
-                let mut out = vec![cg(op)];
-                self.add_tail(fir, index, &mut out);
-                return Ok((out, false, None));
+                return Ok((vec![cg(op)], false, None));
             }
         };
         if mnem == "DIV" || mnem == "IDIV" {
@@ -314,10 +311,8 @@ impl Lowerer<'_> {
                 if let Some(target) = fir.noreturn.get(&index) {
                     converted.push(cg(Op::Trap(*target)));
                 }
-                self.add_tail(fir, index, &mut converted);
                 return Ok((converted, false, None));
             }
-            self.add_tail(fir, index, &mut converted);
             return Ok((converted, false, None));
         }
         let rewrites_memory = matches!(
@@ -370,9 +365,7 @@ impl Lowerer<'_> {
                     _ => SlowFamily::Unmodelled,
                 };
                 let op = self.reject(insn, reason, family);
-                let mut out = vec![cg(op)];
-                self.add_tail(fir, index, &mut out);
-                return Ok((out, false, None));
+                return Ok((vec![cg(op)], false, None));
             }
         };
         let mut converted: Vec<CgOp> = ops.into_iter().map(from_pcode).collect();
@@ -382,7 +375,6 @@ impl Lowerer<'_> {
         if let Some(target) = fir.noreturn.get(&index) {
             converted.push(cg(Op::Trap(*target)));
         }
-        self.add_tail(fir, index, &mut converted);
         Ok((converted, false, flag_operands))
     }
 
