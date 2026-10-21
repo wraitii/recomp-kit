@@ -1243,7 +1243,7 @@ fn span_lengths(
     let mut lengths = Vec::new();
     let mut at = start;
     while at < end {
-        let ins = decode_at(image, check, at)
+        let ins = decode_between(image, check, at, end)
             .ok_or_else(|| Error::input(format!("{}: cannot recover mapped instruction boundaries", Hex(at))))?;
         if at + ins.size as u32 > end {
             return Err(Error::input(format!("{}: cannot recover mapped instruction boundaries", Hex(at))));
@@ -1260,7 +1260,16 @@ fn decode_at(image: &Image, check: Option<&dyn DecodeCheck>, at: Addr) -> Option
         .iter()
         .find(|&&(lo, hi)| lo <= at && at < hi)
         .map(|&(_, hi)| hi)?;
-    let len = 15usize.min((end - at) as usize);
+    decode_between(image, check, at, end)
+}
+
+fn decode_between(
+    image: &Image,
+    check: Option<&dyn DecodeCheck>,
+    at: Addr,
+    end: Addr,
+) -> Option<Insn> {
+    let len = 15usize.min(end.saturating_sub(at) as usize);
     let bytes = image.bytes(at, len)?;
     let found = if let Some(mut next) = (decode_one(bytes, at, None)?).mnemonic.eq(&Mnemonic::Wait)
         .then(|| decode_one(&bytes[1..], at + 1, Some(1)))

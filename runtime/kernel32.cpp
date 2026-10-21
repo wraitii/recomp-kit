@@ -1388,13 +1388,19 @@ bool explicit_library_path(const std::string &name) {
     return name.find_first_of("\\/:") != std::string::npos;
 }
 
+std::string library_file_path(const std::string &module_name) {
+    size_t start = module_name.find_last_of("\\/");
+    start = start == std::string::npos ? 0 : start + 1;
+    return module_name.find('.', start) == std::string::npos ? module_name + ".dll" : module_name;
+}
+
 void get_module_handle_named(X86 *c, const std::string &module_name) {
     std::string name = library_name(module_name);
     // A handle lookup must neither attach a mapped DLL nor acquire a reference.
     if (LoaderModule *m = loader_module_named(name.c_str())) {
         bool matches = m->attached;
         if (matches && explicit_library_path(module_name)) {
-            std::string host = win32_host_path(module_name);
+            std::string host = win32_host_path(library_file_path(module_name));
             matches = !host.empty() && loader_hash_file(host.c_str()) == m->sha256;
         }
         if (!matches)
@@ -1461,7 +1467,7 @@ bool runtime_serves_module(const std::string &lower_name) {
 void load_library_named(X86 *c, const std::string &module_name) {
     std::string name = library_name(module_name);
     LoaderModule *mapped = loader_module_named(name.c_str());
-    std::string host = win32_host_path(module_name);
+    std::string host = win32_host_path(library_file_path(module_name));
     OsStat stat;
     bool exists = !host.empty() && os_stat(host.c_str(), &stat) == 0 && !stat.is_dir;
     if (!exists && explicit_library_path(module_name) && (mapped || !runtime_serves_module(name))) {

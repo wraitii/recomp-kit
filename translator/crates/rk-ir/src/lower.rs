@@ -62,7 +62,7 @@ impl CgFunction {
 }
 
 const SUPPORTED: &[&str] = &[
-    "MOV", "MOVSX", "MOVZX", "XCHG", "NOT", "LEAVE", "LEA", "PUSH", "POP", "RET", "NOP", "ADD",
+    "MOV", "MOVSX", "MOVZX", "XCHG", "NOT", "BSWAP", "LEAVE", "LEA", "PUSH", "POP", "RET", "NOP", "ADD",
     "SUB", "CMP", "INC", "DEC", "ADC", "SBB", "SHL", "SHR", "SAR", "DIV", "IDIV", "NEG", "MUL",
     "IMUL", "CDQ", "CWD", "CBW", "CWDE", "CLD", "STD", "SAHF", "LAHF", "TEST", "AND", "OR", "XOR",
     "ROL", "ROR", "RCL", "RCR", "SHLD", "SHRD", "JMP", "JZ", "JNZ",
