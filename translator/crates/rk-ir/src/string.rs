@@ -23,20 +23,19 @@ pub fn helper(raw: &[u8]) -> Option<&'static str> {
                 let mut single = prefix.to_vec();
                 single.push(opcode);
                 out.push((single.clone(), leak(&format!("{base}{suffix}"))));
-                if base == "movs" || base == "stos" || base == "lods" {
-                    for repeat in [0xf3u8, 0xf2] {
-                        let mut rep = prefix.to_vec();
-                        rep.push(repeat);
-                        rep.push(opcode);
-                        out.push((rep, leak(&format!("rep_{base}{suffix}"))));
-                    }
+                let repeats = if matches!(base, "movs" | "stos" | "lods") {
+                    [(0xf3u8, "rep"), (0xf2, "rep")]
                 } else {
-                    for (byte, name) in [(0xf3u8, "repe"), (0xf2, "repne")] {
-                        let mut rep = vec![byte];
-                        rep.extend_from_slice(prefix);
-                        rep.push(opcode);
-                        out.push((rep, leak(&format!("{name}_{base}{suffix}"))));
-                    }
+                    [(0xf3u8, "repe"), (0xf2, "repne")]
+                };
+                for (byte, name) in repeats {
+                    let name = leak(&format!("{name}_{base}{suffix}"));
+                    let mut rep = prefix.to_vec();
+                    rep.extend_from_slice(&[byte, opcode]);
+                    out.push((rep, name));
+                    let mut rep = vec![byte];
+                    rep.extend_from_slice(&single);
+                    out.push((rep, name));
                 }
             }
         }

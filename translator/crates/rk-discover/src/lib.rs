@@ -1030,6 +1030,18 @@ impl<'a> Recovery<'a> {
             let &(_, end, owner) = discovered_spans.get(index)?;
             (at < end).then_some(owner)
         };
+        let mut valid_entries = self.known_entries.clone();
+        valid_entries.extend(functions.keys().copied());
+        for (&addr, &(owner, _)) in &entries {
+            let valid = if let Some((_, _, mapped_owner)) = self.mapped_span_at(addr) {
+                mapped_starts.contains(&addr) && owner == mapped_owner
+            } else {
+                self.instructions.contains_key(&addr) && discovered_at(addr) == Some(owner)
+            };
+            if valid {
+                valid_entries.insert(addr);
+            }
+        }
         let mut kept = BTreeMap::new();
         let mut kept_instructions = BTreeSet::new();
         for (&owner, spans) in &functions {
@@ -1062,14 +1074,12 @@ impl<'a> Recovery<'a> {
                                             reason = Some(FunctionReject::FlowsIntoMappedInstruction);
                                             break 'spans;
                                         }
-                                        if !self.known_entries.contains(&target) {
+                                        if !valid_entries.contains(&target) {
                                             reason = Some(FunctionReject::FlowsToMappedInterior);
                                             break 'spans;
                                         }
                                     } else if call {
-                                        let entry = functions.contains_key(&target)
-                                            || self.known_entries.contains(&target);
-                                        if !entry {
+                                        if !valid_entries.contains(&target) {
                                             if discovered_at(target).is_some() {
                                                 reason = Some(FunctionReject::CallsToDiscoveredInterior);
                                             } else {
@@ -1078,7 +1088,7 @@ impl<'a> Recovery<'a> {
                                             break 'spans;
                                         }
                                     } else if let Some(other) = discovered_at(target) {
-                                        if other != owner && target != other {
+                                        if other != owner && !valid_entries.contains(&target) {
                                             reason = Some(FunctionReject::JumpsToDiscoveredInterior);
                                             break 'spans;
                                         }
@@ -1109,7 +1119,7 @@ impl<'a> Recovery<'a> {
             let reason = if self.mapped_span_at(addr).is_some() {
                 if !mapped_starts.contains(&addr) {
                     Some(EntryReject::EntryInsideMappedInstruction)
-                } else if !self.known_entries.contains(&addr) {
+                } else if !valid_entries.contains(&addr) {
                     Some(EntryReject::EntryInMappedFunction)
                 } else {
                     None

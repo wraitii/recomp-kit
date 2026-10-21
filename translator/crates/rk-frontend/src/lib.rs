@@ -49,6 +49,7 @@ struct RawFunction {
     return_jumps: BTreeSet<u32>,
     seh_escapes: BTreeSet<u32>,
     dead_addrs: BTreeSet<Addr>,
+    recovered_tables: BTreeMap<Addr, Vec<Addr>>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -147,6 +148,7 @@ impl RawFunction {
             let targets: Vec<Addr> = program
                 .tables
                 .get(&(self.addr, ins.addr))
+                .or_else(|| self.recovered_tables.get(&ins.addr))
                 .cloned()
                 .unwrap_or_else(|| self.index.keys().copied().collect());
             return targets.into_iter().filter_map(|target| self.idx(target)).collect();
@@ -364,6 +366,7 @@ impl RawFunction {
             ins.mnemonic == "JMP"
                 && self.branch_target(i).is_none()
                 && !program.tables.contains_key(&(self.addr, ins.addr))
+                && !self.recovered_tables.contains_key(&ins.addr)
                 && !popped_jump(self, i)
         }) {
             return (0..self.decoded.len() as u32).collect();
@@ -515,7 +518,7 @@ impl RawFunction {
         self.index.get(&addr).copied().unwrap_or(0) as usize
     }
 
-    fn prepare(&mut self, program: &Program) {
+    fn prepare(&mut self, program: &Program, relocated: &BTreeMap<Addr, Addr>) {
         self.index = self
             .decoded
             .iter()
@@ -535,6 +538,7 @@ impl RawFunction {
                 .unwrap_or(self.end);
             self.contiguous[i] = self.fallthrough[i] == next;
         }
+        self.recovered_tables = recover_tables(program, relocated, self);
         self.pushed_continuations = self.pushed_continuations();
         self.seh_sites = seh_frame_sites(self, &program.image);
         self.seh_restores = seh_restore_sites(self);
@@ -593,10 +597,18 @@ fn with_lifters<R>(f: impl FnOnce(&mut Lifter, &Decoder) -> R) -> R {
 
 pub fn analyze(program: &Program) -> Analysis {
     let addresses: Vec<Addr> = program.functions.keys().copied().collect();
+    let relocated: BTreeMap<Addr, Addr> = program
+        .image
+        .relocations
+        .iter()
+        .map(|relocation| (relocation.site, relocation.target))
+        .collect();
     let mut raw: Vec<(Addr, Result<RawFunction>)> = addresses
         .par_iter()
         .map(|&addr| {
-            let result = with_lifters(|lifter, decoder| build_raw(program, addr, lifter, decoder));
+            let result = with_lifters(|lifter, decoder| {
+                build_raw(program, addr, lifter, decoder, &relocated)
+            });
             (addr, result)
         })
         .collect();
@@ -615,7 +627,13 @@ pub fn analyze(program: &Program) -> Analysis {
 pub fn analyze_function(program: &Program, addr: Addr, helpers: &BTreeSet<Addr>) -> Result<FunctionIr> {
     let mut lifter = Lifter::new()?;
     let decoder = Decoder::new()?;
-    let raw = build_raw(program, addr, &mut lifter, &decoder)?;
+    let relocated: BTreeMap<Addr, Addr> = program
+        .image
+        .relocations
+        .iter()
+        .map(|relocation| (relocation.site, relocation.target))
+        .collect();
+    let raw = build_raw(program, addr, &mut lifter, &decoder, &relocated)?;
     finalize(program, addr, raw, helpers)
 }
 
@@ -659,7 +677,13 @@ fn seh_helpers(program: &Program, raw: &[(Addr, Result<RawFunction>)]) -> BTreeS
     }
 }
 
-fn build_raw(program: &Program, addr: Addr, lifter: &mut Lifter, decoder: &Decoder) -> Result<RawFunction> {
+fn build_raw(
+    program: &Program,
+    addr: Addr,
+    lifter: &mut Lifter,
+    decoder: &Decoder,
+    relocated: &BTreeMap<Addr, Addr>,
+) -> Result<RawFunction> {
     let function = program
         .functions
         .get(&addr)
@@ -772,13 +796,14 @@ fn build_raw(program: &Program, addr: Addr, lifter: &mut Lifter, decoder: &Decod
         return_jumps: BTreeSet::new(),
         seh_escapes: BTreeSet::new(),
         dead_addrs: BTreeSet::new(),
+        recovered_tables: BTreeMap::new(),
     };
-    raw.prepare(program);
+    raw.prepare(program, relocated);
     Ok(raw)
 }
 
 fn finalize(program: &Program, addr: Addr, mut raw: RawFunction, helpers: &BTreeSet<Addr>) -> Result<FunctionIr> {
-    let entries = program
+    let mut entries = program
         .interior_by_function
         .get(&addr)
         .cloned()
@@ -805,6 +830,7 @@ fn finalize(program: &Program, addr: Addr, mut raw: RawFunction, helpers: &BTree
             ins.mnemonic == "JMP"
                 && raw.branch_target(*i).is_none()
                 && !program.tables.contains_key(&(raw.addr, ins.addr))
+                && !raw.recovered_tables.contains_key(&ins.addr)
                 && !raw.return_jumps.contains(&(*i as u32))
         })
         .map(|(i, _)| i as u32)
@@ -816,6 +842,13 @@ fn finalize(program: &Program, addr: Addr, mut raw: RawFunction, helpers: &BTree
         .map(|ins| raw.fallthrough[raw.index[&ins.addr] as usize])
         .collect();
     let seh = raw.seh_effects(program, helpers)?;
+    entries.extend(seh.iter().filter_map(|(index, kinds)| {
+        let next = raw.fallthrough[*index as usize];
+        (kinds.iter().any(|kind| matches!(kind, SehEffect::Enter | SehEffect::Adopt))
+            && raw.idx(next).is_some()).then_some(next)
+    }));
+    entries.sort_unstable();
+    entries.dedup();
     let eh3 = msvc_eh3_finally_only(
         &program.image,
         addr,
@@ -872,7 +905,10 @@ fn external_exits(program: &Program, raw: &RawFunction) -> BTreeMap<u32, Vec<Add
             if let Some(target) = raw.branch_target(i) {
                 out.push(target);
             } else if !raw.return_jumps.contains(&(i as u32)) {
-                let table = program.tables.get(&(raw.addr, ins.addr));
+                let table = program
+                    .tables
+                    .get(&(raw.addr, ins.addr))
+                    .or_else(|| raw.recovered_tables.get(&ins.addr));
                 match table {
                     Some(targets) => out.extend(targets.iter().copied()),
                     None => {
@@ -898,6 +934,60 @@ fn external_exits(program: &Program, raw: &RawFunction) -> BTreeMap<u32, Vec<Add
         }
     }
     exits
+}
+
+const MAX_JUMP_TABLE: usize = 4096;
+
+fn recover_tables(
+    program: &Program,
+    relocated: &BTreeMap<Addr, Addr>,
+    raw: &RawFunction,
+) -> BTreeMap<Addr, Vec<Addr>> {
+    let mut tables = BTreeMap::new();
+    for ins in &raw.decoded {
+        if ins.mnemonic != "JMP"
+            || branch_target(ins).is_some()
+            || program.tables.contains_key(&(raw.addr, ins.addr))
+        {
+            continue;
+        }
+        let Some((None, Some(_), 4, displacement, None)) =
+            ins.operands.first().and_then(mem)
+        else {
+            continue;
+        };
+        let Ok(table) = u32::try_from(displacement) else {
+            continue;
+        };
+        if table == 0 || program.image.bytes(table, 4).is_none() {
+            continue;
+        }
+        let relocated_run = relocated.contains_key(&table);
+        let mut seen = BTreeSet::new();
+        let mut targets = Vec::new();
+        for slot in 0..MAX_JUMP_TABLE {
+            let at = table.wrapping_add((slot as u32) * 4);
+            let Some(target) = program.image.rd32(at) else {
+                break;
+            };
+            if relocated_run && relocated.get(&at) != Some(&target) {
+                break;
+            }
+            if !raw.index.contains_key(&target)
+                && !program.functions.contains_key(&target)
+                && !program.entries.contains_key(&target)
+            {
+                break;
+            }
+            if seen.insert(target) {
+                targets.push(target);
+            }
+        }
+        if !targets.is_empty() {
+            tables.insert(ins.addr, targets);
+        }
+    }
+    tables
 }
 
 fn table_jumps(raw: &RawFunction) -> BTreeSet<u32> {

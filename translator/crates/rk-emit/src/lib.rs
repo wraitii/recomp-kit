@@ -194,6 +194,9 @@ struct Emitter<'a> {
     uses_arena: bool,
     value_block: Vec<u32>,
     successors: Vec<Vec<usize>>,
+    transfers: Transfers,
+    has_dynamic: bool,
+    dispatch: Option<Dispatch>,
     key_location: rk_core::Lookup<StateKey, Option<Location>>,
     clone: usize,
     reload_defs: BTreeMap<ValueId, Vec<ValueId>>,
@@ -212,6 +215,78 @@ struct Emitter<'a> {
 struct KeepGroup {
     field: usize,
     olds: [ValueId; 4],
+}
+
+#[derive(Clone, Copy)]
+struct Dispatch {
+    start: Addr,
+    span: u32,
+}
+
+#[derive(Default)]
+struct Transfers {
+    sizes: Vec<u8>,
+    sources: BTreeMap<u32, Vec<(usize, ValueId)>>,
+    targets: BTreeMap<usize, Vec<(ValueId, usize)>>,
+    edges: BTreeSet<(u32, usize)>,
+}
+
+impl Transfers {
+    fn new(plan: &PlannedFunction, successors: &[Vec<usize>], force: bool) -> Self {
+        let s = &plan.ssa;
+        let sources: BTreeSet<u32> = s.blocks.iter().enumerate()
+            .filter(|(index, block)| successors[*index].len() > 1
+                && block.ops.iter().any(|value| s.value(*value).op == Op::BranchInd))
+            .map(|(index, _)| index as u32)
+            .chain([DISPATCH_BLOCK])
+            .collect();
+        let mut result = Self::default();
+        let mut channels: Vec<BTreeMap<u32, ValueId>> = Vec::new();
+        let mut copies = 0;
+        for (target, block) in s.blocks.iter().enumerate() {
+            let preds: Vec<_> = block.preds.iter().enumerate()
+                .filter(|(_, pred)| sources.contains(pred))
+                .collect();
+            if preds.is_empty() {
+                continue;
+            }
+            for &phi in &block.phis {
+                let size = s.value(phi).size;
+                if size == 0 || !plan.live.contains(&phi) {
+                    continue;
+                }
+                let args: BTreeMap<_, _> = preds.iter()
+                    .map(|(position, pred)| (**pred, s.args(phi)[*position]))
+                    .collect();
+                copies += args.len();
+                let channel = channels.iter().enumerate().position(|(index, values)| {
+                    result.sizes[index] == size && args.iter().all(|(pred, arg)| {
+                        values.get(pred).is_none_or(|value| value == arg)
+                    })
+                }).unwrap_or_else(|| {
+                    result.sizes.push(size);
+                    channels.push(BTreeMap::new());
+                    channels.len() - 1
+                });
+                channels[channel].extend(args);
+                result.targets.entry(target).or_default().push((phi, channel));
+            }
+            if result.targets.contains_key(&target) {
+                result.edges.extend(preds.iter().map(|(_, pred)| (**pred, target)));
+            }
+        }
+        let staged: usize = channels.iter().map(BTreeMap::len).sum();
+        let received: usize = result.targets.values().map(Vec::len).sum();
+        if !force && staged + received + result.targets.len() >= copies * 2 {
+            return Self::default();
+        }
+        for (channel, values) in channels.into_iter().enumerate() {
+            for (source, arg) in values {
+                result.sources.entry(source).or_default().push((channel, arg));
+            }
+        }
+        result
+    }
 }
 
 impl<'a> Emitter<'a> {
@@ -244,6 +319,24 @@ impl<'a> Emitter<'a> {
                 indirect_targets.extend(successors[index].iter().copied());
             }
         }
+        let has_dynamic = s.blocks.iter().any(|block| {
+            block.ops.iter().any(|value| {
+                let value = *value;
+                s.value(value).op == Op::BranchInd
+                    && ctx
+                        .ir
+                        .index_of(s.value_addr[value as usize])
+                        .is_some_and(|index| ctx.ir.dynamic.contains(&index))
+            })
+        });
+        let dispatch = has_dynamic
+            .then(|| {
+                let start = *plan.block_addrs.iter().min()?;
+                let end = *plan.block_addrs.iter().max()?;
+                let span = end.checked_sub(start)?.checked_add(1)?;
+                (span <= (1 << 20)).then_some(Dispatch { start, span })
+            })
+            .flatten();
         let inline_ok = (0..s.blocks.len())
             .map(|index| {
                 let block = &s.blocks[index];
@@ -253,6 +346,7 @@ impl<'a> Emitter<'a> {
                     && (block.preds[0] as usize) < index
                     && !entry_targets.contains(&index)
                     && !indirect_targets.contains(&index)
+                    && !has_dynamic
             })
             .collect();
         let uses_arena = s.values.iter().any(|value| {
@@ -335,7 +429,10 @@ impl<'a> Emitter<'a> {
             materialized,
             uses_arena,
             value_block,
+            transfers: Transfers::new(plan, &successors, has_dynamic),
             successors,
+            has_dynamic,
+            dispatch,
             key_location,
             clone: 0,
             reload_defs,
@@ -367,6 +464,9 @@ impl<'a> Emitter<'a> {
         self.out.push_str(" {\n");
         self.write_declarations();
         self.write_x87_declarations();
+        if self.ctx.ir.seh.values().any(|kinds| kinds.contains(&SehEffect::Orphan)) {
+            self.out.push_str("uint64_t seh_mark_ = recomp_seh_frame_mark(c);\n");
+        }
         if self.uses_arena {
             self.out.push_str("uint8_t *arena_ = g_mem;\n");
             self.requires.arena = true;
@@ -375,14 +475,22 @@ impl<'a> Emitter<'a> {
             self.out.push_str("x86_cc_settle(c);\n");
         }
         self.write_inputs()?;
+        let clones = self.plan.x87.as_ref().map_or(1, rk_x87::Plan::clones);
+        self.write_dispatch_tables(clones);
         self.entry_dispatch()?;
         if let Some(site) = self.reload_defs.keys().find(|site| !self.in_block[**site as usize]) {
             return Err(self.error(self.s.value_addr[*site as usize], "state reload site is not a block op"));
         }
-        let clones = self.plan.x87.as_ref().map_or(1, rk_x87::Plan::clones);
         for clone in 0..clones {
             self.clone = clone;
             self.blocks()?;
+            for (&target, copies) in &self.transfers.targets {
+                let _ = writeln!(self.out, "E{}{target}:;", self.block_prefix());
+                for (phi, channel) in copies {
+                    let _ = writeln!(self.out, "v{phi} = e{channel};");
+                }
+                let _ = writeln!(self.out, "goto {}{target};", self.block_prefix());
+            }
         }
         self.out.push_str("}\n");
         self.wrappers(&body_name);
@@ -453,6 +561,9 @@ impl<'a> Emitter<'a> {
     }
 
     fn write_declarations(&mut self) {
+        for (channel, size) in self.transfers.sizes.iter().enumerate() {
+            let _ = writeln!(self.out, "{} e{channel};", ctype(*size));
+        }
         let mut narrow = Vec::new();
         let mut wide = Vec::new();
         for (index, value) in self.s.values.iter().enumerate() {
@@ -542,9 +653,44 @@ impl<'a> Emitter<'a> {
     }
 
     fn block_prefix(&self) -> char {
-        match self.plan.x87.as_ref().and_then(|plan| plan.programs.get(self.clone)).and_then(|program| program.clone) {
+        self.prefix_for(self.clone)
+    }
+
+    fn prefix_for(&self, clone: usize) -> char {
+        match self.plan.x87.as_ref().and_then(|plan| plan.programs.get(clone)).and_then(|program| program.clone) {
             Some("fast") => 'F',
             _ => 'B',
+        }
+    }
+
+    fn write_dispatch_tables(&mut self, clones: usize) {
+        let Some(dispatch) = self.dispatch else { return };
+        let ctype = if self.s.blocks.len() > u16::MAX as usize { "uint32_t" } else { "uint16_t" };
+        let mut slots = BTreeMap::new();
+        for (block, &addr) in self.plan.block_addrs.iter().enumerate() {
+            if let Some(offset) = addr.checked_sub(dispatch.start) {
+                if offset < dispatch.span {
+                    slots.insert(offset, block);
+                }
+            }
+        }
+        let _ = write!(self.out, "static const {ctype} recomp_dispatch_[] = {{");
+        for (offset, block) in slots {
+            let _ = write!(self.out, " [0x{offset:x}] = {},", block + 1);
+        }
+        self.out.push_str(" };\n");
+        let prefixes: BTreeSet<char> = (0..clones).map(|clone| self.prefix_for(clone)).collect();
+        for prefix in prefixes {
+            let _ = writeln!(self.out, "static void *const recomp_labels_{prefix}[] = {{");
+            for block in 0..self.s.blocks.len() {
+                let target = if self.transfers.targets.contains_key(&block) {
+                    format!("&&E{prefix}{block}")
+                } else {
+                    format!("&&{prefix}{block}")
+                };
+                let _ = writeln!(self.out, "{target},");
+            }
+            self.out.push_str("};\n");
         }
     }
 
@@ -554,6 +700,7 @@ impl<'a> Emitter<'a> {
     }
 
     fn entry_dispatch(&mut self) -> Result<()> {
+        self.stage_transfer(DISPATCH_BLOCK)?;
         let primary = self
             .s
             .entries
@@ -573,7 +720,7 @@ impl<'a> Emitter<'a> {
             self.out.push_str("default:;\n");
             self.edge(None, primary.target as usize)?;
             self.out.push_str("}\n");
-        } else if primary.target == 0 {
+        } else if primary.target == 0 && !self.transfers.edges.contains(&(DISPATCH_BLOCK, 0)) {
             self.edge_copies(DISPATCH_BLOCK, primary.target as usize)?;
         } else {
             self.edge(None, primary.target as usize)?;
@@ -760,6 +907,22 @@ impl<'a> Emitter<'a> {
             }
             Op::Seh(kind) => {
                 self.publish(value)?;
+                if matches!(kind, SehEffect::Enter | SehEffect::Adopt) {
+                    let insn = self.insn_at(addr).ok_or_else(|| self.error(addr, "SEH site without instruction"))?;
+                    let next = insn.addr + Addr::from(insn.length);
+                    let callback = if self.ctx.ir.index_of(next).is_some() {
+                        format!("fn_{next:08x}")
+                    } else if self.ctx.known_entries.contains(&next) {
+                        self.declare_entry(next);
+                        format!("entry_{next:08x}")
+                    } else {
+                        return Err(self.error(addr, "SEH continuation without entry"));
+                    };
+                    self.requires.seh_call = true;
+                    let adopt = u8::from(kind == SehEffect::Adopt);
+                    let _ = writeln!(self.out, "{{ extern void {callback}(X86 *); c->eip = 0x{addr:08x}u; recomp_seh_frame_call_(c, {callback}, {adopt}); return; }}");
+                    return Ok(false);
+                }
                 self.seh(kind, addr);
                 Ok(true)
             }
@@ -959,9 +1122,10 @@ impl<'a> Emitter<'a> {
                         return self.unsupported(addr, &mnemonic);
                     }
                 };
+                let invert = if matches!(mnemonic.as_str(), "ANDNPS" | "ANDNPD") { "~" } else { "" };
                 let _ = writeln!(
                     self.out,
-                    "c->xmm[{destination}][{lane}] = c->xmm[{destination}][{lane}] {operator} {source};"
+                    "c->xmm[{destination}][{lane}] = {invert}c->xmm[{destination}][{lane}] {operator} {source};"
                 );
             }
             return Ok(true);
@@ -1252,19 +1416,21 @@ impl<'a> Emitter<'a> {
         let condition = self.expr(*args.first().ok_or_else(|| self.error(0, "branch without condition"))?)?;
         let taken = self.successor(current, Some(target))?;
         if let Some(taken) = taken {
+            let end_addr = self.block_end_addr(current);
             let fallthrough = self
                 .successors(current)
                 .iter()
                 .copied()
-                .find(|block| *block != taken)
-                .unwrap_or(taken);
+                .find(|block| Some(self.plan.block_addrs[*block]) == end_addr);
             let _ = writeln!(self.out, "if ((uint32_t)({condition}))");
             self.edge(Some(current), taken)?;
-            if fallthrough != taken && self.can_inline(current, fallthrough) {
-                return self.inline_block(current, fallthrough);
+            if let Some(fallthrough) = fallthrough {
+                if fallthrough != taken && self.can_inline(current, fallthrough) {
+                    return self.inline_block(current, fallthrough);
+                }
+                self.out.push_str("else\n");
+                self.edge(Some(current), fallthrough)?;
             }
-            self.out.push_str("else\n");
-            self.edge(Some(current), fallthrough)?;
             return Ok(());
         }
         let at = self.s.value_addr[value as usize];
@@ -1293,7 +1459,28 @@ impl<'a> Emitter<'a> {
         let args = self.s.args(value);
         let target = self.expr(*args.first().ok_or_else(|| self.error(addr, "indirect jump without target"))?)?;
         let current = self.block_of(value);
+        let dynamic = self.has_dynamic
+            && self.ctx.ir.index_of(addr).is_some_and(|index| self.ctx.ir.dynamic.contains(&index));
         let successors = self.successors(current).to_vec();
+        self.stage_transfer(current as u32)?;
+        if dynamic && self.dispatch.is_some() {
+            let dispatch = self.dispatch.unwrap();
+            self.out.push_str("{\n");
+            let _ = writeln!(self.out, "uint32_t t_ = (uint32_t)({target});");
+            let _ = writeln!(self.out, "uint32_t o_ = t_ - 0x{:08x}u;", dispatch.start);
+            let _ = writeln!(
+                self.out,
+                "if (o_ < 0x{:x}u) {{ uint32_t d_ = recomp_dispatch_[o_]; if (d_) goto *recomp_labels_{}[d_ - 1]; }}",
+                dispatch.span,
+                self.block_prefix()
+            );
+            let default_lines = self.x87_lines(|x87| x87.default_lines(self.clone, value, &ValueNames(self)));
+            self.write_x87(default_lines);
+            self.publish(value)?;
+            let _ = writeln!(self.out, "c->eip = 0x{addr:08x}u; recomp_jump(c, t_); return;");
+            self.out.push_str("}\n");
+            return Ok(());
+        }
         let _ = writeln!(self.out, "switch ((uint32_t)({target})) {{");
         for target_block in &successors {
             let _ = writeln!(self.out, "case 0x{:08x}u:", self.plan.block_addrs[*target_block]);
@@ -1353,20 +1540,17 @@ impl<'a> Emitter<'a> {
     }
 
     fn seh(&mut self, kind: SehEffect, addr: Addr) {
-        let _ = writeln!(self.out, "c->eip = 0x{addr:08x}u;");
+        if kind == SehEffect::Leave {
+            let _ = writeln!(self.out, "c->eip = 0x{addr:08x}u;");
+        }
         match kind {
-            SehEffect::Enter => self.out.push_str(
-                "{ jmp_buf *b_ = recomp_seh_frame_enter(c); if (RECOMP_SETJMP(*b_)) { recomp_seh_land(c); return; } }\n",
-            ),
-            SehEffect::Adopt => self.out.push_str(
-                "{ jmp_buf *b_ = recomp_seh_frame_adopt(c); if (b_) { if (RECOMP_SETJMP(*b_)) { recomp_seh_land(c); return; } } }\n",
-            ),
+            SehEffect::Enter | SehEffect::Adopt => unreachable!(),
             SehEffect::Leave => self.out.push_str("recomp_seh_frame_leave(c);\n"),
             SehEffect::Landing => {
                 let _ = writeln!(self.out, "if (recomp_seh_pending_target()) recomp_seh_intercept(c, 0x{addr:08x}u);");
             }
             SehEffect::Orphan => {
-                let _ = writeln!(self.out, "recomp_seh_frame_orphan(c, 0x{addr:08x}u);");
+                self.out.push_str("recomp_seh_frame_orphan(c, seh_mark_);\n");
             }
         }
     }
@@ -1602,6 +1786,10 @@ impl<'a> Emitter<'a> {
 
     fn edge(&mut self, source: Option<usize>, target: usize) -> Result<()> {
         let pred = source.map_or(DISPATCH_BLOCK, |block| block as u32);
+        if self.transfers.edges.contains(&(pred, target)) {
+            let _ = writeln!(self.out, "goto E{}{target};", self.block_prefix());
+            return Ok(());
+        }
         self.out.push_str("{\n");
         self.edge_copies(pred, target)?;
         let _ = writeln!(self.out, "goto {}{target};", self.block_prefix());
@@ -1609,27 +1797,64 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    fn stage_transfer(&mut self, source: u32) -> Result<()> {
+        if let Some(copies) = self.transfers.sources.get(&source) {
+            for &(channel, arg) in copies {
+                let expr = self.expr(arg)?;
+                let _ = writeln!(self.out, "e{channel} = ({})({expr});", ctype(self.transfers.sizes[channel]));
+            }
+        }
+        Ok(())
+    }
+
     fn edge_copies(&mut self, pred: u32, target: usize) -> Result<()> {
         let block = &self.s.blocks[target];
         let position = block.preds.iter().position(|candidate| *candidate == pred);
         if let Some(position) = position {
-            for &phi in &block.phis {
-                if !self.plan.live.contains(&phi) || self.s.value(phi).size == 0 {
-                    continue;
-                }
+            let phis: Vec<_> = block.phis.iter().copied()
+                .filter(|phi| self.plan.live.contains(phi) && self.s.value(*phi).size != 0)
+                .collect();
+            let destinations = phis.iter().copied().collect();
+            let parallel = phis.iter().any(|phi| {
+                self.reads_phi(self.s.args(*phi)[position], &destinations)
+            });
+            for &phi in &phis {
                 let arg = *self.s.args(phi).get(position).ok_or_else(|| self.error(0, "phi arity"))?;
                 let ctype = ctype(self.s.value(phi).size);
                 let expr = self.expr(arg)?;
-                let _ = writeln!(self.out, "{ctype} p{phi} = ({ctype})({expr});");
-            }
-            for &phi in &block.phis {
-                if !self.plan.live.contains(&phi) || self.s.value(phi).size == 0 {
-                    continue;
+                if parallel {
+                    let _ = writeln!(self.out, "{ctype} p{phi} = ({ctype})({expr});");
+                } else {
+                    let _ = writeln!(self.out, "v{phi} = ({ctype})({expr});");
                 }
-                let _ = writeln!(self.out, "v{phi} = p{phi};");
+            }
+            if parallel {
+                for &phi in &phis {
+                    let _ = writeln!(self.out, "v{phi} = p{phi};");
+                }
             }
         }
         Ok(())
+    }
+
+    fn reads_phi(&self, value: ValueId, phis: &BTreeSet<ValueId>) -> bool {
+        if matches!(self.s.value(value).op, Op::Byte(_)) {
+            return phis.contains(&value)
+                || self.s.args(value).iter().any(|arg| self.reads_phi(*arg, phis));
+        }
+        if let Some((carrier, _)) = self.keep_lane.get(&value) {
+            return phis.contains(carrier);
+        }
+        if self.materialized[value as usize] {
+            return phis.contains(&value);
+        }
+        match self.s.value(value).op {
+            Op::Pack | Op::StateKeep(_)
+            | Op::P(OpCode::Copy | OpCode::IntZExt) => {
+                self.s.args(value).iter().any(|arg| self.reads_phi(*arg, phis))
+            }
+            _ => phis.contains(&value),
+        }
     }
 
     fn declare_entry(&mut self, target: Addr) {
@@ -2214,8 +2439,7 @@ fn sse_logic(mnemonic: &str) -> Option<&'static str> {
     Some(match mnemonic {
         "ORPS" | "ORPD" => "|",
         "XORPS" | "XORPD" => "^",
-        "ANDPS" | "ANDPD" => "&",
-        "ANDNPS" | "ANDNPD" => "& ~",
+        "ANDPS" | "ANDPD" | "ANDNPS" | "ANDNPD" => "&",
         _ => return None,
     })
 }

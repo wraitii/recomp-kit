@@ -861,6 +861,8 @@ def main():
                     temporary = header.with_suffix(".h.new")
                     temporary.write_bytes(current)
                     temporary.replace(header)
+            if args.target == "gen":
+                return
             if args.target == "ios":
                 if not args.stub and not (args.build_root / "recomp/gen/table.c").is_file():
                     parser.error("No translation in %s/recomp/gen; run tools/build.py --regenerate on macOS first"

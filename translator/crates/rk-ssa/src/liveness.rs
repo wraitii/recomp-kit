@@ -8,7 +8,7 @@ use crate::{Ssa, ValueId};
 fn rooted(op: Op) -> bool {
     matches!(
         op,
-        Op::Input(_) | Op::Const(_) | Op::Target(_) | Op::Phi | Op::StateReload(_) | Op::StateKeep(_)
+        Op::Input(_) | Op::Const(_) | Op::Target(_) | Op::StateReload(_) | Op::StateKeep(_)
     )
 }
 
@@ -21,7 +21,7 @@ pub fn live_values(
     let mut live = LookupSet::default();
     let mut work = extra_roots.to_vec();
     for block in &s.blocks {
-        for &value in block.phis.iter().chain(block.ops.iter()) {
+        for &value in &block.ops {
             let op = s.value(value).op;
             if removable.contains(&op) {
                 continue;

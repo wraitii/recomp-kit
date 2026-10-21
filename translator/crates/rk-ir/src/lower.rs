@@ -62,7 +62,7 @@ impl CgFunction {
 }
 
 const SUPPORTED: &[&str] = &[
-    "MOV", "MOVSX", "MOVZX", "XCHG", "NOT", "BSWAP", "LEAVE", "LEA", "PUSH", "POP", "RET", "NOP", "ADD",
+    "MOV", "MOVSX", "MOVZX", "XCHG", "NOT", "BSWAP", "BSR", "LEAVE", "LEA", "PUSH", "POP", "RET", "NOP", "ADD",
     "SUB", "CMP", "INC", "DEC", "ADC", "SBB", "SHL", "SHR", "SAR", "DIV", "IDIV", "NEG", "MUL",
     "IMUL", "CDQ", "CWD", "CBW", "CWDE", "CLD", "STD", "SAHF", "LAHF", "TEST", "AND", "OR", "XOR",
     "ROL", "ROR", "RCL", "RCR", "SHLD", "SHRD", "JMP", "JZ", "JNZ",
@@ -340,6 +340,7 @@ impl Lowerer<'_> {
                 }
                 "SHL" | "SHR" => correct_shift(&mnem, &ops, self.regs, &mut |size| self.fresh(size)),
                 "SAR" => correct_sar(&ops, self.regs, &mut |size| self.fresh(size)),
+                "BSR" => correct_bsr(&ops, self.regs, &mut |size| self.fresh(size)),
                 "NEG" => correct_neg(&ops, self.regs, &mut |size| self.fresh(size)),
                 "AND" | "OR" | "XOR" | "TEST" => Ok(with_af_zero(&ops, self.regs)),
                 _ => Ok(ops.clone()),
@@ -379,6 +380,14 @@ impl Lowerer<'_> {
     }
 
     fn add_tail(&self, fir: &FunctionIr, index: u32, out: &mut Vec<CgOp>) {
+        if out.iter().any(|op| matches!(op.op, Op::CBranch { .. })) {
+            let insn = &fir.insns[index as usize];
+            let target = insn.addr + Addr::from(insn.length);
+            if fir.exits.get(&index).is_some_and(|targets| targets.contains(&target)) {
+                out.push(cg(Op::Tail { target }));
+            }
+            return;
+        }
         if fir.succ.get(index as usize).is_some_and(|s| !s.is_empty()) {
             return;
         }
@@ -605,6 +614,48 @@ fn with_af_zero(ops: &[PcodeOp], regs: &Registers) -> Vec<PcodeOp> {
     let mut out = ops.to_vec();
     out.push(copy(flag(regs, "AF"), Varnode::constant(0, 1)));
     out
+}
+
+fn correct_bsr(
+    ops: &[PcodeOp],
+    regs: &Registers,
+    fresh: &mut dyn FnMut(u32) -> Varnode,
+) -> Result<Vec<PcodeOp>, Reason> {
+    let unsupported = || Reason::Unsupported { detail: "unsupported BSR p-code shape".into() };
+    let zf = flag(regs, "ZF");
+    let at = ops.iter().position(|op| op.output == Some(zf)).ok_or_else(unsupported)?;
+    let zero = &ops[at];
+    let source = *zero.inputs.first().ok_or_else(unsupported)?;
+    let last = ops.last().ok_or_else(unsupported)?;
+    let dst = last.output.ok_or_else(unsupported)?;
+    if zero.opcode != OpCode::IntEqual
+        || zero.inputs.len() != 2
+        || zero.inputs[1] != Varnode::constant(0, source.size)
+        || last.opcode != OpCode::Copy
+        || dst.space != Space::Register
+        || !matches!(dst.size, 2 | 4)
+        || source.size != dst.size
+        || ops[..at].iter().any(is_control)
+    {
+        return Err(unsupported());
+    }
+    let leading = fresh(dst.size);
+    let index = fresh(dst.size);
+    let extended = fresh(dst.size);
+    let mask = fresh(dst.size);
+    let changed = fresh(dst.size);
+    let selected = fresh(dst.size);
+    let mut out = ops[..=at].to_vec();
+    out.extend([
+        op(OpCode::LzCount, leading, vec![source]),
+        op(OpCode::IntSub, index, vec![Varnode::constant((dst.size * 8 - 1) as u64, dst.size), leading]),
+        op(OpCode::IntZExt, extended, vec![zf]),
+        op(OpCode::IntSub, mask, vec![extended, Varnode::constant(1, dst.size)]),
+        op(OpCode::IntXor, changed, vec![dst, index]),
+        op(OpCode::IntAnd, selected, vec![changed, mask]),
+        op(OpCode::IntXor, dst, vec![dst, selected]),
+    ]);
+    Ok(out)
 }
 
 fn prepare_rmw(
