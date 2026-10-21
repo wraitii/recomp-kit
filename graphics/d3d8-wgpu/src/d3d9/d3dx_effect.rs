@@ -3297,13 +3297,19 @@ fn transform_value(effect: &D3dxEffect, state: &EfxState) -> Result<[f32; 16], R
             "transform state did not provide a numeric matrix",
         ));
     }
-    let input = if state.preshader.is_some() {
-        FXT_FLOAT
-    } else {
-        type_.type_
-    };
-    let bytes = get_matrix(&words, rows, cols, 1, input, false);
     let mut matrix = [0.0f32; 16];
+    if state.preshader.is_some() {
+        for row in 0..rows {
+            for col in 0..cols {
+                let word = words.get(col * 4 + row).ok_or_else(|| {
+                    invalid_data("transform preshader matrix register span is too short")
+                })?;
+                matrix[row * 4 + col] = f32::from_bits(*word);
+            }
+        }
+        return Ok(matrix);
+    }
+    let bytes = get_matrix(&words, rows, cols, 1, type_.type_, false);
     for (value, word) in matrix.iter_mut().zip(bytes.chunks_exact(4)) {
         *value = f32::from_le_bytes([word[0], word[1], word[2], word[3]]);
     }
