@@ -286,7 +286,11 @@ impl<'a> Builder<'a> {
                 continue;
             }
             let succ = &cg.succ[i];
-            let fallthrough = succ.len() == 1 && succ[0] == i as u32 + 1;
+            let fallthrough = succ.len() == 1
+                && succ[0] == i as u32 + 1
+                && cg.insns.get(i + 1).is_some_and(|next| {
+                    cg.insns[i].addr + u32::from(cg.insns[i].length) == next.addr
+                });
             if !fallthrough || cg.exits.contains_key(&(i as u32)) || cg.import_tails.contains_key(&(i as u32)) {
                 for &s in succ {
                     leader[s as usize] = true;
