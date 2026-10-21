@@ -647,6 +647,7 @@ impl<'a> Emitter<'a> {
                     op => ends_block(op),
                 }
             });
+            let end_addr = self.block_end_addr(block);
             let external_branch = ops
                 .last()
                 .is_some_and(|value| matches!(self.s.value(*value).op, Op::CBranch { .. }))
@@ -654,14 +655,12 @@ impl<'a> Emitter<'a> {
                     .successors(block)
                     .iter()
                     .copied()
-                    .any(|next| self.s.blocks[next].start == self.s.blocks[block].end);
+                    .any(|next| Some(self.plan.block_addrs[next]) == end_addr);
             if !ended || external_branch {
-                let end = self.s.blocks[block].end;
                 let next = self.successors(block)
                     .iter()
                     .copied()
-                    .find(|next| self.s.blocks[*next].start == end);
-                let end_addr = self.block_end_addr(block);
+                    .find(|next| Some(self.plan.block_addrs[*next]) == end_addr);
                 let end_lines = self.x87_lines(|x87| x87.end_lines(self.clone, block as u32, &ValueNames(self)));
                 self.write_x87(end_lines);
                 match next {
@@ -764,7 +763,7 @@ impl<'a> Emitter<'a> {
                 self.seh(kind, addr);
                 Ok(true)
             }
-            Op::Div32 { .. } | Op::Idiv32 { .. } => self.divide(value, addr).map(|_| true),
+            Op::Div { .. } | Op::Idiv { .. } => self.divide(value, addr).map(|_| true),
             Op::String(name) => {
                 self.publish(value)?;
                 let _ = writeln!(self.out, "{} (c);", name.0);
@@ -1164,7 +1163,11 @@ impl<'a> Emitter<'a> {
             .ok_or_else(|| self.error(addr, "division without divisor"))?;
         let divisor = self.expr(divisor)?;
         let helper = match self.s.value(value).op {
-            Op::Div32 { .. } => "div32",
+            Op::Div { size: 1, .. } => "div8",
+            Op::Div { size: 2, .. } => "div16",
+            Op::Div { .. } => "div32",
+            Op::Idiv { size: 1, .. } => "idiv8",
+            Op::Idiv { size: 2, .. } => "idiv16",
             _ => "idiv32",
         };
         let _ = writeln!(self.out, "{helper}(c, (uint32_t)({divisor}), 0x{addr:08x}u);");
@@ -1274,11 +1277,12 @@ impl<'a> Emitter<'a> {
                 "if ((uint32_t)({condition})) {{ c->eip = 0x{at:08x}u; recomp_jump(c, 0x{target:08x}u); return; }}"
             );
         }
+        let end_addr = self.block_end_addr(current);
         let fallthrough = self
             .successors(current)
             .iter()
             .copied()
-            .find(|block| self.s.blocks[*block].start == self.s.blocks[current].end);
+            .find(|block| Some(self.plan.block_addrs[*block]) == end_addr);
         match fallthrough {
             Some(fallthrough) => self.edge(Some(current), fallthrough),
             None => Ok(()),
@@ -1589,10 +1593,11 @@ impl<'a> Emitter<'a> {
 
     fn block_end_addr(&self, block: usize) -> Option<Addr> {
         let insns = &self.ctx.ir.insns;
-        match insns.get(self.s.blocks[block].end as usize) {
-            Some(insn) => Some(insn.addr),
-            None => insns.last().map(|insn| insn.addr + insn.length as Addr),
-        }
+        let end = self.s.blocks[block].end;
+        (end > 0)
+            .then(|| insns.get(end as usize - 1))
+            .flatten()
+            .map(|insn| insn.addr + insn.length as Addr)
     }
 
     fn edge(&mut self, source: Option<usize>, target: usize) -> Result<()> {

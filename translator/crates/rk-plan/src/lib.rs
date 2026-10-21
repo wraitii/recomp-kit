@@ -352,7 +352,7 @@ fn boundary_writes(s: &Ssa, call_facts: &dyn CallFacts, value: ValueId) -> Field
         rk_ir::Op::Call { target } => call_facts.call(s.value_addr[value as usize], Some(target)).writes,
         rk_ir::Op::CallInd => call_facts.call(s.value_addr[value as usize], None).writes,
         rk_ir::Op::String(name) => rk_ir::string::effect(name.0).1,
-        rk_ir::Op::Slow(_) | rk_ir::Op::Div32 { .. } | rk_ir::Op::Idiv32 { .. } => Fields::ALL,
+        rk_ir::Op::Slow(_) | rk_ir::Op::Div { .. } | rk_ir::Op::Idiv { .. } => Fields::ALL,
         rk_ir::Op::P(rk_core::ir::OpCode::Call)
         | rk_ir::Op::P(rk_core::ir::OpCode::CallInd)
         | rk_ir::Op::P(rk_core::ir::OpCode::CallOther)

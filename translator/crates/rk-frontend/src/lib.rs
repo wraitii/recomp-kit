@@ -117,7 +117,7 @@ impl RawFunction {
                 return self.idx(target).into_iter().collect();
             }
         }
-        let next = (i + 1 < self.decoded.len() && self.contiguous[i]).then_some((i + 1) as u32);
+        let next = self.fallthrough.get(i).copied().and_then(|addr| self.idx(addr));
         if m == "INT3" {
             return Vec::new();
         }
@@ -244,7 +244,7 @@ impl RawFunction {
             return Vec::new();
         };
         let m = ins.mnemonic.as_str();
-        let next = (i + 1 < self.decoded.len() && self.contiguous[i]).then_some((i + 1) as u32);
+        let next = self.fallthrough.get(i).copied().and_then(|addr| self.idx(addr));
         if m == "INT3" {
             Vec::new()
         } else if m == "RET" {

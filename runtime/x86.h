@@ -1515,6 +1515,7 @@ static inline void x86_sub_flags32(X86 *c, uint32_t a, uint32_t b);
 
 static inline void x86_sub_flags8(X86 *c, uint32_t a, uint32_t b) {
     uint32_t r = (a - b) & 0xffu;
+    x86_cc_drop(c);
     c->eflags_cf = ((a & 0xffu) < (b & 0xffu));
     c->eflags_of = (((a ^ b) & (a ^ r)) >> 7) & 1u;
     c->eflags_af = ((a ^ b ^ r) >> 4) & 1u;
@@ -1524,6 +1525,7 @@ static inline void x86_sub_flags8(X86 *c, uint32_t a, uint32_t b) {
 }
 static inline void x86_sub_flags16(X86 *c, uint32_t a, uint32_t b) {
     uint32_t r = (a - b) & 0xffffu;
+    x86_cc_drop(c);
     c->eflags_cf = ((a & 0xffffu) < (b & 0xffffu));
     c->eflags_of = (((a ^ b) & (a ^ r)) >> 15) & 1u;
     c->eflags_af = ((a ^ b ^ r) >> 4) & 1u;
@@ -1533,6 +1535,7 @@ static inline void x86_sub_flags16(X86 *c, uint32_t a, uint32_t b) {
 }
 static inline void x86_sub_flags32(X86 *c, uint32_t a, uint32_t b) {
     uint32_t r = a - b;
+    x86_cc_drop(c);
     c->eflags_cf = (a < b);
     c->eflags_of = (((a ^ b) & (a ^ r)) >> 31) & 1u;
     c->eflags_af = ((a ^ b ^ r) >> 4) & 1u;

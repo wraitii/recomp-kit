@@ -65,8 +65,8 @@ pub enum Op {
     Trap(Addr),
     Breakpoint,
     Seh(SehEffect),
-    Div32 { addr: Addr },
-    Idiv32 { addr: Addr },
+    Div { addr: Addr, size: u8 },
+    Idiv { addr: Addr, size: u8 },
     String(StringOp),
     Slow(u32),
     CallOther(u64),
@@ -184,7 +184,7 @@ pub fn properties(op: Op) -> Properties {
             OpCode::Unknown => Properties { opaque: true, faults: true, ..Properties::new() },
         },
         Op::Call { .. } | Op::CallInd => Properties::effect(),
-        Op::Div32 { .. } | Op::Idiv32 { .. } | Op::String(_) => Properties::effect(),
+        Op::Div { .. } | Op::Idiv { .. } | Op::String(_) => Properties::effect(),
         Op::Slow(_) | Op::CallOther(_) => Properties::effect(),
         Op::Tail { .. } | Op::ImportTail { .. } | Op::BranchInd | Op::Return => {
             Properties { observes: true, terminator: true, ..Properties::new() }

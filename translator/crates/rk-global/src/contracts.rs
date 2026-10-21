@@ -655,7 +655,7 @@ fn prepare(
                     defs[index] |= produced;
                     continue;
                 }
-                Op::Div32 { .. } | Op::Idiv32 { .. } => {
+                Op::Div { .. } | Op::Idiv { .. } => {
                     let regs = Registers::get();
                     for name in ["EAX", "EDX"] {
                         use_[index] |= lanes.mask(&regs.require(name)) & !local;

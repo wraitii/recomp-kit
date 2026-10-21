@@ -78,8 +78,16 @@ const SUPPORTED: &[&str] = &[
 fn is_media(mnemonic: &str) -> bool {
     matches!(
         mnemonic,
-        "MOVD" | "MOVQ" | "EMMS" | "PXOR" | "PADDW" | "PADDD" | "PSRLW" | "PUNPCKLBW"
-            | "PACKUSWB" | "PMADDWD" | "PMULHW" | "PSUBSW" | "PSHUFW" | "ORPS"
+        "MOVD" | "MOVQ" | "MOVNTQ" | "EMMS" | "FEMMS" | "PSHUFW" | "ORPS" | "ORPD"
+            | "XORPS" | "XORPD" | "ANDPS" | "ANDPD" | "ANDNPS" | "ANDNPD" | "PADDB"
+            | "PADDW" | "PADDD" | "PADDQ" | "PSUBB" | "PSUBW" | "PSUBD" | "PSUBQ"
+            | "PADDSB" | "PADDSW" | "PSUBSB" | "PSUBSW" | "PADDUSB" | "PADDUSW"
+            | "PSUBUSB" | "PSUBUSW" | "PMULLW" | "PMULHW" | "PMADDWD" | "PCMPEQB"
+            | "PCMPEQW" | "PCMPEQD" | "PCMPGTB" | "PCMPGTW" | "PCMPGTD" | "PACKSSWB"
+            | "PACKSSDW" | "PACKUSWB" | "PMINUB" | "PMAXUB" | "PUNPCKLBW"
+            | "PUNPCKLWD" | "PUNPCKLDQ" | "PUNPCKHBW" | "PUNPCKHWD" | "PUNPCKHDQ"
+            | "PAND" | "PANDN" | "POR" | "PXOR" | "PSRLW" | "PSRLD" | "PSRLQ"
+            | "PSRAW" | "PSRAD" | "PSLLW" | "PSLLD" | "PSLLQ"
     )
 }
 
@@ -914,48 +922,67 @@ fn correct_div_cg(
     let signed = mnem == "IDIV";
     let div = if signed { OpCode::IntSDiv } else { OpCode::IntDiv };
     let rem = if signed { OpCode::IntSRem } else { OpCode::IntRem };
-    let index = ops
-        .iter()
-        .position(|op| op.opcode == div)
-        .ok_or_else(|| Reason::UnsupportedDivide { mnemonic: mnem.into() })?;
+    let unsupported = || Reason::UnsupportedDivide { mnemonic: mnem.into() };
+    let index = ops.iter().position(|op| op.opcode == div).ok_or_else(unsupported)?;
     let division = &ops[index];
+    let quotient = division.output.ok_or_else(unsupported)?;
     let remainder = ops
         .iter()
         .find(|op| op.opcode == rem && op.inputs == division.inputs)
-        .ok_or_else(|| Reason::UnsupportedDivide { mnemonic: mnem.into() })?;
-    let eax = regs.require("EAX");
-    let edx = regs.require("EDX");
-    let shape = division.output.is_some_and(|v| v.size == 8)
-        && division.inputs.iter().all(|v| v.size == 8)
-        && ops.len() > index + 3
-        && ops[index + 1].opcode == OpCode::SubPiece
-        && ops[index + 1].output == Some(eax)
-        && ops[index + 1].inputs == [division.output.unwrap(), Varnode::constant(0, 4)]
-        && ops[index + 2].opcode == rem
-        && ops[index + 3].opcode == OpCode::SubPiece
-        && ops[index + 3].output == Some(edx)
-        && ops[index + 3].inputs == [remainder.output.unwrap(), Varnode::constant(0, 4)];
-    if !shape {
-        return Err(Reason::UnsupportedDivide { mnemonic: mnem.into() });
+        .ok_or_else(unsupported)?;
+    let remainder_value = remainder.output.ok_or_else(unsupported)?;
+    let width = match quotient.size {
+        2 => 1u32,
+        4 => 2u32,
+        8 => 4u32,
+        _ => return Err(unsupported()),
+    };
+    if division.inputs.iter().any(|v| v.size != quotient.size) {
+        return Err(unsupported());
+    }
+    let outputs: [(&str, Varnode, u64); 2] = match width {
+        1 => [("AL", quotient, 0), ("AH", remainder_value, 1)],
+        2 => [("AX", quotient, 0), ("DX", remainder_value, 4)],
+        _ => [("EAX", quotient, 0), ("EDX", remainder_value, 4)],
+    };
+    let mut emitted = [false; 2];
+    for op in &ops[index..] {
+        if op.opcode == div || op.opcode == rem {
+            continue;
+        }
+        let matched = outputs.iter().enumerate().position(|(n, (name, source, _))| {
+            let register = regs.require(name);
+            !emitted[n]
+                && op.opcode == OpCode::SubPiece
+                && op.output == Some(register)
+                && op.inputs.len() == 2
+                && op.inputs[0] == *source
+                && op.inputs[1].space == Space::Const
+                && op.inputs[1].offset == 0
+        });
+        match matched {
+            Some(n) => emitted[n] = true,
+            None => return Err(unsupported()),
+        }
+    }
+    if emitted.iter().any(|found| !found) {
+        return Err(unsupported());
     }
     let result = fresh(8);
     let mut inputs = division.inputs.clone();
     inputs.push(Varnode::constant(addr as u64, 4));
-    let opcode = if signed { Op::Idiv32 { addr } } else { Op::Div32 { addr } };
+    let opcode = if signed {
+        Op::Idiv { addr, size: width as u8 }
+    } else {
+        Op::Div { addr, size: width as u8 }
+    };
     let mut out: Vec<CgOp> = ops[..index].iter().cloned().map(from_pcode).collect();
-    out.extend([
-        CgOp { op: opcode, output: Some(result), inputs },
-        CgOp {
-            op: Op::P(OpCode::SubPiece),
-            output: Some(eax),
-            inputs: vec![result, Varnode::constant(0, 4)],
-        },
-        CgOp {
-            op: Op::P(OpCode::SubPiece),
-            output: Some(edx),
-            inputs: vec![result, Varnode::constant(4, 4)],
-        },
-    ]);
+    out.push(CgOp { op: opcode, output: Some(result), inputs });
+    out.extend(outputs.into_iter().map(|(name, _, offset)| CgOp {
+        op: Op::P(OpCode::SubPiece),
+        output: Some(regs.require(name)),
+        inputs: vec![result, Varnode::constant(offset, 4)],
+    }));
     Ok(out)
 }
 

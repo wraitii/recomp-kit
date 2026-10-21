@@ -20,8 +20,8 @@ const INACTIVE: Shape = Shape::Known(CarryShape {
 pub fn reset_op(op: Op) -> bool {
     matches!(
         op,
-        Op::Div32 { .. }
-            | Op::Idiv32 { .. }
+        Op::Div { .. }
+            | Op::Idiv { .. }
             | Op::String(_)
             | Op::Call { .. }
             | Op::CallInd

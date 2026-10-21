@@ -2283,6 +2283,17 @@ void Buffer_Lock(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
+    uint32_t size = arg(c, 2);
+    if (size > o->pixels_bytes - offset) {
+        char key[64];
+        snprintf(key, sizeof key, "d3d8.buffer-lock-oversize:%08x", c->eip);
+        if (log_once(key,
+                     "d3d8: Lock past the end of a guest buffer (view=%08x backing=%08x "
+                     "bytes=%u offset=%u size=%u eip=%08x): the guest can write outside the "
+                     "backing",
+                     arg(c, 0), o->d3d8_guest_backing, o->pixels_bytes, offset, size, c->eip))
+            fflush(stderr);
+    }
     uint32_t base = d8_stage_lock(o);
     wr32(out, base ? base + offset : 0);
     com_ret(c, base ? D8_OK : E_OUTOFMEMORY);

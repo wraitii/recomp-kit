@@ -813,7 +813,7 @@ impl<'a> Builder<'a> {
                 self.reload_fields(value, writes, state, block)?;
                 ops.push(value);
             }
-            Op::Div32 { .. } | Op::Idiv32 { .. } => {
+            Op::Div { .. } | Op::Idiv { .. } => {
                 let memory = self.state_slot(state, memory_index, block)?;
                 let mut args = vec![memory];
                 for input in &cg_op.inputs {

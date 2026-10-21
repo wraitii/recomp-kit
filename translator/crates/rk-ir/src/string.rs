@@ -19,18 +19,17 @@ pub fn helper(raw: &[u8]) -> Option<&'static str> {
             (0xaf, "scas"),
         ] {
             for (prefix, wide) in [(&b""[..], "d"), (&b"\x66"[..], "w")] {
-                if opcode & 1 == 0 && !prefix.is_empty() {
-                    continue;
-                }
                 let suffix = if opcode & 1 == 0 { "b" } else { wide };
                 let mut single = prefix.to_vec();
                 single.push(opcode);
                 out.push((single.clone(), leak(&format!("{base}{suffix}"))));
                 if base == "movs" || base == "stos" || base == "lods" {
-                    let mut rep = prefix.to_vec();
-                    rep.push(0xf3);
-                    rep.push(opcode);
-                    out.push((rep, leak(&format!("rep_{base}{suffix}"))));
+                    for repeat in [0xf3u8, 0xf2] {
+                        let mut rep = prefix.to_vec();
+                        rep.push(repeat);
+                        rep.push(opcode);
+                        out.push((rep, leak(&format!("rep_{base}{suffix}"))));
+                    }
                 } else {
                     for (byte, name) in [(0xf3u8, "repe"), (0xf2, "repne")] {
                         let mut rep = vec![byte];

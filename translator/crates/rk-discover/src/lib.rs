@@ -1306,7 +1306,7 @@ fn decode_one(bytes: &[u8], at: Addr, folded: Option<u8>) -> Option<Insn> {
     let mut decoder = Decoder::with_ip(32, bytes, at as u64, DecoderOptions::NONE);
     let mut insn = Instruction::default();
     decoder.decode_out(&mut insn);
-    if insn.is_invalid() || insn.len() == 0 {
+    if insn.is_invalid() || insn.len() == 0 || insn.len() > bytes.len() {
         return None;
     }
     let base = folded.unwrap_or(0);
@@ -1370,7 +1370,7 @@ fn decode_one(bytes: &[u8], at: Addr, folded: Option<u8>) -> Option<Insn> {
         direct,
         imm4,
         disp4,
-        padding: bytes[..size as usize].iter().all(|&b| b == 0x90 || b == 0xcc),
+        padding: bytes[..insn.len()].iter().all(|&b| b == 0x90 || b == 0xcc),
     })
 }
 
