@@ -11,7 +11,7 @@ use rk_ssa::{FlagDescriptor, ValueId, DISPATCH_BLOCK};
 
 #[derive(Clone, Copy)]
 pub struct PrivateEmit {
-    pub mask: u16,
+    pub mask: Fields,
     pub inputs: Fields,
     pub input_argument: Option<Field>,
 }
@@ -19,7 +19,7 @@ pub struct PrivateEmit {
 pub struct EmitContext<'a> {
     pub ir: &'a FunctionIr,
     pub checked_returns: &'a BTreeSet<Addr>,
-    pub private_masks: &'a BTreeMap<Addr, BTreeSet<u16>>,
+    pub private_masks: &'a BTreeMap<Addr, BTreeSet<Fields>>,
     pub private_input_arguments: &'a BTreeMap<Addr, String>,
     pub known_modes: &'a BTreeSet<Addr>,
     pub known_entries: &'a BTreeSet<Addr>,
@@ -272,7 +272,7 @@ impl<'a> Emitter<'a> {
             if field as usize >= 8 || lane >= 4 {
                 continue;
             }
-            let site = s.resolve(s.args(id)[0]);
+            let site = s.args(id)[0];
             slots.entry((site, field as usize)).or_insert([None; 4])[lane as usize] = Some(id);
         }
         let mut keep_lane: rk_core::Lookup<ValueId, (ValueId, u8)> = rk_core::Lookup::default();
@@ -346,7 +346,7 @@ impl<'a> Emitter<'a> {
     fn run(&mut self) -> Result<()> {
         let addr = self.s.addr;
         let body_name = if let Some(private) = self.private {
-            format!("fn_contract_{addr:08x}_{:04x}", private.mask)
+            format!("fn_contract_{addr:08x}_{:04x}", private.mask.0)
         } else if self.checked {
             format!("body_checked_{addr:08x}")
         } else if self.multi {
@@ -540,24 +540,9 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn x87_block_lines(&self, block: usize) -> Vec<String> {
+    fn x87_lines(&self, lines: impl FnOnce(&rk_x87::Plan) -> Vec<String>) -> Vec<String> {
         let Some(x87) = self.plan.x87.as_ref() else { return Vec::new() };
-        x87.block_lines(self.clone, block as u32, &ValueNames(self))
-    }
-
-    fn x87_event_lines(&self, value: ValueId) -> Vec<String> {
-        let Some(x87) = self.plan.x87.as_ref() else { return Vec::new() };
-        x87.event_lines(self.clone, value, &ValueNames(self))
-    }
-
-    fn x87_end_lines(&self, block: usize) -> Vec<String> {
-        let Some(x87) = self.plan.x87.as_ref() else { return Vec::new() };
-        x87.end_lines(self.clone, block as u32, &ValueNames(self))
-    }
-
-    fn x87_default_lines(&self, value: ValueId) -> Vec<String> {
-        let Some(x87) = self.plan.x87.as_ref() else { return Vec::new() };
-        x87.default_lines(self.clone, value, &ValueNames(self))
+        lines(x87)
     }
 
     fn entry_dispatch(&mut self) -> Result<()> {
@@ -622,7 +607,7 @@ impl<'a> Emitter<'a> {
                     insn.addr, insn.text
                 );
             }
-            let block_lines = self.x87_block_lines(block);
+            let block_lines = self.x87_lines(|x87| x87.block_lines(self.clone, block as u32, &ValueNames(self)));
             self.write_x87(block_lines);
             let ops = item.ops.clone();
             let mut continues = true;
@@ -637,7 +622,7 @@ impl<'a> Emitter<'a> {
                         ops.get(position + 1).map(|next| self.s.value(*next).op),
                     ) {
                         if branch == tail {
-                            let lines = self.x87_event_lines(value);
+                            let lines = self.x87_lines(|x87| x87.event_lines(self.clone, value, &ValueNames(self)));
                             self.write_x87(lines);
                             self.publish(value)?;
                             self.materialize_defs(value)?;
@@ -659,15 +644,17 @@ impl<'a> Emitter<'a> {
                 .is_some_and(|value| matches!(self.s.value(*value).op, Op::CBranch { .. }))
                 && !self
                     .successors(block)
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .any(|next| self.s.blocks[next].start == self.s.blocks[block].end);
             if !ended || external_branch {
                 let end = self.s.blocks[block].end;
                 let next = self.successors(block)
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .find(|next| self.s.blocks[*next].start == end);
                 let end_addr = self.block_end_addr(block);
-                let end_lines = self.x87_end_lines(block);
+                let end_lines = self.x87_lines(|x87| x87.end_lines(self.clone, block as u32, &ValueNames(self)));
                 self.write_x87(end_lines);
                 match next {
                     Some(next) if self.can_inline(block, next) => self.inline_block(block, next)?,
@@ -698,7 +685,7 @@ impl<'a> Emitter<'a> {
         let item = *self.s.value(value);
         let addr = self.s.value_addr[value as usize];
         if !matches!(item.op, Op::X87(_)) {
-            let lines = self.x87_event_lines(value);
+            let lines = self.x87_lines(|x87| x87.event_lines(self.clone, value, &ValueNames(self)));
             self.write_x87(lines);
         }
         match item.op {
@@ -707,7 +694,7 @@ impl<'a> Emitter<'a> {
                 if op.touches_memory() {
                     self.publish(value)?;
                 }
-                let lines = self.x87_event_lines(value);
+                let lines = self.x87_lines(|x87| x87.event_lines(self.clone, value, &ValueNames(self)));
                 self.write_x87(lines);
                 Ok(true)
             }
@@ -723,8 +710,7 @@ impl<'a> Emitter<'a> {
             }
             Op::CallOther(userop) => {
                 self.publish(value)?;
-                self.slow_trap(addr, &format!("callother userop {userop}"));
-                Ok(false)
+                self.unsupported(addr, &format!("callother userop {userop}"))
             }
             Op::Call { target } => self.call(value, target).map(|_| true),
             Op::CallInd => self.call_ind(value, addr).map(|_| true),
@@ -749,7 +735,7 @@ impl<'a> Emitter<'a> {
             Op::Branch { target } => self.branch(value, target).map(|_| true),
             Op::CBranch { target } => self.cbranch(value, target).map(|_| true),
             Op::BranchInd => self.branch_ind(value, addr).map(|_| true),
-            Op::Return => self.return_value(value, addr).map(|_| false),
+            Op::Return => self.return_value(value).map(|_| false),
             Op::Trap(target) => {
                 let _ = writeln!(self.out, "recomp_unmodelled(c, 0x{target:08x}u); return;");
                 Ok(false)
@@ -798,6 +784,11 @@ impl<'a> Emitter<'a> {
         );
     }
 
+    fn unsupported(&mut self, addr: Addr, reason: &str) -> Result<bool> {
+        self.slow_trap(addr, reason);
+        Ok(false)
+    }
+
     fn slow(&mut self, family: SlowFamily, addr: Addr) -> Result<bool> {
         let insn = self
             .insn_at(addr)
@@ -831,8 +822,7 @@ impl<'a> Emitter<'a> {
                     Ok(true)
                 }
                 _ => {
-                    self.slow_trap(addr, &mnemonic);
-                    Ok(false)
+                    self.unsupported(addr, &mnemonic)
                 }
             },
             SlowFamily::Int => {
@@ -845,8 +835,7 @@ impl<'a> Emitter<'a> {
                     }),
                 };
                 let Some(vector) = vector else {
-                    self.slow_trap(addr, &mnemonic);
-                    return Ok(false);
+                    return self.unsupported(addr, &mnemonic);
                 };
                 let _ = writeln!(self.out, "recomp_int(c, 0x{vector:x}u);");
                 Ok(true)
@@ -856,8 +845,7 @@ impl<'a> Emitter<'a> {
             SlowFamily::Mmx => self.slow_mmx(&insn, addr),
             SlowFamily::Segment => self.slow_segment(&insn, addr),
             _ => {
-                self.slow_trap(addr, &mnemonic);
-                Ok(false)
+                self.unsupported(addr, &mnemonic)
             }
         }
     }
@@ -869,25 +857,21 @@ impl<'a> Emitter<'a> {
         if mnemonic.starts_with("INS") || mnemonic.starts_with("OUTS") {
             let suffix = mnemonic.chars().last().unwrap_or('B').to_ascii_lowercase();
             if !matches!(suffix, 'b' | 'w' | 'd') {
-                self.slow_trap(addr, &mnemonic);
-                return Ok(false);
+                return self.unsupported(addr, &mnemonic);
             }
             let root = if mnemonic.starts_with("INS") { "ins" } else { "outs" };
             let _ = writeln!(self.out, "{prefix}{root}{suffix}(c);");
             return Ok(true);
         }
         let Some(operands) = parse_slow_operands(insn) else {
-            self.slow_trap(addr, &mnemonic);
-            return Ok(false);
+            return self.unsupported(addr, &mnemonic);
         };
         if input && mnemonic == "IN" {
             let Some(SlowOperand::Gpr { index, shift, mask }) = operands.first() else {
-                self.slow_trap(addr, "IN destination");
-                return Ok(false);
+                return self.unsupported(addr, "IN destination");
             };
             let Some(port) = operands.get(1).and_then(port_expr) else {
-                self.slow_trap(addr, "IN port");
-                return Ok(false);
+                return self.unsupported(addr, "IN port");
             };
             let size = gpr_size(*mask);
             let _ = writeln!(
@@ -898,12 +882,10 @@ impl<'a> Emitter<'a> {
         }
         if !input && mnemonic == "OUT" {
             let Some(port) = operands.first().and_then(port_expr) else {
-                self.slow_trap(addr, "OUT port");
-                return Ok(false);
+                return self.unsupported(addr, "OUT port");
             };
             let Some(SlowOperand::Gpr { index, shift, mask }) = operands.get(1) else {
-                self.slow_trap(addr, "OUT source");
-                return Ok(false);
+                return self.unsupported(addr, "OUT source");
             };
             let size = gpr_size(*mask);
             let _ = writeln!(
@@ -912,22 +894,19 @@ impl<'a> Emitter<'a> {
             );
             return Ok(true);
         }
-        self.slow_trap(addr, &mnemonic);
-        Ok(false)
+        self.unsupported(addr, &mnemonic)
     }
 
     fn slow_segment(&mut self, insn: &Insn, addr: Addr) -> Result<bool> {
         let mnemonic = insn.mnemonic.to_ascii_uppercase();
         if matches!(mnemonic.as_str(), "LDS" | "LES") {
             let Some(operands) = parse_slow_operands(insn) else {
-                self.slow_trap(addr, &mnemonic);
-                return Ok(false);
+                return self.unsupported(addr, &mnemonic);
             };
             let (Some(SlowOperand::Gpr { index, shift, mask }), Some(SlowOperand::Mem(address))) =
                 (operands.first(), operands.get(1))
             else {
-                self.slow_trap(addr, &mnemonic);
-                return Ok(false);
+                return self.unsupported(addr, &mnemonic);
             };
             let temp = format!("a_{addr:08x}_");
             let _ = writeln!(self.out, "uint32_t {temp} = (uint32_t)({address});");
@@ -936,8 +915,7 @@ impl<'a> Emitter<'a> {
             let _ = writeln!(self.out, "(void)recomp_rd16_(g_mem, {temp} + 4u);");
             return Ok(true);
         }
-        self.slow_trap(addr, &mnemonic);
-        Ok(false)
+        self.unsupported(addr, &mnemonic)
     }
 
     fn slow_mmx(&mut self, insn: &Insn, addr: Addr) -> Result<bool> {
@@ -947,17 +925,14 @@ impl<'a> Emitter<'a> {
             return Ok(true);
         }
         let Some(operands) = parse_slow_operands(insn) else {
-            self.slow_trap(addr, &mnemonic);
-            return Ok(false);
+            return self.unsupported(addr, &mnemonic);
         };
         let Some(dst) = operands.first() else {
-            self.slow_trap(addr, &mnemonic);
-            return Ok(false);
+            return self.unsupported(addr, &mnemonic);
         };
         if let Some(operator) = sse_logic(&mnemonic) {
             let (SlowOperand::Xmm(destination), Some(source)) = (dst, operands.get(1)) else {
-                self.slow_trap(addr, &mnemonic);
-                return Ok(false);
+                return self.unsupported(addr, &mnemonic);
             };
             for lane in 0..4u32 {
                 let source = match source {
@@ -967,8 +942,7 @@ impl<'a> Emitter<'a> {
                         lane * 4
                     ),
                     _ => {
-                        self.slow_trap(addr, &mnemonic);
-                        return Ok(false);
+                        return self.unsupported(addr, &mnemonic);
                     }
                 };
                 let _ = writeln!(
@@ -989,16 +963,14 @@ impl<'a> Emitter<'a> {
                     );
                     return Ok(true);
                 }
-                self.slow_trap(addr, &mnemonic);
-                return Ok(false);
+                return self.unsupported(addr, &mnemonic);
             }
             "PSHUFW" => {
                 if let (SlowOperand::Mm(destination), Some(source), Some(SlowOperand::Imm(order))) =
                     (dst, operands.get(1), operands.get(2))
                 {
                     let Some(source) = mmx_source(source, 64) else {
-                        self.slow_trap(addr, &mnemonic);
-                        return Ok(false);
+                        return self.unsupported(addr, &mnemonic);
                     };
                     let _ = writeln!(
                         self.out,
@@ -1007,18 +979,15 @@ impl<'a> Emitter<'a> {
                     );
                     return Ok(true);
                 }
-                self.slow_trap(addr, &mnemonic);
-                return Ok(false);
+                return self.unsupported(addr, &mnemonic);
             }
             _ => {}
         }
         let SlowOperand::Mm(destination) = dst else {
-            self.slow_trap(addr, &mnemonic);
-            return Ok(false);
+            return self.unsupported(addr, &mnemonic);
         };
         let Some(source) = operands.get(1).and_then(|operand| mmx_source(operand, 64)) else {
-            self.slow_trap(addr, &mnemonic);
-            return Ok(false);
+            return self.unsupported(addr, &mnemonic);
         };
         if let Some((function, bits)) = mmx_shift(&mnemonic) {
             let _ = writeln!(
@@ -1041,16 +1010,14 @@ impl<'a> Emitter<'a> {
             }
             return Ok(true);
         }
-        self.slow_trap(addr, &mnemonic);
-        Ok(false)
+        self.unsupported(addr, &mnemonic)
     }
 
     fn slow_movd(&mut self, dst: &SlowOperand, src: Option<&SlowOperand>, addr: Addr) -> Result<bool> {
         match (dst, src) {
             (SlowOperand::Mm(destination), Some(source)) => {
                 let Some(source) = mmx_source(source, 32) else {
-                    self.slow_trap(addr, "MOVD source");
-                    return Ok(false);
+                    return self.unsupported(addr, "MOVD source");
                 };
                 let _ = writeln!(self.out, "c->mm[{destination}] = {source};");
             }
@@ -1065,8 +1032,7 @@ impl<'a> Emitter<'a> {
                 let _ = writeln!(self.out, "{line}");
             }
             _ => {
-                self.slow_trap(addr, "MOVD form");
-                return Ok(false);
+                return self.unsupported(addr, "MOVD form");
             }
         }
         Ok(true)
@@ -1076,8 +1042,7 @@ impl<'a> Emitter<'a> {
         match (dst, src) {
             (SlowOperand::Mm(destination), Some(source)) => {
                 let Some(source) = mmx_source(source, 64) else {
-                    self.slow_trap(addr, "MOVQ source");
-                    return Ok(false);
+                    return self.unsupported(addr, "MOVQ source");
                 };
                 let _ = writeln!(self.out, "c->mm[{destination}] = {source};");
             }
@@ -1088,8 +1053,7 @@ impl<'a> Emitter<'a> {
                 );
             }
             _ => {
-                self.slow_trap(addr, "MOVQ form");
-                return Ok(false);
+                return self.unsupported(addr, "MOVQ form");
             }
         }
         Ok(true)
@@ -1116,7 +1080,7 @@ impl<'a> Emitter<'a> {
                         .ctx
                         .private_input_arguments
                         .get(&target)
-                        .and_then(|name| field_by_name(name));
+                        .and_then(|name| Field::from_name(name));
                     self.declarations.insert(Declaration::PrivatePrepare(target));
                     self.declarations.insert(Declaration::Checked(target));
                     self.declarations.insert(Declaration::PrivateContract {
@@ -1130,7 +1094,7 @@ impl<'a> Emitter<'a> {
                     );
                     let _ = writeln!(
                         self.out,
-                        "if (entry_contract_prepare_{target:08x}(c, 0)) {{ entry_contract_{target:08x}_{mask:04x}({args}); }} else {{ CALL_FN_CHECKED({target:08x}, 0x{expected:08x}u); }}"
+                        "if (entry_contract_prepare_{target:08x}(c, 0)) {{ entry_contract_{target:08x}_{:04x}({args}); }} else {{ CALL_FN_CHECKED({target:08x}, 0x{expected:08x}u); }}", mask.0
                     );
                     if self.plan.settle_calls.contains(&value) {
                         self.out.push_str("x86_cc_settle(c);\n");
@@ -1272,7 +1236,8 @@ impl<'a> Emitter<'a> {
         if let Some(taken) = taken {
             let fallthrough = self
                 .successors(current)
-                .into_iter()
+                .iter()
+                .copied()
                 .find(|block| *block != taken)
                 .unwrap_or(taken);
             let _ = writeln!(self.out, "if ((uint32_t)({condition}))");
@@ -1296,7 +1261,8 @@ impl<'a> Emitter<'a> {
         }
         let fallthrough = self
             .successors(current)
-            .into_iter()
+            .iter()
+            .copied()
             .find(|block| self.s.blocks[*block].start == self.s.blocks[current].end);
         match fallthrough {
             Some(fallthrough) => self.edge(Some(current), fallthrough),
@@ -1308,14 +1274,14 @@ impl<'a> Emitter<'a> {
         let args = self.s.args(value);
         let target = self.expr(*args.first().ok_or_else(|| self.error(addr, "indirect jump without target"))?)?;
         let current = self.block_of(value);
-        let successors = self.successors(current);
+        let successors = self.successors(current).to_vec();
         let _ = writeln!(self.out, "switch ((uint32_t)({target})) {{");
         for target_block in &successors {
             let _ = writeln!(self.out, "case 0x{:08x}u:", self.plan.block_addrs[*target_block]);
             self.edge(Some(current), *target_block)?;
         }
         self.out.push_str("default:\n");
-        let default_lines = self.x87_default_lines(value);
+        let default_lines = self.x87_lines(|x87| x87.default_lines(self.clone, value, &ValueNames(self)));
         self.write_x87(default_lines);
         self.publish(value)?;
         let _ = writeln!(self.out, "c->eip = 0x{addr:08x}u; recomp_jump(c, (uint32_t)({target})); return;");
@@ -1323,7 +1289,7 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    fn return_value(&mut self, value: ValueId, addr: Addr) -> Result<()> {
+    fn return_value(&mut self, value: ValueId) -> Result<()> {
         if let Some(private) = self.private {
             self.publish_private_return(value, private)?;
             self.out.push_str(
@@ -1339,7 +1305,6 @@ impl<'a> Emitter<'a> {
                 "if (!checked_return_ || RECOMP_UNLIKELY(c->eip != expected_return_)) recomp_return_fast_(c);\nreturn;\n",
             );
         } else {
-            let _ = addr;
             self.out.push_str("recomp_return_fast_(c);\nreturn;\n");
         }
         Ok(())
@@ -1352,7 +1317,7 @@ impl<'a> Emitter<'a> {
             .filter(|key| {
                 self.s
                     .field(*key)
-                    .is_none_or(|field| private.mask & field.bit() != 0)
+                    .is_none_or(|field| private.mask.contains(field))
             })
             .collect();
         self.publish_keys(value, &keys, true)
@@ -1499,7 +1464,6 @@ impl<'a> Emitter<'a> {
     }
 
     fn available(&self, value: ValueId) -> bool {
-        let value = self.s.resolve(value);
         if let Some(known) = self.available.borrow()[value as usize] {
             return known;
         }
@@ -1526,21 +1490,7 @@ impl<'a> Emitter<'a> {
                 let values: Vec<Option<ValueId>> = (0..4)
                     .map(|lane| lanes.get(lane).and_then(|key| state.get(key).copied()))
                     .collect();
-                if let Some(all) = values.iter().copied().collect::<Option<Vec<_>>>() {
-                    if let Some(text) = self.pack_lanes(&all) {
-                        let _ = writeln!(self.out, "c->r[{index}] = {text};");
-                        return Ok(());
-                    }
-                }
-                let mut parts = Vec::new();
-                for (lane, value) in values.into_iter().enumerate() {
-                    let expr = match value {
-                        Some(value) => self.expr(value)?,
-                        None => format!("((c->r[{index}] >> {}) & 0xffu)", lane * 8),
-                    };
-                    parts.push(format!("((({expr}) & 0xffu) << {})", lane * 8));
-                }
-                let _ = writeln!(self.out, "c->r[{index}] = {};", parts.join(" | "));
+                self.publish_lanes(&format!("r[{index}]"), values)?;
             }
             Location::Flag(field) => {
                 let key = rk_ir::lanes(field).first().copied();
@@ -1576,6 +1526,10 @@ impl<'a> Emitter<'a> {
         let values: Vec<Option<ValueId>> = (0..varnode.size)
             .map(|lane| state.get(&StateKey::Register((varnode.offset + lane as u64) as u32)).copied())
             .collect();
+        self.publish_lanes(field, values)
+    }
+
+    fn publish_lanes(&mut self, field: &str, values: Vec<Option<ValueId>>) -> Result<()> {
         if let Some(all) = values.iter().copied().collect::<Option<Vec<_>>>() {
             if let Some(text) = self.pack_lanes(&all) {
                 let _ = writeln!(self.out, "c->{field} = {text};");
@@ -1609,8 +1563,8 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn successors(&self, current: usize) -> Vec<usize> {
-        self.successors[current].clone()
+    fn successors(&self, current: usize) -> &[usize] {
+        &self.successors[current]
     }
 
     fn block_of(&self, value: ValueId) -> usize {
@@ -1667,12 +1621,11 @@ impl<'a> Emitter<'a> {
         if matches!(size, 4 | 8) {
             format!("v{value} = ({ctype})({expr});")
         } else {
-            format!("v{value} = ({ctype})(({expr}) & {});", mask(size))
+            format!("v{value} = ({ctype})(({expr}) & {});", c_mask(size))
         }
     }
 
     fn expr(&self, value: ValueId) -> Result<String> {
-        let value = self.s.resolve(value);
         if let Some((carrier, lane)) = self.keep_lane.get(&value).copied() {
             return Ok(if lane == 0 {
                 format!("(v{carrier} & 0xffu)")
@@ -1716,7 +1669,6 @@ impl<'a> Emitter<'a> {
     }
 
     fn operation(&self, value: ValueId) -> Result<String> {
-        let value = self.s.resolve(value);
         let item = *self.s.value(value);
         let args = self.s.args(value);
         let a = |index: usize| -> Result<String> { self.expr(*args.get(index).ok_or_else(|| self.error(0, "missing argument"))?) };
@@ -1781,7 +1733,7 @@ impl<'a> Emitter<'a> {
                         a(1)?, zero, a(0)?, bits - 1, a(0)?, a(1)?, a(1)?)
                 }
                 OpCode::IntCarry => {
-                    let operand = mask(args.first().map_or(4, |arg| self.s.value(*arg).size));
+                    let operand = c_mask(args.first().map_or(4, |arg| self.s.value(*arg).size));
                     format!("(({}) > ({operand} - ({})))", a(0)?, a(1)?)
                 }
                 OpCode::IntSCarry | OpCode::IntSBorrow => {
@@ -1911,7 +1863,7 @@ impl<'a> Emitter<'a> {
     fn pack_lanes(&self, args: &[ValueId]) -> Option<String> {
         let constants: Option<Vec<u64>> = args
             .iter()
-            .map(|arg| match self.s.value(self.s.resolve(*arg)).op {
+            .map(|arg| match self.s.value(*arg).op {
                 Op::Const(data) => Some(data),
                 _ => None,
             })
@@ -1930,10 +1882,10 @@ impl<'a> Emitter<'a> {
         let mut inner: Option<ValueId> = None;
         let mut bytes = true;
         for (index, arg) in args.iter().enumerate() {
-            let value = self.s.resolve(*arg);
+            let value = *arg;
             match self.s.value(value).op {
                 Op::Byte(byte) if byte as usize == index => {
-                    let source = self.s.resolve(*self.s.args(value).first()?);
+                    let source = *self.s.args(value).first()?;
                     if inner.is_some_and(|inner| inner != source) {
                         bytes = false;
                         break;
@@ -1959,14 +1911,14 @@ impl<'a> Emitter<'a> {
         }
         if args
             .iter()
-            .any(|arg| self.materialized[self.s.resolve(*arg) as usize])
+            .any(|arg| self.materialized[*arg as usize])
         {
             return None;
         }
         let mut origin: Option<(String, u32, u32)> = None;
         let mut lanes = Vec::new();
         for (index, arg) in args.iter().enumerate() {
-            let value = self.s.resolve(*arg);
+            let value = *arg;
             let item = *self.s.value(value);
             let (key, offset) = match item.op {
                 Op::Input(key) | Op::StateReload(key) => (key, 0),
@@ -1974,7 +1926,7 @@ impl<'a> Emitter<'a> {
                     if byte as usize != index {
                         return None;
                     }
-                    let inner = self.s.resolve(*self.s.args(value).first()?);
+                    let inner = *self.s.args(value).first()?;
                     match self.s.value(inner).op {
                         Op::Input(key) | Op::StateReload(key) => (key, byte as u32),
                         _ => return None,
@@ -2038,7 +1990,6 @@ fn reads_c_field(
     materialized: &[bool],
     private: Option<&PrivateEmit>,
 ) -> bool {
-    let value = s.resolve(value);
     if materialized[value as usize] {
         return false;
     }
@@ -2373,18 +2324,12 @@ fn private_loads(private: Option<&PrivateEmit>, key: StateKey) -> bool {
     }
 }
 
-fn field_by_name(name: &str) -> Option<Field> {
-    Field::ALL
-        .into_iter()
-        .find(|field| field.name().eq_ignore_ascii_case(name))
-}
-
-fn select_mask(masks: &BTreeSet<u16>, wanted: u16) -> Option<u16> {
+fn select_mask(masks: &BTreeSet<Fields>, wanted: Fields) -> Option<Fields> {
     masks
         .iter()
         .copied()
-        .filter(|mask| wanted & !mask == 0)
-        .min_by_key(|mask| (mask.count_ones(), *mask))
+        .filter(|mask| wanted & !*mask == Fields::NONE)
+        .min_by_key(|mask| (mask.0.count_ones(), *mask))
 }
 
 fn ends_block(op: Op) -> bool {
@@ -2411,11 +2356,11 @@ fn ctype(size: u8) -> &'static str {
     }
 }
 
-fn mask(size: u8) -> String {
+fn c_mask(size: u8) -> String {
     if size >= 8 {
         "0xffffffffffffffffull".to_string()
     } else {
-        format!("0x{:x}u", (1u64 << (size as u32 * 8)) - 1)
+        format!("0x{:x}u", rk_core::mask(size as u32))
     }
 }
 

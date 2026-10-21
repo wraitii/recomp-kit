@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use rayon::prelude::*;
 use rk_core::contract::{Contract, Field, Fields};
 use rk_core::ir::Policy;
-use rk_core::ir::{FunctionIr, Insn, OpCode, Space, Varnode};
+use rk_core::ir::{FunctionIr, OpCode, Space, Varnode};
 use rk_core::program::Program;
 use rk_core::{Addr, Diagnostic, Error, Reason, Result};
 use rk_frontend::Analysis;
@@ -14,6 +14,7 @@ use rk_ir::{CgFunction, Op, Registers, StateKey};
 use rk_x87::Recipes;
 
 use crate::callgraph::CallGraph;
+use crate::cfg::{closed, is_return, mnemonic};
 use rk_ssa::{BuildOptions, CallEffect, CallFacts};
 
 const GPRS: [Field; 8] = [
@@ -523,8 +524,8 @@ fn join_contracts(contracts: &[Contract]) -> Contract {
     let mut kills = first.kills;
     let mut preserves = first.preserves;
     for contract in &contracts[1..] {
-        reads = reads | contract.reads;
-        writes = writes | contract.writes;
+        reads |= contract.reads;
+        writes |= contract.writes;
         kills = kills.intersection(contract.kills);
         preserves = preserves.intersection(contract.preserves);
     }
@@ -672,7 +673,7 @@ fn prepare(
             }
         }
         let mnemonic = mnemonic(source);
-        if AF_WRITERS.contains(&mnemonic.as_str()) {
+        if AF_WRITERS.contains(&mnemonic.as_ref()) {
             defs[index] |= field_mask(Field::Af);
         }
         if !flag_free(&mnemonic) {
@@ -686,7 +687,6 @@ fn prepare(
             defs[index] |= field_mask(Field::Eax) | field_mask(Field::Edx);
         }
         writes |= defs[index];
-        let _ = &mnemonic;
     }
     let mut preds = vec![Vec::new(); n];
     for (index, successors) in cg.succ.iter().enumerate() {
@@ -982,7 +982,7 @@ fn preserved_registers(
         active: RefCell::new(vec![false; ssa.values.len()]),
     };
     for id in 0..ssa.values.len() as rk_ssa::ValueId {
-        let _ = solver.get(id);
+        solver.get(id);
     }
     let offsets = solver.memo.into_inner();
     let stack_reload = |value: rk_ssa::ValueId| -> Option<(rk_ssa::ValueId, i32)> {
@@ -1034,8 +1034,6 @@ fn preserved_registers(
 }
 
 fn same_lane(ssa: &rk_ssa::Ssa, left: rk_ssa::ValueId, right: rk_ssa::ValueId) -> bool {
-    let left = ssa.resolve(left);
-    let right = ssa.resolve(right);
     if left == right {
         return true;
     }
@@ -1045,36 +1043,6 @@ fn same_lane(ssa: &rk_ssa::Ssa, left: rk_ssa::ValueId, right: rk_ssa::ValueId) -
         return x == y && same_lane(ssa, ssa.args(left)[0], ssa.args(right)[0]);
     }
     false
-}
-
-fn closed(fir: &FunctionIr, tails: &BTreeSet<u32>) -> bool {
-    for (index, insn) in fir.insns.iter().enumerate() {
-        let index = index as u32;
-        if tails.contains(&index) {
-            continue;
-        }
-        if fir.exits.contains_key(&index) {
-            return false;
-        }
-        let mnemonic = mnemonic(insn);
-        let succ = &fir.succ[index as usize];
-        if mnemonic == "RET" {
-            if !succ.is_empty() {
-                return false;
-            }
-        } else if mnemonic == "JMP" {
-            if succ.is_empty() {
-                return false;
-            }
-        } else if mnemonic == "CALL" {
-            if succ.is_empty() && !fir.noreturn.contains_key(&index) {
-                return false;
-            }
-        } else if succ.is_empty() && !is_return(insn) && !fir.noreturn.contains_key(&index) {
-            return false;
-        }
-    }
-    true
 }
 
 fn tail_target(fir: &FunctionIr) -> Option<Addr> {
@@ -1168,16 +1136,6 @@ fn stack_info(program: &Program, fir: &FunctionIr) -> (bool, Option<i32>, Fields
         saved.insert(Field::Ebp);
     }
     (!pushed.is_empty() && (!popped.is_empty() || leave), pops, saved)
-}
-
-fn is_return(insn: &Insn) -> bool {
-    insn.mnemonic.eq_ignore_ascii_case("RET")
-        || insn.ops.iter().any(|op| op.opcode == OpCode::Return)
-}
-
-fn mnemonic(insn: &Insn) -> String {
-    let upper = insn.mnemonic.to_ascii_uppercase();
-    upper.strip_prefix("WAIT ").unwrap_or(&upper).to_string()
 }
 
 fn flag_free(mnemonic: &str) -> bool {

@@ -6,6 +6,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use rayon::prelude::*;
+use rk_core::contract::Fields;
 use rk_core::program::Program;
 use rk_core::settings::Settings;
 use rk_core::{Addr, Error, Result};
@@ -68,7 +69,7 @@ pub enum Declaration {
     PrivatePrepare(Addr),
     PrivateContract {
         addr: Addr,
-        mask: u16,
+        mask: Fields,
         input_argument: Option<String>,
     },
 }
@@ -97,7 +98,7 @@ pub struct Body {
     pub text: String,
     pub requires: Requires,
     pub declarations: BTreeSet<Declaration>,
-    pub private_mask: Option<u16>,
+    pub private_mask: Option<Fields>,
 }
 
 #[derive(Clone, Debug)]
@@ -117,7 +118,7 @@ pub struct Translation<'a> {
     pub call_facts: BTreeMap<Addr, Vec<Addr>>,
     pub cw_effects: BTreeMap<Addr, (u16, u16, u16)>,
     pub checked_returns: BTreeSet<Addr>,
-    pub private_masks: BTreeMap<Addr, BTreeSet<u16>>,
+    pub private_masks: BTreeMap<Addr, BTreeSet<Fields>>,
     pub private_input_arguments: BTreeMap<Addr, String>,
     pub known_modes: BTreeSet<Addr>,
 }
@@ -306,7 +307,8 @@ fn body_chunk(t: &Translation, group: &[&Body], module: Option<&str>) -> String 
         });
         let _ = writeln!(
             s,
-            "void entry_contract_{addr:08x}_{mask:04x}(X86 *c, {parameter}uint32_t expected);"
+            "void entry_contract_{addr:08x}_{:04x}(X86 *c, {parameter}uint32_t expected);",
+            mask.0
         );
     }
     s.push('\n');
@@ -379,8 +381,8 @@ fn entry_chunks(
                     let input = t.private_input_arguments.get(addr);
                     let parameter = input.map_or(String::new(), |name| format!("uint32_t {}_, ", name.to_lowercase()));
                     let argument = input.map_or("c, expected".to_string(), |name| format!("c, {}_, expected", name.to_lowercase()));
-                    let _ = writeln!(s, "void fn_contract_{addr:08x}_{mask:04x}(X86 *c, {parameter}uint32_t expected);");
-                    let _ = writeln!(s, "void entry_contract_{addr:08x}_{mask:04x}(X86 *c, {parameter}uint32_t expected) {{ fn_contract_{addr:08x}_{mask:04x}({argument}); }}");
+                    let _ = writeln!(s, "void fn_contract_{addr:08x}_{:04x}(X86 *c, {parameter}uint32_t expected);", mask.0);
+                    let _ = writeln!(s, "void entry_contract_{addr:08x}_{:04x}(X86 *c, {parameter}uint32_t expected) {{ fn_contract_{addr:08x}_{:04x}({argument}); }}", mask.0, mask.0);
                 }
             }
             let checked: Vec<&(usize, Addr)> = entries

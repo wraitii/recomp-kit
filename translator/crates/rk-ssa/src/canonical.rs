@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, VecDeque};
 use rk_core::Lookup;
 use rk_ir::Op;
 
-use crate::{Ssa, Value, ValueId};
+use crate::{Ssa, ValueId};
 
 pub(crate) fn rewrite_aliases(s: &mut Ssa, alias: &Lookup<ValueId, ValueId>) {
     if alias.is_empty() {
@@ -13,31 +13,31 @@ pub(crate) fn rewrite_aliases(s: &mut Ssa, alias: &Lookup<ValueId, ValueId>) {
         let start = value.args_start as usize;
         let end = start + value.args_len as usize;
         for arg in &mut s.args[start..end] {
-            *arg = resolve(alias, *arg);
+            *arg = resolve_alias(alias, *arg);
         }
     }
     for (_, value) in &mut s.state {
-        *value = resolve(alias, *value);
+        *value = resolve_alias(alias, *value);
     }
     for (_, value) in &mut s.dispatch.loads {
-        *value = resolve(alias, *value);
+        *value = resolve_alias(alias, *value);
     }
     for reads in &mut s.entry_reads {
         for (_, value) in reads {
-            *value = resolve(alias, *value);
+            *value = resolve_alias(alias, *value);
         }
     }
     for state in &mut s.exit_state {
         for value in state.iter_mut().flatten() {
-            *value = resolve(alias, *value);
+            *value = resolve_alias(alias, *value);
         }
     }
     for group in &mut s.lane_groups {
-        group.phi = resolve(alias, group.phi);
+        group.phi = resolve_alias(alias, group.phi);
         for lane in &mut group.lanes {
-            lane.value = resolve(alias, lane.value);
+            lane.value = resolve_alias(alias, lane.value);
             for arg in &mut lane.args {
-                *arg = resolve(alias, *arg);
+                *arg = resolve_alias(alias, *arg);
             }
         }
     }
@@ -45,10 +45,10 @@ pub(crate) fn rewrite_aliases(s: &mut Ssa, alias: &Lookup<ValueId, ValueId>) {
         block.phis.retain(|value| !alias.contains_key(value));
         block.ops.retain(|value| !alias.contains_key(value));
         for phi in &mut block.phis {
-            *phi = resolve(alias, *phi);
+            *phi = resolve_alias(alias, *phi);
         }
         for value in &mut block.ops {
-            *value = resolve(alias, *value);
+            *value = resolve_alias(alias, *value);
         }
     }
     for record in &mut s.flags {
@@ -61,12 +61,12 @@ pub(crate) fn rewrite_aliases(s: &mut Ssa, alias: &Lookup<ValueId, ValueId>) {
             .chain(record.result.iter_mut())
             .chain(record.flags.values_mut())
         {
-            *value = resolve(alias, *value);
+            *value = resolve_alias(alias, *value);
         }
     }
 }
 
-fn resolve(alias: &Lookup<ValueId, ValueId>, mut value: ValueId) -> ValueId {
+pub(crate) fn resolve_alias(alias: &Lookup<ValueId, ValueId>, mut value: ValueId) -> ValueId {
     while let Some(&next) = alias.get(&value) {
         if next == value {
             break;
@@ -76,22 +76,9 @@ fn resolve(alias: &Lookup<ValueId, ValueId>, mut value: ValueId) -> ValueId {
     value
 }
 
-fn constant(s: &mut Ssa, cache: &mut BTreeMap<(u8, u64), ValueId>, size: u8, data: u64) -> ValueId {
-    let mask = if size >= 8 { u64::MAX } else { (1u64 << (size * 8)) - 1 };
-    let data = data & mask;
-    if let Some(&value) = cache.get(&(size, data)) {
-        return value;
-    }
-    let id = s.values.len() as ValueId;
-    s.values.push(Value { op: Op::Const(data), size, args_start: s.args.len() as u32, args_len: 0 });
-    s.value_addr.push(0);
-    cache.insert((size, data), id);
-    id
-}
-
 fn same_packed(s: &Ssa, alias: &Lookup<ValueId, ValueId>, left: ValueId, right: ValueId) -> bool {
-    let left = resolve(alias, left);
-    let right = resolve(alias, right);
+    let left = resolve_alias(alias, left);
+    let right = resolve_alias(alias, right);
     if left == right {
         return true;
     }
@@ -102,7 +89,7 @@ fn same_packed(s: &Ssa, alias: &Lookup<ValueId, ValueId>, left: ValueId, right: 
     }
     let a_args = &s.args[a.args_start as usize..(a.args_start + a.args_len) as usize];
     let b_args = &s.args[b.args_start as usize..(b.args_start + b.args_len) as usize];
-    a_args.iter().zip(b_args).all(|(&x, &y)| resolve(alias, x) == resolve(alias, y))
+    a_args.iter().zip(b_args).all(|(&x, &y)| resolve_alias(alias, x) == resolve_alias(alias, y))
 }
 
 fn signed_sub_parts(s: &Ssa, alias: &Lookup<ValueId, ValueId>, id: ValueId) -> Option<(ValueId, ValueId, ValueId)> {
@@ -115,8 +102,8 @@ fn signed_sub_parts(s: &Ssa, alias: &Lookup<ValueId, ValueId>, id: ValueId) -> O
     if args.len() != 2 {
         return None;
     }
-    let left = &s.values[resolve(alias, args[0]) as usize];
-    let right = &s.values[resolve(alias, args[1]) as usize];
+    let left = &s.values[resolve_alias(alias, args[0]) as usize];
+    let right = &s.values[resolve_alias(alias, args[1]) as usize];
     if left.size != 1 || right.size != 1 {
         return None;
     }
@@ -128,10 +115,10 @@ fn signed_sub_parts(s: &Ssa, alias: &Lookup<ValueId, ValueId>, id: ValueId) -> O
         }
         let sign_args = &s.args[sign.args_start as usize..(sign.args_start + sign.args_len) as usize];
         let overflow_args = &s.args[overflow.args_start as usize..(overflow.args_start + overflow.args_len) as usize];
-        let result = &s.values[resolve(alias, sign_args[0]) as usize];
-        let zero = &s.values[resolve(alias, sign_args[1]) as usize];
-        let a = resolve(alias, overflow_args[0]);
-        let b = resolve(alias, overflow_args[1]);
+        let result = &s.values[resolve_alias(alias, sign_args[0]) as usize];
+        let zero = &s.values[resolve_alias(alias, sign_args[1]) as usize];
+        let a = resolve_alias(alias, overflow_args[0]);
+        let b = resolve_alias(alias, overflow_args[1]);
         if result.op != Op::P(C::IntSub) || result.size == 0
             || result.size != s.values[a as usize].size
             || s.values[a as usize].size != s.values[b as usize].size
@@ -141,7 +128,7 @@ fn signed_sub_parts(s: &Ssa, alias: &Lookup<ValueId, ValueId>, id: ValueId) -> O
         }
         let sub_args = &s.args[result.args_start as usize..(result.args_start + result.args_len) as usize];
         if sub_args.len() == 2 && same_packed(s, alias, sub_args[0], a) && same_packed(s, alias, sub_args[1], b) {
-            return Some((a, b, resolve(alias, sign_args[0])));
+            return Some((a, b, resolve_alias(alias, sign_args[0])));
         }
     }
     None
@@ -155,27 +142,27 @@ fn signed_sub_le(s: &Ssa, alias: &Lookup<ValueId, ValueId>, id: ValueId) -> Opti
     }
     let args = &s.args[value.args_start as usize..(value.args_start + value.args_len) as usize];
     for (relation, equal) in [(args[0], args[1]), (args[1], args[0])] {
-        let relation = &s.values[resolve(alias, relation) as usize];
+        let relation = &s.values[resolve_alias(alias, relation) as usize];
         if relation.op != Op::P(C::IntSLess) || relation.size != 1 || relation.args_len != 2 {
             continue;
         }
         let relation_args = &s.args[relation.args_start as usize..(relation.args_start + relation.args_len) as usize];
-        let a = resolve(alias, relation_args[0]);
-        let b = resolve(alias, relation_args[1]);
+        let a = resolve_alias(alias, relation_args[0]);
+        let b = resolve_alias(alias, relation_args[1]);
         if s.values[a as usize].size == 0 || s.values[a as usize].size != s.values[b as usize].size {
             continue;
         }
-        let equal = &s.values[resolve(alias, equal) as usize];
+        let equal = &s.values[resolve_alias(alias, equal) as usize];
         if equal.op != Op::P(C::IntEqual) || equal.size != 1 || equal.args_len != 2 {
             continue;
         }
         let equal_args = &s.args[equal.args_start as usize..(equal.args_start + equal.args_len) as usize];
-        let left = &s.values[resolve(alias, equal_args[0]) as usize];
-        let right = &s.values[resolve(alias, equal_args[1]) as usize];
+        let left = &s.values[resolve_alias(alias, equal_args[0]) as usize];
+        let right = &s.values[resolve_alias(alias, equal_args[1]) as usize];
         let (zero, result) = if left.op == Op::Const(0) {
-            (left, resolve(alias, equal_args[1]))
+            (left, resolve_alias(alias, equal_args[1]))
         } else if right.op == Op::Const(0) {
-            (right, resolve(alias, equal_args[0]))
+            (right, resolve_alias(alias, equal_args[0]))
         } else {
             continue;
         };
@@ -195,8 +182,9 @@ fn signed_sub_le(s: &Ssa, alias: &Lookup<ValueId, ValueId>, id: ValueId) -> Opti
 
 fn fold(code: rk_core::ir::OpCode, operands: &[u64], sizes: &[u8], result_size: u8) -> Option<u64> {
     use rk_core::ir::OpCode as C;
-    let width = sizes.first().copied().unwrap_or(result_size) as u32 * 8;
-    let bits = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+    let width_bytes = sizes.first().copied().unwrap_or(result_size);
+    let width = width_bytes as u32 * 8;
+    let bits = rk_core::mask(width_bytes as u32);
     let a = operands.first().copied().unwrap_or(0) & bits;
     let b = operands.get(1).copied().unwrap_or(0) & bits;
     let signed = |value: u64| -> i64 {
@@ -266,7 +254,7 @@ fn fold(code: rk_core::ir::OpCode, operands: &[u64], sizes: &[u8], result_size: 
         }
         _ => None,
     };
-    result.map(|data| data & if result_size >= 8 { u64::MAX } else { (1u64 << (result_size as u32 * 8)) - 1 })
+    result.map(|data| data & rk_core::mask(result_size as u32))
 }
 
 enum Identity {
@@ -288,7 +276,7 @@ fn identity(s: &Ssa, code: rk_core::ir::OpCode, args: &[ValueId], size: u8) -> O
     if ca.is_some() && cb.is_some() {
         return None;
     }
-    let mask = if size >= 8 { u64::MAX } else { (1u64 << (size as u32 * 8)) - 1 };
+    let mask = rk_core::mask(size as u32);
     let keep = |id: ValueId| {
         (s.values[id as usize].size == size).then_some(Identity::Value(id))
     };
@@ -342,7 +330,7 @@ pub fn canonicalize(s: &mut Ssa, signed_sub: bool) {
         let end = start + value.args_len as usize;
         let mut args = Vec::with_capacity(end - start);
         for &arg in &s.args[start..end] {
-            args.push(resolve(&alias, arg));
+            args.push(resolve_alias(&alias, arg));
         }
         let mut changed = false;
         for (slot, arg) in s.args[start..end].iter_mut().zip(args.iter().copied()) {
@@ -401,7 +389,7 @@ pub fn canonicalize(s: &mut Ssa, signed_sub: bool) {
                         ..(source.args_start + source.args_len) as usize];
                     source_args.get(index as usize).copied()
                 } else if let Op::Const(data) = source.op {
-                    Some(constant(s, &mut cache, 1, data >> (8 * index)))
+                    Some(s.constant(&mut cache, 1, data >> (8 * index)))
                 } else {
                     None
                 }
@@ -415,14 +403,14 @@ pub fn canonicalize(s: &mut Ssa, signed_sub: bool) {
                             data |= (byte & 0xff) << (8 * index);
                         }
                     }
-                    Some(constant(s, &mut cache, value.size, data))
+                    Some(s.constant(&mut cache, value.size, data))
                 } else if args.iter().enumerate().all(|(index, &arg)| {
                     let byte = &s.values[arg as usize];
                     byte.op == Op::Byte(index as u8) && byte.args_len == 1
-                        && resolve(&alias, s.args[byte.args_start as usize]) == args[0]
+                        && resolve_alias(&alias, s.args[byte.args_start as usize]) == args[0]
                 }) {
                     let first = &s.values[args[0] as usize];
-                    let source = resolve(&alias, s.args[first.args_start as usize]);
+                    let source = resolve_alias(&alias, s.args[first.args_start as usize]);
                     (s.values[source as usize].size == value.size).then_some(source)
                 } else {
                     None
@@ -442,7 +430,7 @@ pub fn canonicalize(s: &mut Ssa, signed_sub: bool) {
                             C::IntEqual | C::IntLessEqual | C::IntSLessEqual => 1,
                             _ => 0,
                         };
-                        Some(constant(s, &mut cache, value.size, result))
+                        Some(s.constant(&mut cache, value.size, result))
                     }
                     _ if args.len() == 2
                         && same_packed(s, &alias, args[0], args[1])
@@ -453,7 +441,7 @@ pub fn canonicalize(s: &mut Ssa, signed_sub: bool) {
                     }
                     _ if args.len() == 2 => match identity(s, code, &args, value.size) {
                         Some(Identity::Value(id)) => Some(id),
-                        Some(Identity::Const(data)) => Some(constant(s, &mut cache, value.size, data)),
+                        Some(Identity::Const(data)) => Some(s.constant(&mut cache, value.size, data)),
                         None if args.iter().all(|&arg| matches!(s.values[arg as usize].op, Op::Const(_))) => {
                             let operands: Vec<u64> = args.iter().map(|&arg| match s.values[arg as usize].op {
                                 Op::Const(data) => data,
@@ -461,7 +449,7 @@ pub fn canonicalize(s: &mut Ssa, signed_sub: bool) {
                             }).collect();
                             let sizes: Vec<u8> = args.iter().map(|&arg| s.values[arg as usize].size).collect();
                             fold(code, &operands, &sizes, value.size)
-                                .map(|data| constant(s, &mut cache, value.size, data))
+                                .map(|data| s.constant(&mut cache, value.size, data))
                         }
                         None => None,
                     },
@@ -475,7 +463,7 @@ pub fn canonicalize(s: &mut Ssa, signed_sub: bool) {
                             }).collect();
                             let sizes: Vec<u8> = args.iter().map(|&arg| s.values[arg as usize].size).collect();
                             fold(code, &operands, &sizes, value.size)
-                                .map(|data| constant(s, &mut cache, value.size, data))
+                                .map(|data| s.constant(&mut cache, value.size, data))
                         }
                     }
                 }
@@ -484,7 +472,7 @@ pub fn canonicalize(s: &mut Ssa, signed_sub: bool) {
             }
         };
         if let Some(replacement) = replacement {
-            let replacement = resolve(&alias, replacement);
+            let replacement = resolve_alias(&alias, replacement);
             if replacement != id {
                 alias.insert(id, replacement);
                 changed = true;

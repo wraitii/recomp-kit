@@ -7,6 +7,7 @@ use rk_core::settings::FaultState;
 use rk_core::{Addr, Diagnostic, Lookup, Reason};
 use rk_ir::{CgFunction, CgOp, FlagShape, Op, Registers, SlowInsn, StateKey};
 
+use crate::canonical::{resolve_alias, rewrite_aliases};
 use crate::{Boundary, Dispatch, Entry, FlagRecord, InsnLoc, Ssa, Value, ValueId, BlockId, DISPATCH_BLOCK};
 
 pub const DEFAULT_VALUE_BUDGET: usize = 40_000_000;
@@ -94,12 +95,17 @@ struct Builder<'a> {
     value_addr: Vec<Addr>,
     block_addrs: Vec<Addr>,
     current_addr: Addr,
-    pending_flag: Option<(OpCode, ValueId, Vec<ValueId>, u8)>,
-    pending_ab: Option<Vec<ValueId>>,
-    pending_shape: Option<FlagShape>,
-    pending_carry: Option<ValueId>,
+    pending: Pending,
     access_indices: Vec<usize>,
     observable_faults: bool,
+}
+
+#[derive(Default)]
+struct Pending {
+    flag: Option<(ValueId, Vec<ValueId>, u8)>,
+    ab: Option<Vec<ValueId>>,
+    shape: Option<FlagShape>,
+    carry: Option<ValueId>,
 }
 
 struct PendingPhi {
@@ -207,10 +213,7 @@ impl<'a> Builder<'a> {
             value_addr: Vec::new(),
             block_addrs: Vec::new(),
             current_addr: 0,
-            pending_flag: None,
-            pending_ab: None,
-            pending_shape: None,
-            pending_carry: None,
+            pending: Pending::default(),
             access_indices,
             // DIVERGENCE(original): relaxed fault state does not preserve exact register state at a fault inside __try.
             observable_faults: fault_state == FaultState::Exact && !cg.seh.is_empty(),
@@ -366,10 +369,10 @@ impl<'a> Builder<'a> {
             let mut temps = Lookup::default();
             for index in start..end {
                 let insn = &cg.insns[index as usize];
-                self.pending_flag = None;
-                self.pending_ab = None;
-                self.pending_shape = insn.flag;
-                self.pending_carry = None;
+                self.pending = Pending {
+                    shape: insn.flag,
+                    ..Pending::default()
+                };
                 let cf = Registers::get().require("CF");
                 let touches_cf = |v: Varnode| {
                     v.space == Space::Register && v.offset == cf.offset && v.size == 1
@@ -379,7 +382,7 @@ impl<'a> Builder<'a> {
                 if reads_cf && writes_cf {
                     let cf_key = StateKey::Register(cf.offset as u32);
                     if let Some(&cf_index) = self.key_index.get(&cf_key) {
-                        self.pending_carry = Some(self.state_slot(&mut state, cf_index, block_id)?);
+                        self.pending.carry = Some(self.state_slot(&mut state, cf_index, block_id)?);
                     }
                 }
                 for cg_op in &insn.ops {
@@ -407,7 +410,7 @@ impl<'a> Builder<'a> {
                 if let Some((a, b)) = insn.flag_operands {
                     let a = self.read(&a, &mut state, &mut temps, block_id)?;
                     let b = self.read(&b, &mut state, &mut temps, block_id)?;
-                    self.pending_ab = Some(vec![a, b]);
+                    self.pending.ab = Some(vec![a, b]);
                 }
                 self.record_flags(&mut state, block_id)?;
             }
@@ -425,12 +428,12 @@ impl<'a> Builder<'a> {
             block.phis.clone_from(phis);
         }
 
-        self.collapse_trivial_phis(&mut blocks);
+        let alias = self.trivial_phi_aliases();
 
         let dispatch = Dispatch {
             loads: keys.iter().copied().zip(self.dispatch_loads.iter().copied()).collect(),
         };
-        Ok(Ssa {
+        let mut ssa = Ssa {
             addr: cg.addr,
             values: self.values,
             args: self.args,
@@ -456,7 +459,9 @@ impl<'a> Builder<'a> {
             entry_reads: self.entry_reads,
             exit_state: self.exit_state,
             lane_groups: Vec::new(),
-        })
+        };
+        rewrite_aliases(&mut ssa, &alias);
+        Ok(ssa)
     }
 
     fn state_slot(
@@ -553,7 +558,7 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    fn collapse_trivial_phis(&mut self, blocks: &mut [crate::Block]) {
+    fn trivial_phi_aliases(&self) -> Lookup<ValueId, ValueId> {
         let mut alias: Lookup<ValueId, ValueId> = Lookup::default();
         loop {
             let mut changed = false;
@@ -592,49 +597,7 @@ impl<'a> Builder<'a> {
                 break;
             }
         }
-        if alias.is_empty() {
-            return;
-        }
-        for value in &mut self.values {
-            let start = value.args_start as usize;
-            let end = start + value.args_len as usize;
-            for arg in &mut self.args[start..end] {
-                *arg = resolve_alias(&alias, *arg);
-            }
-        }
-        for (_, value) in &mut self.state_arena {
-            *value = resolve_alias(&alias, *value);
-        }
-        for value in &mut self.dispatch_loads {
-            *value = resolve_alias(&alias, *value);
-        }
-        for reads in &mut self.entry_reads {
-            for (_, value) in reads {
-                *value = resolve_alias(&alias, *value);
-            }
-        }
-        for state in &mut self.exit_state {
-            for value in state.iter_mut().flatten() {
-                *value = resolve_alias(&alias, *value);
-            }
-        }
-        for block in blocks {
-            block.phis.retain(|value| !alias.contains_key(value));
-            block.ops.retain(|value| !alias.contains_key(value));
-        }
-        for record in &mut self.flags {
-            for value in record
-                .op
-                .iter_mut()
-                .chain(record.a.iter_mut())
-                .chain(record.b.iter_mut())
-                .chain(record.carry.iter_mut())
-                .chain(record.result.iter_mut())
-                .chain(record.flags.values_mut())
-            {
-                *value = resolve_alias(&alias, *value);
-            }
-        }
+        alias
     }
 
     fn is_flag(&self, varnode: Varnode) -> bool {
@@ -651,11 +614,11 @@ impl<'a> Builder<'a> {
         state: &mut [Option<ValueId>],
         block: BlockId,
     ) -> Result<(), Diagnostic> {
-        let carry = self.pending_carry.take();
-        let Some((_code, op, args, size)) = self.pending_flag.take() else {
+        let carry = self.pending.carry.take();
+        let Some((op, args, size)) = self.pending.flag.take() else {
             return Ok(());
         };
-        let kind = match self.pending_shape {
+        let kind = match self.pending.shape {
             Some(FlagShape::Add) => crate::FlagKind::Add,
             Some(FlagShape::Sub) => crate::FlagKind::Sub,
             Some(FlagShape::Cmp) => crate::FlagKind::Cmp,
@@ -666,7 +629,7 @@ impl<'a> Builder<'a> {
             Some(FlagShape::Logic) => crate::FlagKind::Logic,
             None => return Ok(()),
         };
-        let operands = self.pending_ab.take().filter(|operands| operands.len() >= 2).unwrap_or(args);
+        let operands = self.pending.ab.take().filter(|operands| operands.len() >= 2).unwrap_or(args);
         let mut flags = BTreeMap::new();
         for field in [Field::Cf, Field::Pf, Field::Af, Field::Zf, Field::Sf, Field::Of] {
             if let Some(index) = self.field_of.iter().position(|candidate| *candidate == Some(field)) {
@@ -720,39 +683,17 @@ impl<'a> Builder<'a> {
         self.args[start + position] = arg;
     }
 
-    fn snapshot(&mut self, state: &mut [Option<ValueId>], block: BlockId) -> Result<(u32, u32), Diagnostic> {
-        let mut resolved = Vec::with_capacity(self.keys.len());
-        for index in 0..self.keys.len() {
-            resolved.push(self.state_slot(state, index, block)?);
-        }
-        let start = self.state_arena.len() as u32;
-        self.state_arena.extend(self.keys.iter().copied().zip(resolved));
-        Ok((start, self.keys.len() as u32))
-    }
-
-    fn snapshot_access(&mut self, state: &mut [Option<ValueId>], block: BlockId) -> Result<(u32, u32), Diagnostic> {
-        let mut resolved = Vec::with_capacity(self.access_indices.len());
-        for position in 0..self.access_indices.len() {
-            let index = self.access_indices[position];
+    fn boundary(&mut self, at: ValueId, state: &mut [Option<ValueId>], block: BlockId, access: bool) -> Result<(), Diagnostic> {
+        let count = if access { self.access_indices.len() } else { self.keys.len() };
+        let mut resolved = Vec::with_capacity(count);
+        for position in 0..count {
+            let index = if access { self.access_indices[position] } else { position };
             let key = self.keys[index];
             resolved.push((key, self.state_slot(state, index, block)?));
         }
-        let start = self.state_arena.len() as u32;
-        let len = resolved.len() as u32;
+        let state_start = self.state_arena.len() as u32;
+        let state_len = resolved.len() as u32;
         self.state_arena.extend(resolved);
-        Ok((start, len))
-    }
-
-    fn boundary(&mut self, at: ValueId, state: &mut [Option<ValueId>], block: BlockId) -> Result<(), Diagnostic> {
-        let (state_start, state_len) = self.snapshot(state, block)?;
-        let index = self.boundaries.len() as u32;
-        self.boundaries.push(Boundary { at, state_start, state_len });
-        self.boundary_index.insert(at, index);
-        Ok(())
-    }
-
-    fn access_boundary(&mut self, at: ValueId, state: &mut [Option<ValueId>], block: BlockId) -> Result<(), Diagnostic> {
-        let (state_start, state_len) = self.snapshot_access(state, block)?;
         let index = self.boundaries.len() as u32;
         self.boundaries.push(Boundary { at, state_start, state_len });
         self.boundary_index.insert(at, index);
@@ -778,7 +719,7 @@ impl<'a> Builder<'a> {
             Op::Slow(index) => {
                 let memory = self.state_slot(state, memory_index, block)?;
                 let value = self.value(Op::Slow(index), 0, &[memory]);
-                self.boundary(value, state, block)?;
+                self.boundary(value, state, block, false)?;
                 let token = self.value(Op::Memory, 0, &[value]);
                 state[memory_index] = Some(token);
                 self.reload_all(value, state);
@@ -787,7 +728,7 @@ impl<'a> Builder<'a> {
             Op::CallOther(userop) => {
                 let memory = self.state_slot(state, memory_index, block)?;
                 let value = self.value(Op::CallOther(userop), 0, &[memory]);
-                self.boundary(value, state, block)?;
+                self.boundary(value, state, block, false)?;
                 let token = self.value(Op::Memory, 0, &[value]);
                 state[memory_index] = Some(token);
                 self.reload_all(value, state);
@@ -816,7 +757,7 @@ impl<'a> Builder<'a> {
             Op::Call { target } => {
                 let memory = self.state_slot(state, memory_index, block)?;
                 let value = self.value(Op::Call { target }, 0, &[memory]);
-                self.boundary(value, state, block)?;
+                self.boundary(value, state, block, false)?;
                 let token = self.value(Op::Memory, 0, &[value]);
                 state[memory_index] = Some(token);
                 let effect = self.call_effect(addr, Some(target));
@@ -832,7 +773,7 @@ impl<'a> Builder<'a> {
                 let target = self.read(target, state, temps, block)?;
                 let memory = self.state_slot(state, memory_index, block)?;
                 let value = self.value(Op::CallInd, 0, &[memory, target]);
-                self.boundary(value, state, block)?;
+                self.boundary(value, state, block, false)?;
                 let token = self.value(Op::Memory, 0, &[value]);
                 state[memory_index] = Some(token);
                 let effect = self.call_effect(addr, None);
@@ -842,12 +783,12 @@ impl<'a> Builder<'a> {
             Op::String(string) => {
                 let memory = self.state_slot(state, memory_index, block)?;
                 let value = self.value(Op::String(string), 0, &[memory]);
-                self.boundary(value, state, block)?;
+                self.boundary(value, state, block, false)?;
                 let token = self.value(Op::Memory, 0, &[value]);
                 state[memory_index] = Some(token);
                 let (_, mut writes, flags) = rk_ir::string::effect(string.0);
                 if flags {
-                    writes = writes | Fields::FLAGS;
+                    writes |= Fields::FLAGS;
                 }
                 self.reload_fields(value, writes, state, block)?;
                 ops.push(value);
@@ -860,7 +801,7 @@ impl<'a> Builder<'a> {
                 }
                 let size = cg_op.output.map_or(8, |v| v.size as u8);
                 let value = self.value(cg_op.op, size, &args);
-                self.boundary(value, state, block)?;
+                self.boundary(value, state, block, false)?;
                 let token = self.value(Op::Memory, 0, &[value]);
                 state[memory_index] = Some(token);
                 if let Some(output) = cg_op.output {
@@ -872,7 +813,7 @@ impl<'a> Builder<'a> {
             Op::Seh(_) => {
                 let memory = self.state_slot(state, memory_index, block)?;
                 let value = self.value(cg_op.op, 0, &[memory]);
-                self.boundary(value, state, block)?;
+                self.boundary(value, state, block, false)?;
                 let token = self.value(Op::Memory, 0, &[value]);
                 state[memory_index] = Some(token);
                 ops.push(value);
@@ -887,10 +828,10 @@ impl<'a> Builder<'a> {
                 let value = self.value(cg_op.op, size, &args);
                 if self.relaxed_memory() {
                     if cg_op.op == Op::P(OpCode::Store) {
-                        self.access_boundary(value, state, block)?;
+                        self.boundary(value, state, block, true)?;
                     }
                 } else {
-                    self.boundary(value, state, block)?;
+                    self.boundary(value, state, block, false)?;
                 }
                 let token = self.value(Op::Memory, 0, &[value]);
                 state[memory_index] = Some(token);
@@ -905,7 +846,7 @@ impl<'a> Builder<'a> {
                     args.push(self.read(input, state, temps, block)?);
                 }
                 let value = self.value(cg_op.op, 0, &args);
-                self.boundary(value, state, block)?;
+                self.boundary(value, state, block, false)?;
                 ops.push(value);
             }
             Op::Branch { .. } | Op::CBranch { .. } | Op::Trap(_) => {
@@ -917,20 +858,20 @@ impl<'a> Builder<'a> {
                 if matches!(cg_op.op, Op::Branch { target } | Op::CBranch { target }
                     if !self.block_addrs.contains(&target))
                 {
-                    self.boundary(value, state, block)?;
+                    self.boundary(value, state, block, false)?;
                 }
                 ops.push(value);
             }
             Op::P(OpCode::Call) => {
                 let value = self.value(cg_op.op, 0, &[]);
-                self.boundary(value, state, block)?;
+                self.boundary(value, state, block, false)?;
                 self.reload_all(value, state);
                 ops.push(value);
             }
             Op::P(OpCode::CallInd) | Op::P(OpCode::CallOther) | Op::P(OpCode::Unknown) => {
                 let memory = self.state_slot(state, memory_index, block)?;
                 let value = self.value(cg_op.op, 0, &[memory]);
-                self.boundary(value, state, block)?;
+                self.boundary(value, state, block, false)?;
                 let token = self.value(Op::Memory, 0, &[value]);
                 state[memory_index] = Some(token);
                 self.reload_all(value, state);
@@ -947,7 +888,7 @@ impl<'a> Builder<'a> {
                     self.write(&output, value, state, temps)?;
                 }
                 if let Op::P(code) = cg_op.op {
-                    let expected = match self.pending_shape {
+                    let expected = match self.pending.shape {
                         Some(FlagShape::Add | FlagShape::Inc | FlagShape::Adc) => {
                             matches!(code, OpCode::IntAdd)
                         }
@@ -961,11 +902,11 @@ impl<'a> Builder<'a> {
                     };
                     let replace = expected
                         && cg_op.output.is_some_and(|output| !self.is_flag(output))
-                        && (!matches!(self.pending_shape, Some(FlagShape::Logic))
-                            || self.pending_flag.is_none());
+                        && (!matches!(self.pending.shape, Some(FlagShape::Logic))
+                            || self.pending.flag.is_none());
                     if replace {
-                        self.pending_ab = Some(args.clone());
-                        self.pending_flag = Some((code, value, args, size));
+                        self.pending.ab = Some(args.clone());
+                        self.pending.flag = Some((value, args, size));
                     }
                 }
                 ops.push(value);
@@ -1172,14 +1113,4 @@ fn rpo(roots: &[BlockId], succ: &[Vec<BlockId>]) -> Vec<BlockId> {
     }
     post.reverse();
     post
-}
-
-fn resolve_alias(alias: &Lookup<ValueId, ValueId>, mut value: ValueId) -> ValueId {
-    while let Some(&next) = alias.get(&value) {
-        if next == value {
-            break;
-        }
-        value = next;
-    }
-    value
 }

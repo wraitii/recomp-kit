@@ -78,7 +78,6 @@ impl Ssa {
 
 impl FlagPlan {
     pub fn source(&self, s: &Ssa, field: Field, value: ValueId) -> FlagSource {
-        let value = s.resolve(value);
         match s.value(value).op {
             Op::Input(key) => FlagSource::Input(key),
             Op::Const(data) => FlagSource::Const(data),

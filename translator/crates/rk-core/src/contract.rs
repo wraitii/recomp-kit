@@ -1,59 +1,57 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[repr(u8)]
-pub enum Field {
-    Eax,
-    Ecx,
-    Edx,
-    Ebx,
-    Esp,
-    Ebp,
-    Esi,
-    Edi,
-    Cf,
-    Pf,
-    Af,
-    Zf,
-    Sf,
-    Of,
+macro_rules! fields {
+    ($($variant:ident => $name:literal),* $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[repr(u8)]
+        pub enum Field {
+            $($variant,)*
+        }
+
+        impl Field {
+            pub const ALL: [Field; [$(stringify!($variant)),*].len()] = [$(Field::$variant,)*];
+
+            pub fn bit(self) -> u16 {
+                1 << self as u8
+            }
+
+            pub fn name(self) -> &'static str {
+                [$($name,)*][self as usize]
+            }
+
+            pub fn from_name(name: &str) -> Option<Field> {
+                Field::ALL
+                    .into_iter()
+                    .find(|field| field.name().eq_ignore_ascii_case(name))
+            }
+        }
+    };
 }
 
-impl Field {
-    pub const ALL: [Field; 14] = [
-        Field::Eax,
-        Field::Ecx,
-        Field::Edx,
-        Field::Ebx,
-        Field::Esp,
-        Field::Ebp,
-        Field::Esi,
-        Field::Edi,
-        Field::Cf,
-        Field::Pf,
-        Field::Af,
-        Field::Zf,
-        Field::Sf,
-        Field::Of,
-    ];
-
-    pub fn bit(self) -> u16 {
-        1 << self as u8
-    }
-
-    pub fn name(self) -> &'static str {
-        ["EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI", "CF", "PF", "AF", "ZF", "SF", "OF"]
-            [self as usize]
-    }
+fields! {
+    Eax => "EAX",
+    Ecx => "ECX",
+    Edx => "EDX",
+    Ebx => "EBX",
+    Esp => "ESP",
+    Ebp => "EBP",
+    Esi => "ESI",
+    Edi => "EDI",
+    Cf => "CF",
+    Pf => "PF",
+    Af => "AF",
+    Zf => "ZF",
+    Sf => "SF",
+    Of => "OF",
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Fields(pub u16);
 
 impl Fields {
-    pub const ALL: Fields = Fields(0x3fff);
-    pub const GPRS: Fields = Fields(0x00ff);
-    pub const FLAGS: Fields = Fields(0x3f00);
+    pub const ALL: Fields = Fields((1u16 << Field::ALL.len()) - 1);
+    pub const GPRS: Fields = Fields((1u16 << Field::Cf as u8) - 1);
+    pub const FLAGS: Fields = Fields(Fields::ALL.0 & !Fields::GPRS.0);
     pub const NONE: Fields = Fields(0);
 
     pub fn contains(self, field: Field) -> bool {
@@ -98,6 +96,12 @@ impl std::ops::BitAnd for Fields {
     type Output = Fields;
     fn bitand(self, rhs: Fields) -> Fields {
         Fields(self.0 & rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for Fields {
+    fn bitor_assign(&mut self, rhs: Fields) {
+        self.0 |= rhs.0;
     }
 }
 

@@ -139,8 +139,23 @@ pub struct Ssa {
 }
 
 impl Ssa {
-    pub fn resolve(&self, value: ValueId) -> ValueId {
-        value
+    pub(crate) fn new_value(&mut self, op: Op, size: u8, args: &[ValueId], addr: Addr) -> ValueId {
+        let id = self.values.len() as ValueId;
+        let start = self.args.len() as u32;
+        self.args.extend_from_slice(args);
+        self.values.push(Value { op, size, args_start: start, args_len: args.len() as u32 });
+        self.value_addr.push(addr);
+        id
+    }
+
+    pub(crate) fn constant(&mut self, cache: &mut BTreeMap<(u8, u64), ValueId>, size: u8, data: u64) -> ValueId {
+        let data = data & rk_core::mask(size as u32);
+        if let Some(&value) = cache.get(&(size, data)) {
+            return value;
+        }
+        let id = self.new_value(Op::Const(data), size, &[], 0);
+        cache.insert((size, data), id);
+        id
     }
 
     pub fn value(&self, value: ValueId) -> &Value {

@@ -1,4 +1,5 @@
 mod callgraph;
+mod cfg;
 mod contracts;
 mod modes;
 mod private;
@@ -6,7 +7,7 @@ mod private;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 
-use rk_core::contract::{Contract, Field};
+use rk_core::contract::{Contract, Field, Fields};
 use rk_core::program::Program;
 use rk_core::settings::Settings;
 use rk_core::{Addr, Result};
@@ -14,7 +15,7 @@ use rk_frontend::Analysis;
 use rk_ssa::{CallEffect, CallFacts};
 
 pub use modes::{ModeCondition, ReturnSummary, X87ModeFacts, CW_MASK, CW_PC_RC};
-pub use private::{field_by_name, specialize, PrivateAnalysis, PrivateLayout};
+pub use private::{specialize, PrivateAnalysis, PrivateLayout};
 
 pub struct ContractCallFacts<'a> {
     contracts: &'a BTreeMap<Addr, Contract>,
@@ -59,7 +60,7 @@ pub struct GlobalInput<'a> {
 pub struct PrivateFacts {
     pub targets: BTreeMap<Addr, Contract>,
     pub layouts: BTreeMap<Addr, Vec<PrivateLayout>>,
-    pub masks: BTreeMap<Addr, BTreeSet<u16>>,
+    pub masks: BTreeMap<Addr, BTreeSet<Fields>>,
     pub input_arguments: BTreeMap<Addr, Field>,
     pub checked_returns: BTreeSet<Addr>,
     pub callers: BTreeSet<Addr>,
@@ -224,7 +225,7 @@ impl GlobalFacts {
                     out,
                     "layout {:08x} mask={:04x} inputs={} argument={}",
                     addr,
-                    layout.output_mask(),
+                    layout.outputs.0,
                     fields(layout.inputs),
                     layout.input_argument.map_or("-", Field::name),
                 )?;

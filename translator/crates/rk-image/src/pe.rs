@@ -8,26 +8,112 @@ const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const DIR_IMPORT: usize = 1;
 const DIR_BASERELOC: usize = 5;
 
-struct Section {
-    virtual_address: u32,
-    virtual_size: u32,
-    raw_size: u32,
-    raw_pointer: u32,
-    characteristics: u32,
+#[derive(Clone, Debug)]
+pub struct Section {
+    pub virtual_address: u32,
+    pub virtual_size: u32,
+    pub raw_size: u32,
+    pub raw_pointer: u32,
+    pub characteristics: u32,
 }
 
-fn u16_at(data: &[u8], off: usize) -> Option<u16> {
+pub(crate) fn u16_at(data: &[u8], off: usize) -> Option<u16> {
     Some(u16::from_le_bytes(data.get(off..off + 2)?.try_into().ok()?))
 }
 
-fn u32_at(data: &[u8], off: usize) -> Option<u32> {
+pub(crate) fn u32_at(data: &[u8], off: usize) -> Option<u32> {
     Some(u32::from_le_bytes(data.get(off..off + 4)?.try_into().ok()?))
 }
 
-fn c_string(data: &[u8], off: usize) -> Option<String> {
+pub(crate) fn c_string(data: &[u8], off: usize) -> Option<String> {
     let tail = data.get(off..)?;
     let end = tail.iter().position(|&b| b == 0)?;
     Some(String::from_utf8_lossy(&tail[..end]).into_owned())
+}
+
+pub(crate) struct Headers<'a> {
+    file: &'a [u8],
+    opt: usize,
+    directory_count: usize,
+    pub preferred_base: u32,
+    pub size: u32,
+    pub data: Vec<u8>,
+    pub sections: Vec<Section>,
+}
+
+impl<'a> Headers<'a> {
+    pub(crate) fn parse(file: &'a [u8]) -> Option<Self> {
+        let pe = u32_at(file, 0x3c)? as usize;
+        if file.get(pe..pe + 4)? != b"PE\0\0" {
+            return None;
+        }
+        let coff = pe + 4;
+        let section_count = u16_at(file, coff + 2)? as usize;
+        let optional_size = u16_at(file, coff + 16)? as usize;
+        let opt = coff + 20;
+        if u16_at(file, opt)? != 0x10b {
+            return None;
+        }
+        let preferred_base = u32_at(file, opt + 28)?;
+        let size = u32_at(file, opt + 56)?;
+        let headers = u32_at(file, opt + 60)? as usize;
+        let directory_count = u32_at(file, opt + 92)? as usize;
+        let table = opt + optional_size;
+        let mut sections = Vec::with_capacity(section_count);
+        for i in 0..section_count {
+            let at = table + i * 40;
+            sections.push(Section {
+                virtual_size: u32_at(file, at + 8)?,
+                virtual_address: u32_at(file, at + 12)?,
+                raw_size: u32_at(file, at + 16)?,
+                raw_pointer: u32_at(file, at + 20)?,
+                characteristics: u32_at(file, at + 36)?,
+            });
+        }
+
+        let mut data = file.get(..headers.min(file.len()))?.to_vec();
+        for s in &sections {
+            if s.virtual_size == 0 && s.raw_size == 0 {
+                continue;
+            }
+            let start = s.raw_pointer as usize;
+            let end = start + s.raw_size as usize;
+            if end > file.len() {
+                continue;
+            }
+            data.resize(s.virtual_address as usize, 0);
+            data.extend_from_slice(&file[start..end]);
+        }
+        data.resize(size as usize, 0);
+
+        Some(Self { file, opt, directory_count, preferred_base, size, data, sections })
+    }
+
+    pub(crate) fn entry_rva(&self) -> Option<u32> {
+        u32_at(self.file, self.opt + 16)
+    }
+
+    pub(crate) fn directory_count(&self) -> usize {
+        self.directory_count
+    }
+
+    pub(crate) fn directory(&self, index: usize) -> Option<(u32, u32)> {
+        if index >= self.directory_count {
+            return Some((0, 0));
+        }
+        Some((u32_at(self.file, self.opt + 96 + index * 8)?, u32_at(self.file, self.opt + 100 + index * 8)?))
+    }
+
+    pub(crate) fn exec_ranges(&self, base: Addr) -> Vec<(Addr, Addr)> {
+        self.sections
+            .iter()
+            .filter(|s| s.characteristics & SCN_MEM_EXECUTE != 0)
+            .map(|s| {
+                let start = base + s.virtual_address;
+                (start, start + s.virtual_size.max(s.raw_size))
+            })
+            .collect()
+    }
 }
 
 pub fn load(path: &Path, base: Option<Addr>) -> Result<Image> {
@@ -37,58 +123,13 @@ pub fn load(path: &Path, base: Option<Addr>) -> Result<Image> {
 }
 
 fn parse(file: &[u8], base: Option<Addr>) -> Option<std::result::Result<Image, String>> {
-    let pe = u32_at(file, 0x3c)? as usize;
-    if file.get(pe..pe + 4)? != b"PE\0\0" {
-        return None;
-    }
-    let coff = pe + 4;
-    let sections_count = u16_at(file, coff + 2)? as usize;
-    let optional_size = u16_at(file, coff + 16)? as usize;
-    let opt = coff + 20;
-    if u16_at(file, opt)? != 0x10b {
-        return None;
-    }
-    let preferred = u32_at(file, opt + 28)?;
-    let size = u32_at(file, opt + 56)?;
-    let headers = u32_at(file, opt + 60)? as usize;
-    let directories = u32_at(file, opt + 92)? as usize;
-    let directory = |index: usize| -> Option<(u32, u32)> {
-        if index >= directories {
-            return Some((0, 0));
-        }
-        Some((u32_at(file, opt + 96 + index * 8)?, u32_at(file, opt + 100 + index * 8)?))
-    };
-    let mut sections = Vec::with_capacity(sections_count);
-    let table = opt + optional_size;
-    for i in 0..sections_count {
-        let at = table + i * 40;
-        sections.push(Section {
-            virtual_size: u32_at(file, at + 8)?,
-            virtual_address: u32_at(file, at + 12)?,
-            raw_size: u32_at(file, at + 16)?,
-            raw_pointer: u32_at(file, at + 20)?,
-            characteristics: u32_at(file, at + 36)?,
-        });
-    }
-
-    let mut data = file.get(..headers.min(file.len()))?.to_vec();
-    for s in &sections {
-        if s.virtual_size == 0 && s.raw_size == 0 {
-            continue;
-        }
-        let start = s.raw_pointer as usize;
-        let end = start + s.raw_size as usize;
-        if end > file.len() {
-            continue;
-        }
-        data.resize(s.virtual_address as usize, 0);
-        data.extend_from_slice(&file[start..end]);
-    }
-    data.resize(size as usize, 0);
-
-    let base = base.unwrap_or(preferred);
-    let delta = base.wrapping_sub(preferred);
-    let (reloc_rva, reloc_size) = directory(DIR_BASERELOC)?;
+    let mut headers = Headers::parse(file)?;
+    let preferred_base = headers.preferred_base;
+    let size = headers.size;
+    let base = base.unwrap_or(preferred_base);
+    let delta = base.wrapping_sub(preferred_base);
+    let mut data = std::mem::take(&mut headers.data);
+    let (reloc_rva, reloc_size) = headers.directory(DIR_BASERELOC)?;
     let mut relocations = Vec::new();
     let mut off = reloc_rva as usize;
     let reloc_end = off + reloc_size as usize;
@@ -127,7 +168,7 @@ fn parse(file: &[u8], base: Option<Addr>) -> Option<std::result::Result<Image, S
     }
 
     let mut imports = BTreeMap::new();
-    let (import_rva, _) = directory(DIR_IMPORT)?;
+    let (import_rva, _) = headers.directory(DIR_IMPORT)?;
     let mut descriptor = import_rva as usize;
     while import_rva != 0 && descriptor + 20 <= data.len() {
         let original = u32_at(&data, descriptor)?;
@@ -156,14 +197,7 @@ fn parse(file: &[u8], base: Option<Addr>) -> Option<std::result::Result<Image, S
         descriptor += 20;
     }
 
-    let exec_ranges = sections
-        .iter()
-        .filter(|s| s.characteristics & SCN_MEM_EXECUTE != 0)
-        .map(|s| {
-            let start = base + s.virtual_address;
-            (start, start + s.virtual_size.max(s.raw_size))
-        })
-        .collect();
+    let exec_ranges = headers.exec_ranges(base);
     Some(Ok(Image {
         base,
         size,

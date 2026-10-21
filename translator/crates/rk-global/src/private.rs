@@ -16,23 +16,11 @@ pub struct PrivateLayout {
     pub input_argument: Option<Field>,
 }
 
-impl PrivateLayout {
-    pub fn output_mask(self) -> u16 {
-        self.outputs.iter().fold(0, |mask, field| {
-            mask | (1
-                << Field::ALL
-                    .iter()
-                    .position(|candidate| *candidate == field)
-                    .unwrap())
-        })
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct PrivateAnalysis {
     pub targets: BTreeMap<Addr, Contract>,
     pub layouts: BTreeMap<Addr, Vec<PrivateLayout>>,
-    pub masks: BTreeMap<Addr, BTreeSet<u16>>,
+    pub masks: BTreeMap<Addr, BTreeSet<Fields>>,
     pub input_arguments: BTreeMap<Addr, Field>,
     pub checked_returns: BTreeSet<Addr>,
     pub callers: BTreeSet<Addr>,
@@ -55,7 +43,7 @@ pub(crate) fn analyze(input: &PrivateInput<'_>) -> PrivateAnalysis {
             .settings
             .private_input_registers
             .iter()
-            .filter_map(|(&addr, name)| field_by_name(name).map(|field| (addr, field)))
+            .filter_map(|(&addr, name)| Field::from_name(name).map(|field| (addr, field)))
             .collect(),
         ..PrivateAnalysis::default()
     };
@@ -136,25 +124,19 @@ pub(crate) fn analyze(input: &PrivateInput<'_>) -> PrivateAnalysis {
 }
 
 pub fn specialize(
-    requests: &BTreeMap<Addr, BTreeSet<(Addr, u16)>>,
+    requests: &BTreeMap<Addr, BTreeSet<(Addr, Fields)>>,
     contracts: &BTreeMap<Addr, Contract>,
     input_arguments: &BTreeMap<Addr, Field>,
 ) -> PrivateAnalysis {
-    let mut masks: BTreeMap<Addr, u16> = BTreeMap::new();
-    let mut flagless: BTreeMap<Addr, u16> = BTreeMap::new();
+    let mut masks: BTreeMap<Addr, Fields> = BTreeMap::new();
+    let mut flagless: BTreeMap<Addr, Fields> = BTreeMap::new();
     let mut flagless_users: BTreeMap<Addr, usize> = BTreeMap::new();
-    let flags = Fields::FLAGS.iter().fold(0u16, |mask, field| {
-        mask | (1
-            << Field::ALL
-                .iter()
-                .position(|candidate| *candidate == field)
-                .unwrap())
-    });
+    let flags = Fields::FLAGS;
     for wanted in requests.values() {
         let mut local_flagless = BTreeSet::new();
         for &(target, mask) in wanted {
             *masks.entry(target).or_default() |= mask;
-            if mask & flags == 0 {
+            if mask & flags == Fields::NONE {
                 *flagless.entry(target).or_default() |= mask;
                 local_flagless.insert(target);
             }
@@ -175,7 +157,7 @@ pub fn specialize(
     }
     for (&target, &mask) in &flagless {
         if flagless_users.get(&target).copied().unwrap_or(0) >= 16
-            && masks.get(&target).copied().unwrap_or(0) & flags != 0
+            && masks.get(&target).copied().unwrap_or_default() & flags != Fields::NONE
         {
             let inputs = result
                 .layouts
@@ -186,7 +168,7 @@ pub fn specialize(
         }
     }
     for layouts in result.layouts.values_mut() {
-        layouts.sort_by_key(|layout| (layout.output_mask(), layout.input_argument));
+        layouts.sort_by_key(|layout| (layout.outputs, layout.input_argument));
         layouts.dedup();
     }
     result
@@ -195,30 +177,20 @@ pub fn specialize(
 fn push_layout(
     result: &mut PrivateAnalysis,
     target: Addr,
-    mask: u16,
+    mask: Fields,
     input_contract: Fields,
     input_arguments: &BTreeMap<Addr, Field>,
 ) {
-    let outputs: Fields = Field::ALL
-        .into_iter()
-        .enumerate()
-        .filter(|(index, _)| mask & (1 << index) != 0)
-        .map(|(_, field)| field)
-        .collect();
     let argument = input_arguments.get(&target).copied();
     let argument_fields = Fields(argument.map_or(0, Field::bit));
     let inputs = input_contract.difference(argument_fields);
     let layout = PrivateLayout {
         inputs,
-        outputs,
+        outputs: mask,
         input_argument: argument,
     };
     result.layouts.entry(target).or_default().push(layout);
-    result
-        .masks
-        .entry(target)
-        .or_default()
-        .insert(layout.output_mask());
+    result.masks.entry(target).or_default().insert(mask);
 }
 
 fn callers(
@@ -347,10 +319,4 @@ fn x87_count(analysis: &Analysis, addr: Addr) -> usize {
                 })
                 .count()
         })
-}
-
-pub fn field_by_name(name: &str) -> Option<Field> {
-    Field::ALL
-        .into_iter()
-        .find(|field| field.name().eq_ignore_ascii_case(name))
 }

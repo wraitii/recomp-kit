@@ -276,7 +276,7 @@ impl Lowerer<'_> {
             );
             return Ok((vec![cg(op)], false, None));
         }
-        let ops = match normalize_direct_ram(raw_ops, &mut || self.fresh(4)) {
+        let ops = match normalize_direct_ram(raw_ops, &mut |size| self.fresh(size)) {
             Ok(ops) => ops,
             Err(reason) => {
                 let op = self.reject(insn, reason, SlowFamily::Unmodelled);
@@ -291,7 +291,7 @@ impl Lowerer<'_> {
                 &ops,
                 self.regs,
                 insn.addr,
-                &mut || self.fresh(8),
+                &mut |size| self.fresh(size),
             ) {
                 Ok(ops) => (ops, true),
                 Err(reason) => {
@@ -301,7 +301,7 @@ impl Lowerer<'_> {
             };
             if has_address {
                 if let Some(kinds) = fir.seh.get(&index) {
-                    apply_seh(&mut converted, kinds, insn.addr);
+                    apply_seh(&mut converted, kinds);
                 }
                 if let Some(target) = fir.noreturn.get(&index) {
                     converted.push(cg(Op::Trap(*target)));
@@ -319,7 +319,7 @@ impl Lowerer<'_> {
                 | "SHRD"
         ) && ops.iter().any(|op| op.opcode == OpCode::Store);
         let prepared = if rewrites_memory {
-            prepare_rmw(&ops, &mut || self.fresh(4))
+            prepare_rmw(&ops, &mut |size| self.fresh(size))
         } else {
             Ok(ops.clone())
         };
@@ -331,18 +331,18 @@ impl Lowerer<'_> {
                         &mnem,
                         &ops,
                         self.regs,
-                        &mut || self.fresh(4),
+                        &mut |size| self.fresh(size),
                         &mut flag_operands,
                     )
                 }
-                "SHL" | "SHR" => correct_shift(&mnem, &ops, self.regs, &mut || self.fresh(4)),
-                "SAR" => correct_sar(&ops, self.regs, &mut || self.fresh(4)),
-                "NEG" => correct_neg(&ops, self.regs, &mut || self.fresh(4)),
+                "SHL" | "SHR" => correct_shift(&mnem, &ops, self.regs, &mut |size| self.fresh(size)),
+                "SAR" => correct_sar(&ops, self.regs, &mut |size| self.fresh(size)),
+                "NEG" => correct_neg(&ops, self.regs, &mut |size| self.fresh(size)),
                 "AND" | "OR" | "XOR" | "TEST" => Ok(with_af_zero(&ops, self.regs)),
                 _ => Ok(ops.clone()),
             }?;
             Ok(if rewrites_memory {
-                defer_flags(corrected, self.regs, &mut || self.fresh(4))
+                defer_flags(corrected, self.regs, &mut |size| self.fresh(size))
             } else {
                 corrected
             })
@@ -369,7 +369,7 @@ impl Lowerer<'_> {
         };
         let mut converted: Vec<CgOp> = ops.into_iter().map(from_pcode).collect();
         if let Some(kinds) = fir.seh.get(&index) {
-            apply_seh(&mut converted, kinds, insn.addr);
+            apply_seh(&mut converted, kinds);
         }
         if let Some(target) = fir.noreturn.get(&index) {
             converted.push(cg(Op::Trap(*target)));
@@ -450,7 +450,7 @@ fn is_control(op: &PcodeOp) -> bool {
 
 fn normalize_direct_ram(
     ops: &[PcodeOp],
-    fresh: &mut dyn FnMut() -> Varnode,
+    fresh: &mut dyn FnMut(u32) -> Varnode,
 ) -> Result<Vec<PcodeOp>, Reason> {
     let mut ops = ops.to_vec();
     if let Some(index) = ops.iter().position(|op| {
@@ -458,8 +458,7 @@ fn normalize_direct_ram(
             && op.inputs.first().is_some_and(|v| v.space == Space::Ram)
     }) {
         let target = ops[index].inputs[0];
-        let unique = fresh();
-        let unique = Varnode::new(unique.space, unique.offset, target.size);
+        let unique = fresh(target.size);
         ops[index].inputs[0] = unique;
         ops.insert(
             index,
@@ -511,8 +510,7 @@ fn normalize_direct_ram(
                 detail: "unsupported direct-ram read-modify-write".into(),
             });
         }
-        let mut operand = fresh();
-        operand = Varnode::new(operand.space, operand.offset, size);
+        let operand = fresh(size);
         let mut out = Vec::with_capacity(ops.len() + 2);
         for mut op in ops {
             if is_control(&op) {
@@ -555,10 +553,8 @@ fn normalize_direct_ram(
             .copied()
             .find(|&i| ops[i].output.is_some_and(|v| v.space == Space::Ram))
         {
-            let mut dst = fresh();
-            dst = Varnode::new(dst.space, dst.offset, size);
-            let output = ops[index].output.replace(dst);
-            let _ = output;
+            let dst = fresh(size);
+            ops[index].output = Some(dst);
             ops.insert(
                 index + 1,
                 PcodeOp {
@@ -571,8 +567,7 @@ fn normalize_direct_ram(
         }
         return Ok(ops);
     }
-    let mut src = fresh();
-    src = Varnode::new(src.space, src.offset, size);
+    let src = fresh(size);
     let first = touched[0];
     let mut out = Vec::with_capacity(ops.len() + 1);
     for (index, mut op) in ops.into_iter().enumerate() {
@@ -614,7 +609,7 @@ fn with_af_zero(ops: &[PcodeOp], regs: &Registers) -> Vec<PcodeOp> {
 
 fn prepare_rmw(
     ops: &[PcodeOp],
-    fresh: &mut dyn FnMut() -> Varnode,
+    fresh: &mut dyn FnMut(u32) -> Varnode,
 ) -> Result<Vec<PcodeOp>, Reason> {
     let stores: Vec<usize> = ops.iter().enumerate()
         .filter(|(_, op)| op.opcode == OpCode::Store)
@@ -652,10 +647,8 @@ fn prepare_rmw(
             detail: "read-modify-write addresses disagree".into(),
         });
     }
-    let mut old = fresh();
-    old = Varnode::new(old.space, old.offset, loaded.size);
-    let mut stored = fresh();
-    stored = Varnode::new(stored.space, stored.offset, store.inputs[1].size);
+    let old = fresh(loaded.size);
+    let stored = fresh(store.inputs[1].size);
     let mut out = Vec::with_capacity(ops.len() + 2);
     let mut seen_load = false;
     let mut seen_store = false;
@@ -681,7 +674,7 @@ fn prepare_rmw(
     Ok(out)
 }
 
-fn defer_flags(ops: Vec<PcodeOp>, regs: &Registers, fresh: &mut dyn FnMut() -> Varnode) -> Vec<PcodeOp> {
+fn defer_flags(ops: Vec<PcodeOp>, regs: &Registers, fresh: &mut dyn FnMut(u32) -> Varnode) -> Vec<PcodeOp> {
     let mut names = BTreeMap::new();
     let mut deferred = Vec::new();
     let mut out = Vec::with_capacity(ops.len() + 8);
@@ -699,8 +692,7 @@ fn defer_flags(ops: Vec<PcodeOp>, regs: &Registers, fresh: &mut dyn FnMut() -> V
                     output.offset == flag.offset && output.size == flag.size
                 });
             if is_flag {
-                let mut replacement = fresh();
-                replacement = Varnode::new(replacement.space, replacement.offset, output.size);
+                let replacement = fresh(output.size);
                 op.output = Some(replacement);
                 deferred.push((output, replacement));
                 names.insert(output, replacement);
@@ -716,11 +708,11 @@ fn correct_arithmetic(
     mnem: &str,
     ops: &[PcodeOp],
     regs: &Registers,
-    fresh: &mut dyn FnMut() -> Varnode,
+    fresh: &mut dyn FnMut(u32) -> Varnode,
     flag_operands: &mut Option<(Varnode, Varnode)>,
 ) -> Result<Vec<PcodeOp>, Reason> {
     let mut ops = ops.to_vec();
-    let (primary_index, a, b, result, insert) = if mnem == "ADC" || mnem == "SBB" {
+    let (_, a, b, result, insert) = if mnem == "ADC" || mnem == "SBB" {
         let opcode = if mnem == "ADC" { OpCode::IntAdd } else { OpCode::IntSub };
         let primary = ops
             .iter()
@@ -747,10 +739,8 @@ fn correct_arithmetic(
         if inputs.len() < 2 {
             return Err(Reason::UnsupportedArithmetic { mnemonic: mnem.into() });
         }
-        let mut a = fresh();
-        a = Varnode::new(a.space, a.offset, result.size);
-        let mut b = fresh();
-        b = Varnode::new(b.space, b.offset, result.size);
+        let a = fresh(result.size);
+        let b = fresh(result.size);
         *flag_operands = Some((a, b));
         ops.splice(first_cf..first_cf, [copy(a, inputs[0]), copy(b, inputs[1])]);
         (primary + 2, a, b, result, first_cf + 3)
@@ -790,20 +780,14 @@ fn correct_arithmetic(
         if inputs.len() < 2 {
             return Err(Reason::UnsupportedArithmetic { mnemonic: mnem.into() });
         }
-        let mut a = fresh();
-        a = Varnode::new(a.space, a.offset, result.size);
-        let mut b = fresh();
-        b = Varnode::new(b.space, b.offset, result.size);
+        let a = fresh(result.size);
+        let b = fresh(result.size);
         ops.splice(primary..primary, [copy(a, inputs[0]), copy(b, inputs[1])]);
         (primary + 2, a, b, result, primary + 3)
     };
-    let _ = primary_index;
-    let mut x = fresh();
-    x = Varnode::new(x.space, x.offset, result.size);
-    let mut y = fresh();
-    y = Varnode::new(y.space, y.offset, result.size);
-    let mut z = fresh();
-    z = Varnode::new(z.space, z.offset, result.size);
+    let x = fresh(result.size);
+    let y = fresh(result.size);
+    let z = fresh(result.size);
     let recipe = vec![
         op(OpCode::IntXor, x, vec![a, b]),
         op(OpCode::IntXor, y, vec![x, result]),
@@ -818,7 +802,7 @@ fn correct_shift(
     mnem: &str,
     ops: &[PcodeOp],
     regs: &Registers,
-    fresh: &mut dyn FnMut() -> Varnode,
+    fresh: &mut dyn FnMut(u32) -> Varnode,
 ) -> Result<Vec<PcodeOp>, Reason> {
     let mut ops = ops.to_vec();
     let opcode = if mnem == "SHL" { OpCode::IntLeft } else { OpCode::IntRight };
@@ -831,24 +815,16 @@ fn correct_shift(
         .ok_or_else(|| Reason::UnsupportedShift { mnemonic: mnem.into() })?;
     let source = ops[index].output.unwrap();
     let count = ops[index].inputs[1];
-    let mut original = fresh();
-    original = Varnode::new(original.space, original.offset, source.size);
-    let mut old_of = fresh();
-    old_of = Varnode::new(old_of.space, old_of.offset, 1);
+    let original = fresh(source.size);
+    let old_of = fresh(1);
     ops.insert(index, copy(original, ops[index].inputs[0]));
     ops.insert(0, copy(old_of, flag(regs, "OF")));
-    let mut nonzero = fresh();
-    nonzero = Varnode::new(nonzero.space, nonzero.offset, 1);
-    let mut zero = fresh();
-    zero = Varnode::new(zero.space, zero.offset, 1);
-    let mut sign = fresh();
-    sign = Varnode::new(sign.space, sign.offset, 1);
-    let mut changed = fresh();
-    changed = Varnode::new(changed.space, changed.offset, 1);
-    let mut kept = fresh();
-    kept = Varnode::new(kept.space, kept.offset, 1);
-    let mut updated = fresh();
-    updated = Varnode::new(updated.space, updated.offset, 1);
+    let nonzero = fresh(1);
+    let zero = fresh(1);
+    let sign = fresh(1);
+    let changed = fresh(1);
+    let kept = fresh(1);
+    let updated = fresh(1);
     let sign_source = if mnem == "SHL" { source } else { original };
     let mut recipe = vec![
         op(OpCode::IntNotEqual, nonzero, vec![count, Varnode::constant(0, count.size)]),
@@ -861,8 +837,7 @@ fn correct_shift(
         op(OpCode::IntSLess, sign, vec![sign_source, Varnode::constant(0, sign_source.size)]),
     ];
     if mnem == "SHL" {
-        let mut x = fresh();
-        x = Varnode::new(x.space, x.offset, 1);
+        let x = fresh(1);
         recipe.push(op(OpCode::IntXor, x, vec![sign, flag(regs, "CF")]));
         recipe.push(op(OpCode::IntAnd, changed, vec![nonzero, x]));
     } else {
@@ -878,7 +853,7 @@ fn correct_shift(
 fn correct_sar(
     ops: &[PcodeOp],
     regs: &Registers,
-    fresh: &mut dyn FnMut() -> Varnode,
+    fresh: &mut dyn FnMut(u32) -> Varnode,
 ) -> Result<Vec<PcodeOp>, Reason> {
     let mut ops = ops.to_vec();
     let index = ops
@@ -889,14 +864,10 @@ fn correct_sar(
         })
         .ok_or_else(|| Reason::UnsupportedShift { mnemonic: "SAR".into() })?;
     let count = ops[index].inputs[1];
-    let mut old_of = fresh();
-    old_of = Varnode::new(old_of.space, old_of.offset, 1);
-    let mut nonzero = fresh();
-    nonzero = Varnode::new(nonzero.space, nonzero.offset, 1);
-    let mut zero = fresh();
-    zero = Varnode::new(zero.space, zero.offset, 1);
-    let mut updated = fresh();
-    updated = Varnode::new(updated.space, updated.offset, 1);
+    let old_of = fresh(1);
+    let nonzero = fresh(1);
+    let zero = fresh(1);
+    let updated = fresh(1);
     ops.insert(0, copy(old_of, flag(regs, "OF")));
     ops.extend([
         op(OpCode::IntNotEqual, nonzero, vec![count, Varnode::constant(0, count.size)]),
@@ -915,7 +886,7 @@ fn correct_sar(
 fn correct_neg(
     ops: &[PcodeOp],
     regs: &Registers,
-    fresh: &mut dyn FnMut() -> Varnode,
+    fresh: &mut dyn FnMut(u32) -> Varnode,
 ) -> Result<Vec<PcodeOp>, Reason> {
     let mut ops = ops.to_vec();
     let result = ops
@@ -923,10 +894,8 @@ fn correct_neg(
         .find(|op| op.opcode == OpCode::Int2Comp && op.output.is_some_and(|v| matches!(v.space, Space::Register | Space::Unique)))
         .and_then(|op| op.output)
         .ok_or_else(|| Reason::UnsupportedArithmetic { mnemonic: "NEG".into() })?;
-    let mut low = fresh();
-    low = Varnode::new(low.space, low.offset, result.size);
-    let mut af = fresh();
-    af = Varnode::new(af.space, af.offset, 1);
+    let low = fresh(result.size);
+    let af = fresh(1);
     ops.extend([
         op(OpCode::IntAnd, low, vec![result, Varnode::constant(0xf, result.size)]),
         op(OpCode::IntNotEqual, af, vec![low, Varnode::constant(0, result.size)]),
@@ -940,7 +909,7 @@ fn correct_div_cg(
     ops: &[PcodeOp],
     regs: &Registers,
     addr: Addr,
-    fresh: &mut dyn FnMut() -> Varnode,
+    fresh: &mut dyn FnMut(u32) -> Varnode,
 ) -> Result<Vec<CgOp>, Reason> {
     let signed = mnem == "IDIV";
     let div = if signed { OpCode::IntSDiv } else { OpCode::IntDiv };
@@ -969,8 +938,7 @@ fn correct_div_cg(
     if !shape {
         return Err(Reason::UnsupportedDivide { mnemonic: mnem.into() });
     }
-    let mut result = fresh();
-    result = Varnode::new(result.space, result.offset, 8);
+    let result = fresh(8);
     let mut inputs = division.inputs.clone();
     inputs.push(Varnode::constant(addr as u64, 4));
     let opcode = if signed { Op::Idiv32 { addr } } else { Op::Div32 { addr } };
@@ -991,7 +959,7 @@ fn correct_div_cg(
     Ok(out)
 }
 
-fn apply_seh(ops: &mut Vec<CgOp>, kinds: &[SehEffect], addr: Addr) {
+fn apply_seh(ops: &mut Vec<CgOp>, kinds: &[SehEffect]) {
     for kind in kinds {
         match kind {
             SehEffect::Landing => ops.insert(0, cg(Op::Seh(*kind))),
@@ -1005,7 +973,6 @@ fn apply_seh(ops: &mut Vec<CgOp>, kinds: &[SehEffect], addr: Addr) {
             _ => ops.push(cg(Op::Seh(*kind))),
         }
     }
-    let _ = addr;
 }
 
 pub fn string_fields(_helper: &str) -> (Fields, Fields, bool) {

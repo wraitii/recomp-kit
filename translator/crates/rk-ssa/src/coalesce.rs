@@ -4,7 +4,7 @@ use rk_core::contract::Field;
 use rk_core::Lookup;
 use rk_ir::{lanes, Op, StateKey};
 
-use crate::{canonical::rewrite_aliases, LaneGroup, LaneGroupLane, Ssa, Value, ValueId};
+use crate::{canonical::rewrite_aliases, LaneGroup, LaneGroupLane, Ssa, ValueId};
 
 enum WordArg {
     Source(ValueId),
@@ -132,29 +132,6 @@ fn candidate(
     })
 }
 
-fn constant(s: &mut Ssa, cache: &mut BTreeMap<(u8, u64), ValueId>, size: u8, data: u64) -> ValueId {
-    let mask = if size >= 8 { u64::MAX } else { (1u64 << (size * 8)) - 1 };
-    let data = data & mask;
-    if let Some(&value) = cache.get(&(size, data)) {
-        return value;
-    }
-    let id = s.values.len() as ValueId;
-    s.values.push(Value { op: Op::Const(data), size, args_start: s.args.len() as u32, args_len: 0 });
-    s.value_addr.push(0);
-    cache.insert((size, data), id);
-    id
-}
-
-fn new_value(s: &mut Ssa, op: Op, size: u8, args: &[ValueId], addr: u32) -> ValueId {
-    let id = s.values.len() as ValueId;
-    let start = s.args.len() as u32;
-    s.args.extend_from_slice(args);
-    s.values.push(Value { op, size, args_start: start, args_len: args.len() as u32 });
-    s.value_addr.push(addr);
-    id
-}
-
-
 fn coalesce_roots(s: &mut Ssa) {
     let key_index: BTreeMap<StateKey, usize> =
         s.keys.iter().enumerate().map(|(index, key)| (*key, index)).collect();
@@ -184,9 +161,9 @@ fn coalesce_roots(s: &mut Ssa) {
             continue;
         }
         let addr = s.value_addr[inputs[0] as usize];
-        let word = new_value(s, Op::Input(s.keys[keys[0]]), 4, &[], addr);
+        let word = s.new_value( Op::Input(s.keys[keys[0]]), 4, &[], addr);
         for (lane, value) in inputs.into_iter().enumerate() {
-            let byte = new_value(s, Op::Byte(lane as u8), 1, &[word], addr);
+            let byte = s.new_value( Op::Byte(lane as u8), 1, &[word], addr);
             alias.insert(value, byte);
         }
     }
@@ -210,7 +187,7 @@ fn coalesce_roots(s: &mut Ssa) {
         if keys.len() != 4 {
             continue;
         }
-        let site = s.resolve(s.args(id)[0]);
+        let site = s.args(id)[0];
         groups.entry((site, keys)).or_insert([None; 4])[lane as usize] = Some(id);
     }
 
@@ -223,13 +200,13 @@ fn coalesce_roots(s: &mut Ssa) {
         }
         let word = if keep {
             let olds: Vec<ValueId> = ids.iter().map(|id| s.args(*id)[1]).collect();
-            let old = new_value(s, Op::Pack, 4, &olds, addr);
-            new_value(s, Op::StateKeep(s.keys[keys[0]]), 4, &[site, old], addr)
+            let old = s.new_value( Op::Pack, 4, &olds, addr);
+            s.new_value( Op::StateKeep(s.keys[keys[0]]), 4, &[site, old], addr)
         } else {
-            new_value(s, Op::StateReload(s.keys[keys[0]]), 4, &[site], addr)
+            s.new_value( Op::StateReload(s.keys[keys[0]]), 4, &[site], addr)
         };
         for (lane, id) in ids.into_iter().enumerate() {
-            let byte = new_value(s, Op::Byte(lane as u8), 1, &[word], addr);
+            let byte = s.new_value( Op::Byte(lane as u8), 1, &[word], addr);
             alias.insert(id, byte);
         }
     }
@@ -299,17 +276,17 @@ pub(crate) fn coalesce(s: &mut Ssa) {
         for arg in candidate.word_args {
             args.push(match arg {
                 WordArg::Source(value) => value,
-                WordArg::Const(data) => constant(s, &mut constants, width, data),
+                WordArg::Const(data) => s.constant(&mut constants, width, data),
                 WordArg::Pack(values) => *packs
                     .entry(values.clone())
-                    .or_insert_with(|| new_value(s, Op::Pack, width, &values, addr)),
+                    .or_insert_with(|| s.new_value( Op::Pack, width, &values, addr)),
             });
         }
         let key = (candidate.block, width, args.clone());
         let phi = match word_phis.get(&key) {
             Some(&phi) => phi,
             None => {
-                let phi = new_value(s, Op::Phi, width, &args, addr);
+                let phi = s.new_value( Op::Phi, width, &args, addr);
                 let position = candidate
                     .lanes
                     .iter()
@@ -323,7 +300,7 @@ pub(crate) fn coalesce(s: &mut Ssa) {
 
         let mut group = LaneGroup { phi, block: candidate.block as u32, lanes: Vec::new() };
         for (lane, site) in candidate.lanes.into_iter().enumerate() {
-            let value = new_value(s, Op::Byte(lane as u8), 1, &[phi], s.value_addr[site.phi as usize]);
+            let value = s.new_value( Op::Byte(lane as u8), 1, &[phi], s.value_addr[site.phi as usize]);
             alias.insert(site.phi, value);
             group.lanes.push(LaneGroupLane { key: site.key, value, args: site.args });
         }

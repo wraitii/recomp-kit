@@ -70,7 +70,7 @@ fn fields(names: &[&str]) -> Fields {
             "OF" => Field::Of,
             _ => continue,
         };
-        out = out | Fields(field.bit());
+        out |= Fields(field.bit());
     }
     out
 }

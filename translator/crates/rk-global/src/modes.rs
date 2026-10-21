@@ -5,6 +5,7 @@ use rk_core::{Addr, Lookup};
 use rk_frontend::Analysis;
 
 use crate::callgraph::CallGraph;
+use crate::cfg::{closed, is_return, mnemonic};
 
 pub const CW_MASK: u16 = 0xffff;
 pub const CW_PC_RC: u16 = 0x0f00;
@@ -147,9 +148,8 @@ pub(crate) fn analyze(
         }
         entries.sort_by_key(|&(addr, root, _)| (addr, root));
         if recursive {
-            for &(addr, _, entry_addr) in &entries {
+            for &(_, _, entry_addr) in &entries {
                 summaries.insert(entry_addr, PRESERVE);
-                let _ = addr;
             }
         }
         for &(addr, root, entry_addr) in &entries {
@@ -505,7 +505,7 @@ fn prepare(fir: &FunctionIr, indirect: &BTreeMap<Addr, Vec<Addr>>) -> Option<Mod
     for &index in &order {
         let insn = &fir.insns[index as usize];
         let mnemonic = mnemonic(insn);
-        let effect = match mnemonic.as_str() {
+        let effect = match mnemonic.as_ref() {
             "FINIT" | "FNINIT" | "FSAVE" | "FNSAVE" => Effect::Set(CW_MASK, CW_RESET),
             "FNSTENV" | "FSTENV" => Effect::Set(CW_EXCEPTION_MASK, CW_EXCEPTION_MASK),
             "FLDCW" => restores
@@ -549,36 +549,6 @@ fn prepare(fir: &FunctionIr, indirect: &BTreeMap<Addr, Vec<Addr>>) -> Option<Mod
         returns,
         x87_count,
     })
-}
-
-fn closed(fir: &FunctionIr, tails: &BTreeSet<u32>) -> bool {
-    for (index, insn) in fir.insns.iter().enumerate() {
-        let index = index as u32;
-        if tails.contains(&index) {
-            continue;
-        }
-        if fir.exits.contains_key(&index) {
-            return false;
-        }
-        let mnemonic = mnemonic(insn);
-        let succ = &fir.succ[index as usize];
-        if mnemonic == "RET" {
-            if !succ.is_empty() {
-                return false;
-            }
-        } else if mnemonic == "JMP" {
-            if succ.is_empty() {
-                return false;
-            }
-        } else if mnemonic == "CALL" {
-            if succ.is_empty() && !fir.noreturn.contains_key(&index) {
-                return false;
-            }
-        } else if succ.is_empty() && !is_return(insn) && !fir.noreturn.contains_key(&index) {
-            return false;
-        }
-    }
-    true
 }
 
 fn direct_targets(insn: &rk_core::ir::Insn, indirect: &BTreeMap<Addr, Vec<Addr>>) -> Vec<Addr> {
@@ -756,17 +726,4 @@ fn mode_leaf(prep: &ModePrepared) -> bool {
             .order
             .iter()
             .all(|&index| matches!(prep.effects[index as usize], Effect::Keep | Effect::Restore(_)))
-}
-
-fn mnemonic(insn: &rk_core::ir::Insn) -> String {
-    insn.mnemonic
-        .to_ascii_uppercase()
-        .strip_prefix("WAIT ")
-        .unwrap_or(&insn.mnemonic.to_ascii_uppercase())
-        .to_string()
-}
-
-fn is_return(insn: &rk_core::ir::Insn) -> bool {
-    insn.mnemonic.eq_ignore_ascii_case("RET")
-        || insn.ops.iter().any(|op| op.opcode == OpCode::Return)
 }

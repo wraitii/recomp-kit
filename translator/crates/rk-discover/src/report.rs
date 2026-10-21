@@ -30,16 +30,38 @@ pub struct DiscardedSeed {
     pub evidence: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FunctionReject {
+    StartsInsideMappedInstruction,
+    StartsInMappedFunction,
+    OverlapsMappedCode,
+    FlowsIntoMappedInstruction,
+    FlowsToMappedInterior,
+    CallsToDiscoveredInterior,
+    CallsToUngroundedTarget,
+    JumpsToDiscoveredInterior,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryReject {
+    EntryInsideMappedInstruction,
+    EntryInMappedFunction,
+    EntryInRejectedFunction,
+    EntryNotInFunction,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct FunctionRejection {
     pub address: String,
-    pub reason: &'static str,
+    pub reason: FunctionReject,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct EntryRejection {
     pub address: String,
-    pub reason: &'static str,
+    pub reason: EntryReject,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

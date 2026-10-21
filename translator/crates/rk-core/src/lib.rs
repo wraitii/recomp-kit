@@ -11,6 +11,14 @@ pub use lookup::{Lookup, LookupSet};
 
 pub type Addr = u32;
 
+pub const fn mask(size: u32) -> u64 {
+    if size >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (size * 8)) - 1
+    }
+}
+
 pub struct Hex(pub Addr);
 
 impl std::fmt::Display for Hex {

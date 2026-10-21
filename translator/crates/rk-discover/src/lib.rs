@@ -8,8 +8,8 @@ use rayon::prelude::*;
 use rk_core::{Addr, Error, Hex, Result};
 
 use report::{
-    Conflict, DiscardedSeed, DiscoveryReport, EntryRejection, FunctionRejection, Gap, PointerRun,
-    RejectionCounts,
+    Conflict, DiscardedSeed, DiscoveryReport, EntryReject, EntryRejection, FunctionReject,
+    FunctionRejection, Gap, PointerRun, RejectionCounts,
 };
 
 const RANK_TRUSTED: u16 = 100;
@@ -192,8 +192,8 @@ struct Recovery<'a> {
     excluded_bytes: u64,
     kept_functions: usize,
     kept_entries: usize,
-    function_rejections: Vec<(Addr, &'static str)>,
-    entry_rejections: Vec<(Addr, &'static str)>,
+    function_rejections: Vec<(Addr, FunctionReject)>,
+    entry_rejections: Vec<(Addr, EntryReject)>,
 }
 
 impl<'a> Recovery<'a> {
@@ -1036,9 +1036,9 @@ impl<'a> Recovery<'a> {
             let mut reason = None;
             if self.mapped_span_at(owner).is_some() {
                 if !mapped_starts.contains(&owner) {
-                    reason = Some("starts_inside_mapped_instruction");
+                    reason = Some(FunctionReject::StartsInsideMappedInstruction);
                 } else if !self.known_entries.contains(&owner) {
-                    reason = Some("starts_in_mapped_function");
+                    reason = Some(FunctionReject::StartsInMappedFunction);
                 }
             }
             if reason.is_none() {
@@ -1050,7 +1050,7 @@ impl<'a> Recovery<'a> {
                     for &length in lengths {
                         for byte in at..at + length as u32 {
                             if self.mapped_span_at(byte).is_some() {
-                                reason = Some("overlaps_mapped_code");
+                                reason = Some(FunctionReject::OverlapsMappedCode);
                                 break 'spans;
                             }
                         }
@@ -1059,11 +1059,11 @@ impl<'a> Recovery<'a> {
                                 if let Some((target, call)) = ins.direct {
                                     if self.mapped_span_at(target).is_some() {
                                         if !mapped_starts.contains(&target) {
-                                            reason = Some("flows_into_mapped_instruction");
+                                            reason = Some(FunctionReject::FlowsIntoMappedInstruction);
                                             break 'spans;
                                         }
                                         if !self.known_entries.contains(&target) {
-                                            reason = Some("flows_to_mapped_interior");
+                                            reason = Some(FunctionReject::FlowsToMappedInterior);
                                             break 'spans;
                                         }
                                     } else if call {
@@ -1071,15 +1071,15 @@ impl<'a> Recovery<'a> {
                                             || self.known_entries.contains(&target);
                                         if !entry {
                                             if discovered_at(target).is_some() {
-                                                reason = Some("calls_to_discovered_interior");
+                                                reason = Some(FunctionReject::CallsToDiscoveredInterior);
                                             } else {
-                                                reason = Some("calls_to_ungrounded_target");
+                                                reason = Some(FunctionReject::CallsToUngroundedTarget);
                                             }
                                             break 'spans;
                                         }
                                     } else if let Some(other) = discovered_at(target) {
                                         if other != owner && target != other {
-                                            reason = Some("jumps_to_discovered_interior");
+                                            reason = Some(FunctionReject::JumpsToDiscoveredInterior);
                                             break 'spans;
                                         }
                                     }
@@ -1108,16 +1108,16 @@ impl<'a> Recovery<'a> {
         for (addr, (owner, kind)) in entries {
             let reason = if self.mapped_span_at(addr).is_some() {
                 if !mapped_starts.contains(&addr) {
-                    Some("entry_inside_mapped_instruction")
+                    Some(EntryReject::EntryInsideMappedInstruction)
                 } else if !self.known_entries.contains(&addr) {
-                    Some("entry_in_mapped_function")
+                    Some(EntryReject::EntryInMappedFunction)
                 } else {
                     None
                 }
             } else if !kept.contains_key(&owner) {
-                Some("entry_in_rejected_function")
+                Some(EntryReject::EntryInRejectedFunction)
             } else if !kept_instructions.contains(&addr) {
-                Some("entry_not_in_function")
+                Some(EntryReject::EntryNotInFunction)
             } else {
                 None
             };
@@ -1183,25 +1183,23 @@ impl<'a> Recovery<'a> {
             .collect();
         let mut rejection_counts = RejectionCounts::default();
         for (_, reason) in &self.function_rejections {
-            match *reason {
-                "starts_inside_mapped_instruction" => rejection_counts.functions_starts_inside_mapped_instruction += 1,
-                "starts_in_mapped_function" => rejection_counts.functions_starts_in_mapped_function += 1,
-                "overlaps_mapped_code" => rejection_counts.functions_overlaps_mapped_code += 1,
-                "flows_into_mapped_instruction" => rejection_counts.functions_flows_into_mapped_instruction += 1,
-                "flows_to_mapped_interior" => rejection_counts.functions_flows_to_mapped_interior += 1,
-                "calls_to_discovered_interior" => rejection_counts.functions_calls_to_discovered_interior += 1,
-                "calls_to_ungrounded_target" => rejection_counts.functions_calls_to_ungrounded_target += 1,
-                "jumps_to_discovered_interior" => rejection_counts.functions_jumps_to_discovered_interior += 1,
-                _ => {}
+            match reason {
+                FunctionReject::StartsInsideMappedInstruction => rejection_counts.functions_starts_inside_mapped_instruction += 1,
+                FunctionReject::StartsInMappedFunction => rejection_counts.functions_starts_in_mapped_function += 1,
+                FunctionReject::OverlapsMappedCode => rejection_counts.functions_overlaps_mapped_code += 1,
+                FunctionReject::FlowsIntoMappedInstruction => rejection_counts.functions_flows_into_mapped_instruction += 1,
+                FunctionReject::FlowsToMappedInterior => rejection_counts.functions_flows_to_mapped_interior += 1,
+                FunctionReject::CallsToDiscoveredInterior => rejection_counts.functions_calls_to_discovered_interior += 1,
+                FunctionReject::CallsToUngroundedTarget => rejection_counts.functions_calls_to_ungrounded_target += 1,
+                FunctionReject::JumpsToDiscoveredInterior => rejection_counts.functions_jumps_to_discovered_interior += 1,
             }
         }
         for (_, reason) in &self.entry_rejections {
-            match *reason {
-                "entry_inside_mapped_instruction" => rejection_counts.entries_inside_mapped_instruction += 1,
-                "entry_in_mapped_function" => rejection_counts.entries_in_mapped_function += 1,
-                "entry_in_rejected_function" => rejection_counts.entries_in_rejected_function += 1,
-                "entry_not_in_function" => rejection_counts.entries_not_in_function += 1,
-                _ => {}
+            match reason {
+                EntryReject::EntryInsideMappedInstruction => rejection_counts.entries_inside_mapped_instruction += 1,
+                EntryReject::EntryInMappedFunction => rejection_counts.entries_in_mapped_function += 1,
+                EntryReject::EntryInRejectedFunction => rejection_counts.entries_in_rejected_function += 1,
+                EntryReject::EntryNotInFunction => rejection_counts.entries_not_in_function += 1,
             }
         }
         let function_rejections = self

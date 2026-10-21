@@ -8,7 +8,7 @@ use rk_ssa::{live_values, prepare, publications, CallFacts, FlagPublication, Pre
 
 #[derive(Clone, Debug, Default)]
 pub struct ContractRequests {
-    pub by_caller: BTreeMap<Addr, std::collections::BTreeSet<(Addr, u16)>>,
+    pub by_caller: BTreeMap<Addr, std::collections::BTreeSet<(Addr, Fields)>>,
 }
 
 pub struct PlanOptions<'a> {
@@ -45,7 +45,7 @@ pub struct PlannedFunction {
     pub settle_calls: BTreeSet<ValueId>,
     pub flag_publish: BTreeMap<ValueId, FlagPublication>,
     pub entry_settle: bool,
-    pub call_masks: BTreeMap<ValueId, (Addr, u16)>,
+    pub call_masks: BTreeMap<ValueId, (Addr, Fields)>,
     pub requests: ContractRequests,
     pub x87: Option<rk_x87::Plan>,
 }
@@ -64,7 +64,7 @@ pub fn plan_function(cg: &CgFunction, opts: &PlanOptions<'_>) -> Result<PlannedF
     for (value, keys) in &publish {
         let mut publication = flag_plan.publication(&ssa, *value, keys);
         if std::env::var_os("RK_NO_DESCRIPTORS").is_some() {
-            publication.eager = publication.eager | publication.descriptor.map_or(Fields::NONE, |d| d.mask);
+            publication.eager |= publication.descriptor.map_or(Fields::NONE, |d| d.mask);
             publication.descriptor = None;
         }
         if let Some(descriptor) = &publication.descriptor {
@@ -110,18 +110,18 @@ pub fn plan_function(cg: &CgFunction, opts: &PlanOptions<'_>) -> Result<PlannedF
         if !ssa.field(key).is_some_and(|field| Fields::FLAGS.contains(field)) {
             continue;
         }
-        let site = ssa.resolve(ssa.args(index as ValueId)[0]);
+        let site = ssa.args(index as ValueId)[0];
         if matches!(ssa.value(site).op, rk_ir::Op::Call { .. } | rk_ir::Op::CallInd) {
             settle_calls.insert(site);
         }
     }
-    let mut reload_masks: BTreeMap<ValueId, u16> = BTreeMap::new();
+    let mut reload_masks: BTreeMap<ValueId, Fields> = BTreeMap::new();
     for (index, value) in ssa.values.iter().enumerate() {
         let id = index as ValueId;
         let rk_ir::Op::StateReload(key) = value.op else { continue };
         let Some(field) = ssa.field(key) else { continue };
-        let site = ssa.resolve(ssa.args(id)[0]);
-        *reload_masks.entry(site).or_default() |= field.bit();
+        let site = ssa.args(id)[0];
+        *reload_masks.entry(site).or_default() |= Fields(field.bit());
     }
     for (value, keys) in &base {
         let Some(state) = ssa.boundary(*value) else { continue };
@@ -129,22 +129,21 @@ pub fn plan_function(cg: &CgFunction, opts: &PlanOptions<'_>) -> Result<PlannedF
             if !keys.contains(&key) {
                 continue;
             }
-            let state_value = ssa.resolve(state_value);
             let rk_ir::Op::StateReload(loaded) = ssa.value(state_value).op else { continue };
             let Some(field) = ssa.field(loaded) else { continue };
-            let site = ssa.resolve(ssa.args(state_value)[0]);
-            *reload_masks.entry(site).or_default() |= field.bit();
+            let site = ssa.args(state_value)[0];
+            *reload_masks.entry(site).or_default() |= Fields(field.bit());
         }
     }
     let mut call_masks = BTreeMap::new();
-    let mut requested: BTreeMap<(Addr, u16), ()> = BTreeMap::new();
+    let mut requested: BTreeMap<(Addr, Fields), ()> = BTreeMap::new();
     for (index, value) in ssa.values.iter().enumerate() {
         let id = index as ValueId;
         let rk_ir::Op::Call { target } = value.op else { continue };
         if !opts.private_targets.contains(&target) {
             continue;
         }
-        let mask = reload_masks.get(&id).copied().unwrap_or(0);
+        let mask = reload_masks.get(&id).copied().unwrap_or_default();
         call_masks.insert(id, (target, mask));
         requested.insert((target, mask), ());
     }
@@ -197,7 +196,7 @@ fn reduce_publications(
                 .loads
                 .iter()
                 .find(|(loaded, _)| loaded == key)
-                .map(|(_, value)| s.resolve(*value))
+                .map(|(_, value)| *value)
         })
         .collect();
     let successors = successors(s);
@@ -291,13 +290,12 @@ fn walk_block(
         let Some(state) = s.boundary(value) else { continue };
         for &(key, state_value) in state {
             let Some(&index) = key_index.get(&key) else { continue };
-            let state_value = s.resolve(state_value);
             match s.value(state_value).op {
                 rk_ir::Op::StateReload(loaded) if loaded == key => {
                     resident[index] = Some(state_value);
                 }
                 rk_ir::Op::StateKeep(loaded) if loaded == key => {
-                    let old = s.resolve(s.args(state_value)[1]);
+                    let old = s.args(state_value)[1];
                     if resident[index] == Some(old) {
                         resident[index] = Some(state_value);
                     }
@@ -307,7 +305,7 @@ fn walk_block(
         }
         let Some(keys) = base.get(&value) else { continue };
         let current: BTreeMap<StateKey, ValueId> =
-            state.iter().map(|&(key, value)| (key, s.resolve(value))).collect();
+            state.iter().copied().collect();
         for key in keys {
             let Some(&state_value) = current.get(key) else { continue };
             let Some(&index) = key_index.get(key) else { continue };

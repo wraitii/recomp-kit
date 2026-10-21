@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use rayon::prelude::*;
+use rk_core::contract::Fields;
 use rk_core::ir::FunctionIr;
 use rk_core::program::Program;
 use rk_core::settings::Settings;
@@ -67,6 +68,12 @@ enum Stage {
     Global,
     Bodies,
     All,
+}
+
+impl Args {
+    fn wants(&self, stage: Stage) -> bool {
+        self.dump.iter().any(|s| *s == stage || *s == Stage::All)
+    }
 }
 
 fn parse_addr(text: &str) -> std::result::Result<Addr, String> {
@@ -181,9 +188,27 @@ struct BodyContext<'a> {
     fault_state: rk_core::settings::FaultState,
     known_entries: &'a BTreeSet<Addr>,
     private_targets: &'a BTreeSet<Addr>,
-    no_masks: BTreeMap<Addr, BTreeSet<u16>>,
-    no_arguments: BTreeMap<Addr, String>,
-    no_modes: BTreeSet<Addr>,
+    private_masks: BTreeMap<Addr, BTreeSet<Fields>>,
+    private_input_arguments: BTreeMap<Addr, String>,
+    known_modes: BTreeSet<Addr>,
+}
+
+impl<'a> BodyContext<'a> {
+    fn emit_context<'b>(
+        &'b self,
+        ir: &'b FunctionIr,
+        private: Option<&'b rk_emit::PrivateEmit>,
+    ) -> rk_emit::EmitContext<'b> {
+        rk_emit::EmitContext {
+            ir,
+            checked_returns: self.checked,
+            private_masks: &self.private_masks,
+            private_input_arguments: &self.private_input_arguments,
+            known_modes: &self.known_modes,
+            known_entries: self.known_entries,
+            private,
+        }
+    }
 }
 
 fn plan_one(ctx: &BodyContext<'_>, ir: &FunctionIr) -> rk_core::Result<rk_plan::PlannedFunction> {
@@ -251,15 +276,7 @@ fn emit_row(
     ir: &FunctionIr,
     planned: &rk_plan::PlannedFunction,
 ) -> BodyRow {
-    let emit_ctx = rk_emit::EmitContext {
-        ir,
-        checked_returns: ctx.checked,
-        private_masks: &ctx.no_masks,
-        private_input_arguments: &ctx.no_arguments,
-        known_modes: &ctx.no_modes,
-        known_entries: ctx.known_entries,
-        private: None,
-    };
+    let emit_ctx = ctx.emit_context(ir, None);
     match rk_emit::emit_body(planned, &emit_ctx) {
         Ok((mut body, emit_report)) => {
             let covered: BTreeSet<Addr> =
@@ -323,7 +340,7 @@ fn build_bodies(
 ) -> Result<(
     Vec<Body>,
     EmitStats,
-    BTreeMap<Addr, BTreeSet<u16>>,
+    BTreeMap<Addr, BTreeSet<Fields>>,
     BTreeMap<Addr, String>,
     BTreeSet<Addr>,
 )> {
@@ -338,7 +355,7 @@ fn build_bodies(
     } else {
         global.private.targets.keys().copied().collect()
     };
-    let ctx = BodyContext {
+    let make_ctx = |private_masks, private_input_arguments, known_modes| BodyContext {
         program,
         facts: global.call_facts(),
         checked: &global.private.checked_returns,
@@ -352,10 +369,11 @@ fn build_bodies(
         fault_state: settings.fault_state,
         known_entries: &known_entries,
         private_targets: &private_targets,
-        no_masks: BTreeMap::new(),
-        no_arguments: BTreeMap::new(),
-        no_modes: BTreeSet::new(),
+        private_masks,
+        private_input_arguments,
+        known_modes,
     };
+    let ctx = make_ctx(BTreeMap::new(), BTreeMap::new(), BTreeSet::new());
     let selected: BTreeSet<Addr> = only.iter().copied().collect();
     let wanted = |addr: Addr| selected.is_empty() || selected.contains(&addr);
     let sources: Vec<(Addr, Option<FunctionIr>)> = match owned {
@@ -425,24 +443,11 @@ fn build_bodies(
         .iter()
         .map(|(&addr, &field)| (addr, field.name().to_string()))
         .collect();
-    let ctx2 = BodyContext {
-        program,
-        facts: global.call_facts(),
-        checked: &global.private.checked_returns,
-        x87_modes: rk_x87::ModeInput::from(&global.x87),
-        x87_options: rk_x87::Options {
-            strict: settings.fault_state == rk_core::settings::FaultState::Exact,
-            convention: settings.msvc_x87_convention,
-            cw_clone: settings.x87_cw_clone,
-            force: x87_mode.into(),
-        },
-        fault_state: settings.fault_state,
-        known_entries: &known_entries,
-        private_targets: &private_targets,
-        no_masks: specialized.masks.clone(),
-        no_arguments: private_arguments,
-        no_modes: global.private.known_modes.clone(),
-    };
+    let ctx2 = make_ctx(
+        specialized.masks.clone(),
+        private_arguments,
+        global.private.known_modes.clone(),
+    );
     let phase2: Vec<(Vec<BodyRow>, Vec<Body>)> = retained
         .into_par_iter()
         .map(|item| -> Result<(Vec<BodyRow>, Vec<Body>)> {
@@ -454,25 +459,17 @@ fn build_bodies(
                     if let Some(layouts) = specialized.layouts.get(&addr) {
                         for layout in layouts {
                             let private = rk_emit::PrivateEmit {
-                                mask: layout.output_mask(),
+                                mask: layout.outputs,
                                 inputs: layout.inputs,
                                 input_argument: layout.input_argument,
                             };
-                            let emit_ctx = rk_emit::EmitContext {
-                                ir: &ir,
-                                checked_returns: ctx2.checked,
-                                private_masks: &ctx2.no_masks,
-                                private_input_arguments: &ctx2.no_arguments,
-                                known_modes: &ctx2.no_modes,
-                                known_entries: ctx2.known_entries,
-                                private: Some(&private),
-                            };
+                            let emit_ctx = ctx2.emit_context(&ir, Some(&private));
                             match rk_emit::emit_body(&planned, &emit_ctx) {
                                 Ok((body, _)) => private_bodies.push(body),
                                 Err(error) => {
                                     bail!(
                                         "private body {addr:08x}/{:04x} emission failed: {error}",
-                                        layout.output_mask()
+                                        layout.outputs.0
                                     );
                                 }
                             }
@@ -493,7 +490,7 @@ fn build_bodies(
         private_bodies.extend(private);
     }
     bodies.sort_by_key(|body| body.addr);
-    private_bodies.sort_by_key(|body| (body.addr, body.private_mask.unwrap_or(0)));
+    private_bodies.sort_by_key(|body| (body.addr, body.private_mask.unwrap_or_default()));
     bodies.extend(private_bodies);
     Ok((
         bodies,
@@ -832,11 +829,7 @@ fn main() -> Result<()> {
     let facts = facts::load(&settings, &program, &analysis)?;
     phases.mark("facts");
     let whole = args.out.is_some() || args.dump.is_empty();
-    let wants_global = whole
-        || args
-            .dump
-            .iter()
-            .any(|s| matches!(s, Stage::Global | Stage::All));
+    let wants_global = whole || args.wants(Stage::Global);
     let ssa = if whole && args.check {
         rk_ssa::sweep(
             &analysis.ir,
@@ -866,11 +859,7 @@ fn main() -> Result<()> {
     };
     phases.mark("x87");
     let only = if whole { &[][..] } else { &args.only[..] };
-    let wants_bodies = whole
-        || args
-            .dump
-            .iter()
-            .any(|s| matches!(s, Stage::Bodies | Stage::All));
+    let wants_bodies = whole || args.wants(Stage::Bodies);
     let owned = (wants_bodies && args.dump.is_empty()).then(|| std::mem::take(&mut analysis.ir));
     let (bodies, emit_stats, private_masks, private_input_arguments, known_modes) = if wants_bodies
     {
@@ -918,46 +907,22 @@ fn main() -> Result<()> {
             bail!("--dump needs at least one --only address, except --dump global");
         }
         let mut out = std::io::stdout().lock();
-        if args
-            .dump
-            .iter()
-            .any(|s| matches!(s, Stage::Program | Stage::All))
-        {
+        if args.wants(Stage::Program) {
             dump_program(&program, &args.only, &mut out)?;
         }
-        if args
-            .dump
-            .iter()
-            .any(|s| matches!(s, Stage::Fir | Stage::All))
-        {
+        if args.wants(Stage::Fir) {
             dump_fir(&program, &analysis, &args.only, &mut out)?;
         }
-        if args
-            .dump
-            .iter()
-            .any(|s| matches!(s, Stage::Ssa | Stage::All))
-        {
+        if args.wants(Stage::Ssa) {
             dump_ssa(&program, &analysis, &args.only, false, &mut out)?;
         }
-        if args
-            .dump
-            .iter()
-            .any(|s| matches!(s, Stage::Prepared | Stage::All))
-        {
+        if args.wants(Stage::Prepared) {
             dump_ssa(&program, &analysis, &args.only, true, &mut out)?;
         }
-        if args
-            .dump
-            .iter()
-            .any(|s| matches!(s, Stage::Global | Stage::All))
-        {
+        if args.wants(Stage::Global) {
             dump_global(&program, &global, &args.only, &mut out)?;
         }
-        if args
-            .dump
-            .iter()
-            .any(|s| matches!(s, Stage::Bodies | Stage::All))
-        {
+        if args.wants(Stage::Bodies) {
             dump_bodies(&program, &translation.bodies, &args.only, &mut out)?;
         }
         out.flush()?;
