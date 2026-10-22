@@ -38,8 +38,7 @@
           "SF",
           "OF"
         ]
-      },
-      "x87": "preserve"
+      }
     },
     "d3d8-create-device": {
       "regs": {
@@ -96,7 +95,7 @@
       "effect": "d3d8-shim",
       "evidence": [
         "dx/d3d8.cpp handlers and D3D8-specific COM lifetime hooks do not invoke guest callbacks; com_ret writes guest EAX, imports_dispatch adjusts ESP, and other GPRs and arithmetic flags retain their guest values. Reads remain conservative.",
-        "dx/d3d8_fpu.h contains the only D3D8 guest CW update; CreateDevice has its own effect. Unsupported methods terminate with named diagnostics."
+        "dx/d3d8_fpu.h contains the only D3D8 guest CW update; only CreateDevice carries a CW effect. Unsupported methods terminate with named diagnostics."
       ]
     }
   ],

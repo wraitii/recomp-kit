@@ -78,8 +78,7 @@
           "EAX",
           "ESP"
         ]
-      },
-      "x87": "preserve"
+      }
     },
     {
       "id": 1,
@@ -358,7 +357,7 @@
     },
     {
       "id": 57,
-      "text": "dx/d3d8_fpu.h contains the only D3D8 guest CW update; CreateDevice has its own effect. Unsupported methods terminate with named diagnostics."
+      "text": "dx/d3d8_fpu.h contains the only D3D8 guest CW update; only CreateDevice carries a CW effect. Unsupported methods terminate with named diagnostics."
     },
     {
       "id": 58,
@@ -3716,15 +3715,15 @@
   "executable_sha256": "78786b4e95fa535bb364154885bc161a92e96dddac18b66716581a8725a9735f",
   "format": "recomp-analysis-facts-v2",
   "inputs": {
-    "catalog_sha256": "259acc87a5f8b22a059bb2b17a027ebb8396f4cd5d36c74879acb8ec28c28207",
+    "catalog_sha256": "95cf2342c88e632880865709993da289184fedb57afca6441f9a77974016b4ad",
     "code_map_sha256": "8a414facd3011147071699ed055ed363ec890d2222c8bbbb160175822b2a453e",
-    "config_sha256": "570fcb62e5be045bf69542b987fa6d4b32120a502c4846e0a1c1957bed9d5c03",
+    "config_sha256": "451ec9a1bc235707c072ad3959b97e514fb0299288a340bba63e2c78e09eb204",
     "method_catalog_sha256": "8c6436db71c0a0dcbda2b3f4beaac484bdc0da277a82682eccf81e324f681f3b",
     "observations": {
       "0c620c8f6bacb21a0c31d2a67ac19d3a9056385e012f6c998b0f648c2c3bb841": "0c620c8f6bacb21a0c31d2a67ac19d3a9056385e012f6c998b0f648c2c3bb841",
       "a13925165356a65c9e0e3ecfadc6d036938938ad0de0510801a8c8642490aa50": "a13925165356a65c9e0e3ecfadc6d036938938ad0de0510801a8c8642490aa50"
     },
-    "producer_sha256": "6acb830d80545f0687b75b54abfd07f6f33301584bdb67615649cdaafea94710"
+    "producer_sha256": "6ee886e868844e79ccee40548977036c500a516e8e7e37f5dc2b51bd7ba1e95e"
   },
   "methods": [
     {
