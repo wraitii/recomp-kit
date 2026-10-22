@@ -1,4 +1,3 @@
-pub mod eval;
 pub mod report;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -27,6 +26,13 @@ const RANK_SWEEP: u16 = 30;
 const RANK_INTERIOR_POINTER: u16 = 20;
 const RANK_SINGLE_POINTER: u16 = 15;
 const BODY_BYTES: Addr = 4096;
+const SHORT_FRAGMENT_MIN: Addr = 4;
+const SHORT_FRAGMENT_MAX: Addr = 8;
+const SHORT_FRAGMENT_REPEAT_LIMIT: usize = 10;
+const DATA_ENTROPY_MIN_BYTES: Addr = 512;
+const DATA_ENTROPY_MAX: f64 = 3.5;
+const DATA_ZERO_RATIO_MIN: f64 = 0.4;
+const MAX_DISCOVERY_PASSES: usize = 8;
 const SWITCH_LOOKBACK: usize = 6;
 const SWITCH_SLOTS: u32 = 4096;
 const SWITCH_REACH: u32 = 0x10000;
@@ -102,6 +108,21 @@ impl Insn {
 
     fn end(&self) -> Addr {
         self.addr + self.size as u32
+    }
+
+    fn signature(&self) -> String {
+        format!(
+            "{}:{:?}:{:?}:{:?}:{}:{:?}:{:?}:{:?}:{}",
+            self.size,
+            self.mnemonic,
+            self.flow,
+            self.ops,
+            self.op_count,
+            self.direct,
+            self.imm4,
+            self.disp4,
+            self.padding
+        )
     }
 
     fn seeds_flow(&self) -> bool {
@@ -193,7 +214,38 @@ pub fn discover_with(
         });
     }
     let details = rk_image::details::load(&settings.exe, program.image.base)?;
-    let mut recovery = Recovery::new(program, details, check);
+    let mut suppressions = Vec::new();
+    let mut rejections = Vec::new();
+    let mut functions = BTreeMap::new();
+    let mut entries = BTreeMap::new();
+    let mut recovery = None;
+    for pass in 1..=MAX_DISCOVERY_PASSES {
+        let mut current = Recovery::new(program, details.clone(), check, suppressions.clone());
+        current.pass = pass;
+        current.function_rejections = rejections;
+        run_discovery(&mut current, settings)?;
+        let (next_functions, next_entries) = current.code_map_rows()?;
+        let (next_functions, next_entries, next_suppressions) =
+            current.discard_fragments(next_functions, next_entries);
+        let done = next_suppressions.is_empty();
+        suppressions.extend(next_suppressions);
+        rejections = std::mem::take(&mut current.function_rejections);
+        functions = next_functions;
+        entries = next_entries;
+        recovery = Some(current);
+        if done {
+            break;
+        }
+    }
+    let mut recovery = recovery.expect("discovery runs at least once");
+    recovery.function_rejections = rejections;
+    let (functions, entries) = recovery.filter(functions, entries)?;
+    let report = recovery.report();
+    let instruction_lengths = recovery.instructions.iter().map(|(&at, ins)| (at, ins.size)).collect();
+    Ok(Discovered { functions, entries, instruction_lengths, report })
+}
+
+fn run_discovery(recovery: &mut Recovery<'_>, settings: &Settings) -> Result<()> {
     recovery.map_lengths()?;
     recovery.initial_seeds();
     recovery.observed_seeds(settings)?;
@@ -201,11 +253,7 @@ pub fn discover_with(
     recovery.pointer_tables();
     recovery.sweep();
     recovery.finish();
-    let (functions, entries) = recovery.code_map_rows()?;
-    let (functions, entries) = recovery.filter(functions, entries)?;
-    let report = recovery.report();
-    let instruction_lengths = recovery.instructions.iter().map(|(&at, ins)| (at, ins.size)).collect();
-    Ok(Discovered { functions, entries, instruction_lengths, report })
+    Ok(())
 }
 
 pub fn merge(program: &mut Program, discovered: &Discovered) -> Result<()> {
@@ -262,16 +310,37 @@ struct Recovery<'a> {
     conflicts: BTreeSet<(Addr, Addr, String)>,
     reloc_slots: BTreeSet<Addr>,
     known_entries: BTreeSet<Addr>,
+    suppressed: Vec<(Addr, Addr)>,
     excluded_bytes: u64,
     kept_functions: usize,
     kept_entries: usize,
-    function_rejections: Vec<(Addr, FunctionReject)>,
+    pass: usize,
+    function_rejections: Vec<(Addr, FunctionReject, usize)>,
     entry_rejections: Vec<(Addr, EntryReject)>,
 }
 
 impl<'a> Recovery<'a> {
-    fn new(program: &'a Program, details: rk_image::details::PeDetails, check: Option<&'a dyn DecodeCheck>) -> Self {
+    fn new(
+        program: &'a Program,
+        details: rk_image::details::PeDetails,
+        check: Option<&'a dyn DecodeCheck>,
+        mut suppressed: Vec<(Addr, Addr)>,
+    ) -> Self {
         let image = &program.image;
+        suppressed.sort_unstable();
+        let mut merged: Vec<(Addr, Addr)> = Vec::new();
+        for (start, end) in suppressed {
+            if start >= end {
+                continue;
+            }
+            if let Some(last) = merged.last_mut() {
+                if start <= last.1 {
+                    last.1 = last.1.max(end);
+                    continue;
+                }
+            }
+            merged.push((start, end));
+        }
         let mut ghidra_spans = Vec::new();
         let mut ghidra_lengths = BTreeMap::new();
         let mut known_mask = vec![0u8; image.size as usize];
@@ -330,9 +399,11 @@ impl<'a> Recovery<'a> {
             conflicts: BTreeSet::new(),
             reloc_slots: image.relocations.iter().map(|r| r.site).collect(),
             known_entries: program.entries.keys().copied().collect(),
+            suppressed: merged,
             excluded_bytes,
             kept_functions: 0,
             kept_entries: 0,
+            pass: 1,
             function_rejections: Vec::new(),
             entry_rejections: Vec::new(),
         };
@@ -360,6 +431,12 @@ impl<'a> Recovery<'a> {
 
     fn at_known_data(&self, at: Addr) -> bool {
         self.offset(at).is_some_and(|off| self.known_mask[off] != 0)
+    }
+
+    fn suppressed_at(&self, at: Addr) -> Option<(Addr, Addr)> {
+        let index = self.suppressed.partition_point(|&(start, _)| start <= at).checked_sub(1)?;
+        let &(start, end) = self.suppressed.get(index)?;
+        (at < end).then_some((start, end))
     }
 
     fn in_data(&self, at: Addr) -> bool {
@@ -443,7 +520,7 @@ impl<'a> Recovery<'a> {
     }
 
     fn seed(&mut self, target: Addr, evidence: &str, rank: u16, root: bool) {
-        if !self.image.is_exec(target) {
+        if !self.image.is_exec(target) || self.suppressed_at(target).is_some() {
             return;
         }
         if root {
@@ -523,6 +600,9 @@ impl<'a> Recovery<'a> {
         }
         let speculative = rank < RANK_TRUSTED;
         let end = ins.end();
+        if (ins.addr..end).any(|at| self.suppressed_at(at).is_some()) {
+            return false;
+        }
         if (ins.addr..end).any(|at| self.at_known_data(at) || self.in_data(at)) {
             return false;
         }
@@ -730,6 +810,9 @@ impl<'a> Recovery<'a> {
             let speculative = rank < RANK_TRUSTED;
             let mut at = at;
             while self.image.is_exec(at) {
+                if self.suppressed_at(at).is_some() {
+                    break;
+                }
                 if self.at_known_data(at) {
                     if let Some(owner) = self.ghidra_owner(at) {
                         if owner != at {
@@ -1055,6 +1138,10 @@ impl<'a> Recovery<'a> {
         for (start, end) in ranges {
             let mut at = start;
             while at < end {
+                if let Some((_, skip)) = self.suppressed_at(at) {
+                    at = skip.min(end);
+                    continue;
+                }
                 if let Some(owner) = self.owner_at(at) {
                     let size = self.instructions.get(&owner).map_or(1, |ins| ins.size as u32);
                     at = owner + size;
@@ -1214,6 +1301,217 @@ impl<'a> Recovery<'a> {
         (at < end).then_some((start, end, owner))
     }
 
+    fn spans_are_padding(&self, owner: Addr, spans: &[Span]) -> bool {
+        if self.mapped_span_at(owner).is_some()
+            || self.seeds.contains_key(&owner)
+            || self.known_entries.contains(&owner)
+        {
+            return false;
+        }
+        let mut any = false;
+        for span in spans {
+            let mut at = span.start;
+            for &length in span.lengths.iter().flatten() {
+                any = true;
+                let Some(ins) = self.instructions.get(&at) else {
+                    return false;
+                };
+                if !ins.padding {
+                    return false;
+                }
+                at += length as u32;
+            }
+        }
+        any
+    }
+
+    fn entropy_data(&self, owner: Addr, spans: &[Span]) -> bool {
+        if self.mapped_span_at(owner).is_some()
+            || self.known_entries.contains(&owner)
+            || self.trusted_seeds.contains(&owner)
+        {
+            return false;
+        }
+        let size: Addr = spans.iter().map(|span| span.size).sum();
+        if size < DATA_ENTROPY_MIN_BYTES {
+            return false;
+        }
+        let mut counts = [0usize; 256];
+        let mut total = 0usize;
+        let mut zeros = 0usize;
+        for span in spans {
+            let Some(bytes) = self.image.bytes(span.start, span.size as usize) else {
+                return false;
+            };
+            for &byte in bytes {
+                counts[byte as usize] += 1;
+                total += 1;
+                zeros += usize::from(byte == 0);
+            }
+        }
+        if total == 0 {
+            return false;
+        }
+        let total = total as f64;
+        let entropy = counts
+            .iter()
+            .filter(|&&count| count > 0)
+            .map(|&count| {
+                let probability = count as f64 / total;
+                -probability * probability.log2()
+            })
+            .sum::<f64>();
+        entropy < DATA_ENTROPY_MAX && zeros as f64 / total > DATA_ZERO_RATIO_MIN
+    }
+
+    fn alignment_call_stub(&self, owner: Addr, spans: &[Span]) -> bool {
+        if self.mapped_span_at(owner).is_some()
+            || self.seeds.contains_key(&owner)
+            || self.known_entries.contains(&owner)
+        {
+            return false;
+        }
+        let [span] = spans else {
+            return false;
+        };
+        let [length] = span.lengths.as_deref().unwrap_or_default() else {
+            return false;
+        };
+        if !(SHORT_FRAGMENT_MIN..=SHORT_FRAGMENT_MAX).contains(&span.size) {
+            return false;
+        }
+        let Some(ins) = self.instructions.get(&span.start) else {
+            return false;
+        };
+        if !ins.is_call() || ins.size != *length {
+            return false;
+        }
+        let end = span.end();
+        if end % 16 != 0 {
+            return false;
+        }
+        let next = self.ghidra_spans.partition_point(|&(start, _, _)| start < end);
+        let Some(&(next_start, _, _)) = self.ghidra_spans.get(next) else {
+            return false;
+        };
+        if next_start != end {
+            return false;
+        }
+        let previous = self.ghidra_spans.partition_point(|&(start, _, _)| start < span.start);
+        let Some(&(_, previous_end, _)) = previous.checked_sub(1).and_then(|index| self.ghidra_spans.get(index)) else {
+            return false;
+        };
+        previous_end == span.start
+    }
+
+    fn short_signature(&self, spans: &[Span]) -> Option<String> {
+        let mut key = String::new();
+        for span in spans {
+            let mut at = span.start;
+            for &length in span.lengths.as_ref()? {
+                let ins = self.instructions.get(&at)?;
+                key.push_str(&ins.signature());
+                key.push(';');
+                at += length as u32;
+            }
+        }
+        Some(key)
+    }
+
+    fn discard_fragments(
+        &mut self,
+        functions: Functions,
+        entries: Entries,
+    ) -> (Functions, Entries, Vec<(Addr, Addr)>) {
+        let mut signatures = BTreeMap::new();
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for (&owner, spans) in &functions {
+            let size: Addr = spans.iter().map(|span| span.size).sum();
+            if !(SHORT_FRAGMENT_MIN..=SHORT_FRAGMENT_MAX).contains(&size) {
+                continue;
+            }
+            if self.mapped_span_at(owner).is_some()
+                || self.seeds.contains_key(&owner)
+                || self.known_entries.contains(&owner)
+            {
+                continue;
+            }
+            let Some(signature) = self.short_signature(spans) else {
+                continue;
+            };
+            *counts.entry(signature.clone()).or_default() += 1;
+            signatures.insert(owner, signature);
+        }
+        let mut kept = BTreeMap::new();
+        let mut discarded = Vec::new();
+        for (&owner, spans) in &functions {
+            let reason = if self.spans_are_padding(owner, spans) {
+                Some(FunctionReject::PaddingOnly)
+            } else if signatures
+                .get(&owner)
+                .is_some_and(|signature| counts.get(signature).copied().unwrap_or(0) > SHORT_FRAGMENT_REPEAT_LIMIT)
+            {
+                Some(FunctionReject::RepeatedShortFragment)
+            } else if self.alignment_call_stub(owner, spans) {
+                Some(FunctionReject::AlignmentCallStub)
+            } else if self.entropy_data(owner, spans) {
+                Some(FunctionReject::DataTable)
+            } else {
+                None
+            };
+            match reason {
+                Some(reason) => {
+                    self.function_rejections.push((owner, reason, self.pass));
+                    discarded.push((owner, spans.clone()));
+                }
+                None => {
+                    kept.insert(owner, spans.clone());
+                }
+            }
+        }
+        let mut suppressions: Vec<(Addr, Addr)> = discarded
+            .iter()
+            .flat_map(|(_, spans)| spans.iter().map(|span| (span.start, span.end())))
+            .collect();
+        let mut discarded_sources = BTreeSet::new();
+        for (_, spans) in &discarded {
+            for span in spans {
+                let mut at = span.start;
+                for &length in span.lengths.iter().flatten() {
+                    discarded_sources.insert(at);
+                    at += length as u32;
+                }
+            }
+        }
+        if !discarded_sources.is_empty() {
+            let orphans: BTreeSet<Addr> = self
+                .seeds
+                .iter()
+                .filter(|(&target, evidence)| {
+                    !evidence.is_empty()
+                        && !self.roots.contains(&target)
+                        && !self.trusted_seeds.contains(&target)
+                        && self.mapped_span_at(target).is_none()
+                        && evidence.iter().all(|item| {
+                            evidence_source(item).is_some_and(|source| discarded_sources.contains(&source))
+                        })
+                })
+                .map(|(&target, _)| target)
+                .collect();
+            for target in orphans {
+                let Some(spans) = functions.get(&target) else {
+                    continue;
+                };
+                if discarded.iter().any(|(owner, _)| *owner == target) {
+                    continue;
+                }
+                self.function_rejections.push((target, FunctionReject::OnlySeededByDiscardedCode, self.pass));
+                suppressions.extend(spans.iter().map(|span| (span.start, span.end())));
+            }
+        }
+        (kept, entries, suppressions)
+    }
+
     fn filter(&mut self, functions: Functions, entries: Entries) -> Result<(Functions, Entries)> {
         let mut discovered_spans: Vec<(Addr, Addr, Addr)> = functions
             .iter()
@@ -1304,7 +1602,7 @@ impl<'a> Recovery<'a> {
                 }
             }
             if let Some(reason) = reason {
-                self.function_rejections.push((owner, reason));
+                self.function_rejections.push((owner, reason, self.pass));
             } else {
                 self.kept_functions += 1;
                 for span in spans {
@@ -1393,7 +1691,7 @@ impl<'a> Recovery<'a> {
             })
             .collect();
         let mut rejection_counts = RejectionCounts::default();
-        for (_, reason) in &self.function_rejections {
+        for (_, reason, _) in &self.function_rejections {
             match reason {
                 FunctionReject::StartsInsideMappedInstruction => rejection_counts.functions_starts_inside_mapped_instruction += 1,
                 FunctionReject::StartsInMappedFunction => rejection_counts.functions_starts_in_mapped_function += 1,
@@ -1403,6 +1701,11 @@ impl<'a> Recovery<'a> {
                 FunctionReject::CallsToDiscoveredInterior => rejection_counts.functions_calls_to_discovered_interior += 1,
                 FunctionReject::CallsToUngroundedTarget => rejection_counts.functions_calls_to_ungrounded_target += 1,
                 FunctionReject::JumpsToDiscoveredInterior => rejection_counts.functions_jumps_to_discovered_interior += 1,
+                FunctionReject::PaddingOnly => rejection_counts.functions_padding_only += 1,
+                FunctionReject::RepeatedShortFragment => rejection_counts.functions_repeated_short_fragment += 1,
+                FunctionReject::OnlySeededByDiscardedCode => rejection_counts.functions_only_seeded_by_discarded_code += 1,
+                FunctionReject::AlignmentCallStub => rejection_counts.functions_alignment_call_stub += 1,
+                FunctionReject::DataTable => rejection_counts.functions_data_table += 1,
             }
         }
         for (_, reason) in &self.entry_rejections {
@@ -1416,7 +1719,7 @@ impl<'a> Recovery<'a> {
         let function_rejections = self
             .function_rejections
             .iter()
-            .map(|&(addr, reason)| FunctionRejection { address: Hex(addr).to_string(), reason })
+            .map(|&(addr, reason, pass)| FunctionRejection { address: Hex(addr).to_string(), reason, pass })
             .collect();
         let entry_rejections = self
             .entry_rejections
@@ -1425,6 +1728,7 @@ impl<'a> Recovery<'a> {
             .collect();
         DiscoveryReport {
             instructions: self.instructions.len(),
+            passes: self.pass,
             entry_seeds: self.seeds.len(),
             excluded_bytes: self.excluded_bytes,
             discovered_functions: self.kept_functions + self.function_rejections.len(),
@@ -1588,4 +1892,8 @@ fn decode_one(bytes: &[u8], at: Addr, folded: Option<u8>) -> Option<Insn> {
 
 fn mnemonic_name(mnemonic: Mnemonic) -> String {
     format!("{mnemonic:?}").to_lowercase()
+}
+
+fn evidence_source(evidence: &str) -> Option<Addr> {
+    parse_hex(evidence.rsplit_once(':')?.1)
 }

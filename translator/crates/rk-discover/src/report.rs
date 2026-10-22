@@ -41,6 +41,11 @@ pub enum FunctionReject {
     CallsToDiscoveredInterior,
     CallsToUngroundedTarget,
     JumpsToDiscoveredInterior,
+    PaddingOnly,
+    RepeatedShortFragment,
+    OnlySeededByDiscardedCode,
+    AlignmentCallStub,
+    DataTable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -56,6 +61,7 @@ pub enum EntryReject {
 pub struct FunctionRejection {
     pub address: String,
     pub reason: FunctionReject,
+    pub pass: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -74,6 +80,11 @@ pub struct RejectionCounts {
     pub functions_calls_to_discovered_interior: usize,
     pub functions_calls_to_ungrounded_target: usize,
     pub functions_jumps_to_discovered_interior: usize,
+    pub functions_padding_only: usize,
+    pub functions_repeated_short_fragment: usize,
+    pub functions_only_seeded_by_discarded_code: usize,
+    pub functions_alignment_call_stub: usize,
+    pub functions_data_table: usize,
     pub entries_inside_mapped_instruction: usize,
     pub entries_in_mapped_function: usize,
     pub entries_in_rejected_function: usize,
@@ -83,6 +94,7 @@ pub struct RejectionCounts {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct DiscoveryReport {
     pub instructions: usize,
+    pub passes: usize,
     pub entry_seeds: usize,
     pub excluded_bytes: u64,
     pub discovered_functions: usize,
