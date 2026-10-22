@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use serde::de::{self, Deserializer};
 use serde::Deserialize;
 
+use crate::contract::{Contract, Field, Fields};
 use crate::{parse_hex, Addr, Error, Result};
 
 pub const INPUT_FORMAT: &str = "recomp-translate-input-v1";
@@ -37,6 +39,7 @@ pub struct Translate {
     pub x87_imports_preserve_pc_rc: bool,
     pub x87_facts: Option<String>,
     pub x87_mode_metadata: Option<String>,
+    pub analysis_facts: Option<String>,
     pub indirect_targets: Option<String>,
     pub discovery_evidence: Option<String>,
     pub call_effects: Vec<CallEffect>,
@@ -64,7 +67,7 @@ pub enum FaultState {
     Exact,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 pub struct CallEffect {
     pub site: Option<Addr>,
     pub import: Option<String>,
@@ -72,22 +75,108 @@ pub struct CallEffect {
     pub x87: Option<X87Effect>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegsEffect {
     Abi,
     Unknown,
+    Contract(Contract),
+}
+
+impl RegsEffect {
+    pub fn contract(self) -> Contract {
+        match self {
+            Self::Abi => Contract::ABI,
+            Self::Unknown => Contract::CONSERVATIVE,
+            Self::Contract(contract) => contract,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawRegsEffect {
+    Named(RawRegsName),
+    Fields(RawRegsFields),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawRegsName {
+    Abi,
+    Unknown,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRegsFields {
+    reads: Vec<String>,
+    kills: Vec<String>,
+    writes: Vec<String>,
+    preserves: Vec<String>,
+}
+
+fn fields(values: Vec<String>, what: &str) -> std::result::Result<Fields, String> {
+    let mut out = Fields::NONE;
+    let mut seen = BTreeSet::new();
+    for name in values {
+        let field = Field::from_name(&name)
+            .ok_or_else(|| format!("unknown register or flag {name:?} in {what}"))?;
+        if !seen.insert(field) {
+            return Err(format!("field {name:?} repeats in {what}"));
+        }
+        out.insert(field);
+    }
+    Ok(out)
+}
+
+impl<'de> Deserialize<'de> for RegsEffect {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match RawRegsEffect::deserialize(deserializer)? {
+            RawRegsEffect::Named(RawRegsName::Abi) => Ok(Self::Abi),
+            RawRegsEffect::Named(RawRegsName::Unknown) => Ok(Self::Unknown),
+            RawRegsEffect::Fields(raw) => {
+                let reads = fields(raw.reads, "reads").map_err(de::Error::custom)?;
+                let kills = fields(raw.kills, "kills").map_err(de::Error::custom)?;
+                let writes = fields(raw.writes, "writes").map_err(de::Error::custom)?;
+                let preserves = fields(raw.preserves, "preserves").map_err(de::Error::custom)?;
+                if !kills.intersection(preserves).is_empty() {
+                    return Err(de::Error::custom("kills and preserves overlap"));
+                }
+                if !kills.difference(writes).is_empty() {
+                    return Err(de::Error::custom("kills must be a subset of writes"));
+                }
+                if !(writes | preserves).contains_all() {
+                    return Err(de::Error::custom(
+                        "every register and flag must be covered by writes or preserves",
+                    ));
+                }
+                Ok(Self::Contract(Contract {
+                    reads,
+                    kills,
+                    writes,
+                    preserves,
+                }))
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
 pub enum X87Effect {
     Named(X87Named),
-    Masked {
-        preserved: u16,
-        known: u16,
-        value: u16,
-    },
+    Masked(X87Mask),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct X87Mask {
+    pub preserved: u16,
+    pub known: u16,
+    pub value: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -102,11 +191,11 @@ impl X87Effect {
         match self {
             X87Effect::Named(X87Named::Preserve) => (0xffff, 0, 0),
             X87Effect::Named(X87Named::Unknown) => (0, 0, 0),
-            X87Effect::Masked {
+            X87Effect::Masked(X87Mask {
                 preserved,
                 known,
                 value,
-            } => (preserved, known, value),
+            }) => (preserved, known, value),
         }
     }
 }
@@ -173,6 +262,7 @@ pub struct Settings {
     pub curated: Curated,
     pub alternate_entries: BTreeSet<Addr>,
     pub configured_entries: BTreeSet<Addr>,
+    pub analysis_facts: Option<PathBuf>,
     pub indirect_targets: Option<PathBuf>,
     pub discovery_evidence: Option<PathBuf>,
     pub native_header: Option<PathBuf>,
@@ -238,9 +328,29 @@ impl Settings {
                 .filter(|_| main)
                 .map(|name| input.dir.join(name))
         };
+        if main
+            && t.analysis_facts.is_some()
+            && (t.indirect_targets.is_some() || !t.call_effects.is_empty())
+        {
+            return Err(Error::input(
+                "translate.analysis_facts cannot be combined with translate.indirect_targets or translate.call_effects",
+            ));
+        }
         let mut sites = BTreeMap::new();
         let mut imports = BTreeMap::new();
         for effect in &t.call_effects {
+            if let Some(X87Effect::Masked(X87Mask {
+                preserved,
+                known,
+                value,
+            })) = effect.x87
+            {
+                if value & !known != 0 || known & preserved != 0 {
+                    return Err(Error::input(
+                        "call_effects x87 masks require value within known and known disjoint from preserved",
+                    ));
+                }
+            }
             match (effect.site, &effect.import) {
                 (Some(site), None) => {
                     if main {
@@ -310,6 +420,7 @@ impl Settings {
                 BTreeSet::new()
             },
             configured_entries,
+            analysis_facts: resolve(&t.analysis_facts),
             indirect_targets: resolve(&t.indirect_targets),
             discovery_evidence: resolve(&t.discovery_evidence),
             native_header: resolve(&t.native.header),

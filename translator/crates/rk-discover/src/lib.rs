@@ -5,6 +5,7 @@ use std::path::Path;
 
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use rk_core::program::{Function, Image, InteriorKind, Program, Span};
+use rk_core::facts::{AnalysisFacts, TransferKind};
 use rk_core::settings::Settings;
 use rayon::prelude::*;
 use rk_core::{parse_hex, Addr, Error, Hex, Result};
@@ -219,6 +220,7 @@ pub fn discover_with(
     let mut functions = BTreeMap::new();
     let mut entries = BTreeMap::new();
     let mut recovery = None;
+    let mut converged = false;
     for pass in 1..=MAX_DISCOVERY_PASSES {
         let mut current = Recovery::new(program, details.clone(), check, suppressions.clone());
         current.pass = pass;
@@ -234,13 +236,15 @@ pub fn discover_with(
         entries = next_entries;
         recovery = Some(current);
         if done {
+            converged = true;
             break;
         }
     }
     let mut recovery = recovery.expect("discovery runs at least once");
     recovery.function_rejections = rejections;
     let (functions, entries) = recovery.filter(functions, entries)?;
-    let report = recovery.report();
+    let mut report = recovery.report();
+    report.converged = converged;
     let instruction_lengths = recovery.instructions.iter().map(|(&at, ins)| (at, ins.size)).collect();
     Ok(Discovered { functions, entries, instruction_lengths, report })
 }
@@ -915,6 +919,16 @@ impl<'a> Recovery<'a> {
 
     fn observed_seeds(&mut self, settings: &Settings) -> Result<()> {
         let mut observed = Vec::new();
+        if let Some(path) = &settings.analysis_facts {
+            let facts = AnalysisFacts::load(path, &settings.sha256)?;
+            for (&site, row) in &facts.sites {
+                if let Some(targets) = &row.targets {
+                    for &target in targets {
+                        observed.push((site, target, row.kind == TransferKind::Call));
+                    }
+                }
+            }
+        }
         if let Some(path) = &settings.indirect_targets {
             for fields in rows(path)?.iter().skip(2) {
                 let [site, kind, targets] = &fields[..] else {
@@ -1729,6 +1743,7 @@ impl<'a> Recovery<'a> {
         DiscoveryReport {
             instructions: self.instructions.len(),
             passes: self.pass,
+            converged: false,
             entry_seeds: self.seeds.len(),
             excluded_bytes: self.excluded_bytes,
             discovered_functions: self.kept_functions + self.function_rejections.len(),

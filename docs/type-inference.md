@@ -18,7 +18,7 @@ PYTHONPATH=tools:tools/recomp python -m typeinf.nominal \
 `nominal.py` combines the existing dispatch proofs with `structure.py` bounds.
 The basis file distinguishes `proof`, `nominal`, `structure` and
 `structure+observed`. Outputs are candidates; installation into the game's
-configured `indirect_targets` file is a separate step. The build fingerprints
+configured `analysis_facts` file is a separate step. The build fingerprints
 that file. Per-function facts and preservation contracts are cached under
 `<build>/typeinf`, keyed by executable, configuration and analysis sources.
 
@@ -63,6 +63,86 @@ rejects unexplained address uses and nearby escaped/indexed addresses, with
 against arbitrary indirect writes to a cell; reducing it weakens the premise.
 Global writer inference remains experimental. Structural-only bounds do not
 depend on this census.
+
+## Analysis facts
+
+`[translate] analysis_facts` names a committed, executable-hash-bound JSON file.
+Translation reads it as-is; it never runs the producer or merges handwritten facts.
+Regenerate explicitly to a candidate, compare it with Git, and retain custom edits
+when adopting the output. From the kit root, using the project's Python environment:
+
+```sh
+python tools/build.py --game ghost-recon --produce-analysis-facts /tmp/facts.json \
+    --analysis-observation /absolute/path/observe.tsv \
+    --analysis-report /tmp/facts-report.json \
+    --analysis-compare games/ghost-recon/metadata/analysis-facts.json
+```
+
+`rk-analysis` reads original bytes, mapped instruction boundaries, optional observation
+files (repeat `--analysis-observation`), and optional shared COM method/effect catalogs.
+Catalogs are either both present or both absent. Comparison is a separate report
+operation; committed targets and effects are never inference inputs.
+
+With `[analysis] guest_bounds`, the producer freezes a byte-derived table census
+before refining SSA and contracts. `assume_constant_vptr_stores` restricts it to
+tables installed by decoded `MOV mem32, immediate32`; this assumes every runtime
+vtable at a bounded site has such an installation. Otherwise all decoded immediate
+and absolute-address references are candidates. Table contents are assumed immutable.
+Every candidate slot must name a successfully lifted function, and every observed
+guest target must be included; shim or unsupported observations block the site.
+`assume_compatible_cleanup` additionally permits interface-prefix compatibility
+narrowing. Cleanup summaries check ESP balance through direct calls and normal/tail
+returns; unknown cleanup never rejects a candidate. They do not prove stack alias
+or escape safety. Dominating earlier calls contribute slot and cleanup requirements
+only when receiver and vptr SSA values both match. Refinement intersects proven bounds
+across passes over the frozen universe, retaining prior bounds for unresolved sites;
+empty intersections or exclusions of observed targets are rejected and reported.
+
+`reuse_discovery_seeds` permits configured `analysis_facts` targets to become
+byte-validated discovery seeds only. `indirect_targets` and `discovery_evidence` are
+cleared, the normalized unique `(site, kind, target)` seed rows are digested, and the
+seed universe remains distinct from proof. Clean runs clear `analysis_facts` too.
+Discovery must converge before the producer emits bounds, and the stable function
+universe digest is reported. Refinement freezes the discovered program and raw table
+census; later contract passes may improve site shapes but cannot add tables.
+Ghost Recon enables `guest_bounds`, `assume_constant_vptr_stores`,
+`assume_compatible_cleanup` and `reuse_discovery_seeds`.
+
+The report separates discovery mode and seed provenance, raw census and install
+counts, summary/blocked-function and shape-rejection counts, open-site reasons with
+examples, per-pass contract/CW coverage, convergence, and target-set comparison as
+same, narrower, wider, incomparable, missing or added independently of effects.
+
+`[analysis] families` selects broad patterns such as `d3d8.dll!*::*`.
+`assert_effect_coverage = true` permits assuming that an observed method's audited
+state effects cover all executions of its site. False emits no such effects.
+`[[analysis.overrides]]` can select `family`, `interface`, `method`, and/or an eight-digit
+hex `site`, and set `enabled` or a named catalog `effect` with `evidence`. Selectors
+combine; site, method, interface, then more-specific family rules take precedence,
+with the later rule breaking ties. The winning rule uses `assert_effect_coverage`
+when `enabled` is omitted and the catalog when `effect` is omitted.
+CLI observation paths replace configured `observations`; config paths are relative to
+the game directory. Mixed, unidentified, or conflicting observations remain unresolved.
+Disabling a policy affects the next explicit generation, not existing committed facts.
+
+V2 retains V1 shared `targets`, `effects`, `sites`, `imports` and `evidence`, and adds
+symbolic `methods` (site key `m`), assumption provenance and input digests. `regs` accepts
+`abi`, `unknown`, or explicit `reads`/`kills`/`writes`/`preserves` lists containing GPR and
+arithmetic-flag names. CW effects use `preserved`/`known`/`value` masks. Method identities
+are not exhaustive target bounds. Only exhaustive guest target sets feed dispatch
+bounds; sites are instruction addresses, `k` defaults to `call`, and `jump` means a tail
+JMP. Explicit unknown effects stay conservative. Rust recomputes function preservation
+and CW summaries. V1 remains supported; legacy `indirect_targets` and `call_effects`
+cannot be combined with `analysis_facts`.
+
+The shared D3D8 slot catalog is generated by `tools/gen_com_interfaces.py` with
+`--reference third_party/wine-d3d8/d3d8.h --bindings dx/d3d8_bindings.json --dll d3d8.dll
+--catalog-output dx/metadata/com-methods.json` (`--check` checks freshness). Audited
+shim effects live in `dx/metadata/method-effects.json`; the current D3D8 handlers
+preserve guest arithmetic flags and GPRs other than EAX/ESP. Reads remain conservative.
+CreateDevice preserves only the CW bits outside `0x0f3f`: its preserve flag and early
+returns prevent a stronger unconditional result. Callback-capable or unaudited methods
+need conservative effects until their complete behavior is established.
 
 ## Shape research solver
 

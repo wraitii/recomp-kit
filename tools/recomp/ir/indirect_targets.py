@@ -15,6 +15,22 @@ def instruction_kind(image, site):
 
 
 def load(settings, program):
+    if getattr(settings, "analysis_targets", None) is not None:
+        facts = {}
+        owners = program.owners()
+        for site, (kind, targets) in sorted(settings.analysis_targets.items()):
+            if site not in owners:
+                raise TranslateError("%s: site %08x is not an instruction start in the code map"
+                                     % (settings.analysis_facts, site))
+            if instruction_kind(program.pe, site) != kind:
+                raise TranslateError("%s: site %08x is not an indirect %s"
+                                     % (settings.analysis_facts, site, kind))
+            for target in targets:
+                if target not in program.functions:
+                    raise TranslateError("%s: site %08x target %08x is not a function entry"
+                                         % (settings.analysis_facts, site, target))
+            facts[site] = (kind, tuple(targets))
+        return facts
     if settings.indirect_targets is None:
         return {}
     path = settings.indirect_targets

@@ -78,6 +78,8 @@ def identity(settings, indirect=True):
         "game_native": tree_digest(settings.game_dir, ("*.c", "*.cpp", "*.h"))}
     if indirect and settings.indirect_targets:
         inputs["indirect_targets"] = hashlib.sha256(settings.indirect_targets.read_bytes()).hexdigest()
+    if indirect and getattr(settings, "analysis_facts", None):
+        inputs["analysis_facts"] = hashlib.sha256(settings.analysis_facts.read_bytes()).hexdigest()
     return {"executable_sha256": settings.sha256.lower(),
             "producer": PRODUCER,
             "producer_sha256": producer_digest(kit),

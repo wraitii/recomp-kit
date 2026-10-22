@@ -3,6 +3,7 @@ from pathlib import Path
 
 from program import TranslateError
 from ir.body import EmissionPolicy
+from ir import analysis_facts
 
 
 class Settings(object):
@@ -40,17 +41,36 @@ class Settings(object):
         self.x87_mode_metadata = self.game_dir / metadata if metadata and not self.module else None
         facts = translate.get("x87_facts")
         self.x87_facts = self.game_dir / facts if facts and not self.module else None
+        analysis = translate.get("analysis_facts")
+        self.analysis_facts = self.game_dir / analysis if analysis and not self.module else None
+        self.analysis_targets = None
         indirect = translate.get("indirect_targets")
         self.indirect_targets = self.game_dir / indirect if indirect and not self.module else None
+        if self.analysis_facts and (self.indirect_targets is not None or translate.get("call_effects")):
+            raise TranslateError("analysis_facts cannot be combined with indirect_targets or call_effects")
         self.allocators = (frozenset(row["function"] for row in translate.get("allocators", ()))
                            if not self.module else frozenset())
         self.call_effects = {"sites": {}, "imports": {}}
-        for row in translate.get("call_effects", []):
-            fields = {field: row[field] for field in ("regs", "x87") if field in row}
-            if "site" in row:
-                self.call_effects["sites"][row["site"]] = fields
-            else:
-                self.call_effects["imports"][row["import"]] = fields
+        if self.analysis_facts:
+            loaded = analysis_facts.load(self.analysis_facts, self.sha256)
+            self.analysis_targets = {site: (row["kind"], row["targets"])
+                                     for site, row in loaded["sites"].items()
+                                     if row["targets"] is not None}
+            for site, row in loaded["sites"].items():
+                if row["effect"] is not None:
+                    if row["kind"] != "call":
+                        raise TranslateError("%s: jump site %08x cannot carry a call effect"
+                                             % (self.analysis_facts, site))
+                    self.call_effects["sites"][site] = row["effect"]
+            self.call_effects["imports"] = {name: row["effect"]
+                                            for name, row in loaded["imports"].items()}
+        else:
+            for row in translate.get("call_effects", []):
+                fields = {field: row[field] for field in ("regs", "x87") if field in row}
+                if "site" in row:
+                    self.call_effects["sites"][row["site"]] = fields
+                else:
+                    self.call_effects["imports"][row["import"]] = fields
         self.x87_imports_preserve_pc_rc = translate["x87_imports_preserve_pc_rc"]
         self.x87_entry_contracts = translate.get("x87_entry_contracts", []) if not self.module else []
         self.call_contracts = translate["call_contracts"]

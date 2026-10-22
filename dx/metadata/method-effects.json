@@ -1,0 +1,113 @@
+{
+  "format": "recomp-method-effects-v1",
+  "effects": {
+    "d3d8-shim": {
+      "regs": {
+        "reads": [
+          "EAX",
+          "ECX",
+          "EDX",
+          "EBX",
+          "ESP",
+          "EBP",
+          "ESI",
+          "EDI",
+          "CF",
+          "PF",
+          "AF",
+          "ZF",
+          "SF",
+          "OF"
+        ],
+        "kills": [],
+        "writes": [
+          "EAX",
+          "ESP"
+        ],
+        "preserves": [
+          "ECX",
+          "EDX",
+          "EBX",
+          "EBP",
+          "ESI",
+          "EDI",
+          "CF",
+          "PF",
+          "AF",
+          "ZF",
+          "SF",
+          "OF"
+        ]
+      },
+      "x87": "preserve"
+    },
+    "d3d8-create-device": {
+      "regs": {
+        "reads": [
+          "EAX",
+          "ECX",
+          "EDX",
+          "EBX",
+          "ESP",
+          "EBP",
+          "ESI",
+          "EDI",
+          "CF",
+          "PF",
+          "AF",
+          "ZF",
+          "SF",
+          "OF"
+        ],
+        "kills": [],
+        "writes": [
+          "EAX",
+          "ESP"
+        ],
+        "preserves": [
+          "ECX",
+          "EDX",
+          "EBX",
+          "EBP",
+          "ESI",
+          "EDI",
+          "CF",
+          "PF",
+          "AF",
+          "ZF",
+          "SF",
+          "OF"
+        ]
+      },
+      "x87": {
+        "preserved": 61632,
+        "known": 0,
+        "value": 0
+      }
+    },
+    "unknown": {
+      "regs": "unknown",
+      "x87": "unknown"
+    }
+  },
+  "families": [
+    {
+      "pattern": "d3d8.dll!*::*",
+      "effect": "d3d8-shim",
+      "evidence": [
+        "dx/d3d8.cpp handlers and D3D8-specific COM lifetime hooks do not invoke guest callbacks; com_ret writes guest EAX, imports_dispatch adjusts ESP, and other GPRs and arithmetic flags retain their guest values. Reads remain conservative.",
+        "dx/d3d8_fpu.h contains the only D3D8 guest CW update; CreateDevice has its own effect. Unsupported methods terminate with named diagnostics."
+      ]
+    }
+  ],
+  "methods": [
+    {
+      "identity": "d3d8.dll!IDirect3D8::CreateDevice",
+      "effect": "d3d8-create-device",
+      "evidence": [
+        "D3D8 CreateDevice changes PC/RC unless D3DCREATE_FPU_PRESERVE; early returns precede the control-word update, so only the fixed bits are asserted"
+      ]
+    }
+  ],
+  "sites": []
+}

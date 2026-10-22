@@ -548,10 +548,17 @@ def _join_indirect(values):
 
 def _domain(lookup, effects, noreturn):
     def regs(value):
-        return IMPORT_ABI if value == "abi" else None
+        if value == "abi":
+            return IMPORT_ABI
+        if isinstance(value, dict):
+            return Contract(frozenset(value["reads"]), frozenset(value["kills"]),
+                            frozenset(value["writes"]), frozenset(value["preserves"]))
+        return None
 
     def override(row):
         value = effects["sites"].get(row.site, {}).get("regs")
+        if value is None and row.import_key is not None:
+            value = effects["imports"].get(row.import_key, {}).get("regs")
         return call_sites.MISSING if value is None else regs(value)
 
     def indirect(row, facts):

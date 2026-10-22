@@ -7,9 +7,10 @@ use rk_core::contract::{Contract, Field, Fields};
 use rk_core::ir::Policy;
 use rk_core::ir::{FunctionIr, OpCode, Space, Varnode};
 use rk_core::program::Program;
+use rk_core::settings::CallEffect as ConfiguredEffect;
 use rk_core::{Addr, Diagnostic, Error, Reason, Result};
 use rk_frontend::Analysis;
-use rk_ir::x87::{MemoryEffect, X87Environment, X87Eager, X87Legacy, X87Op};
+use rk_ir::x87::{MemoryEffect, X87Eager, X87Environment, X87Legacy, X87Op};
 use rk_ir::{CgFunction, Op, Registers, StateKey};
 use rk_x87::Recipes;
 
@@ -162,6 +163,8 @@ pub(crate) fn analyze(
     program: &Program,
     analysis: &Analysis,
     indirect: &BTreeMap<Addr, Vec<Addr>>,
+    indirect_jumps: &BTreeMap<Addr, Vec<Addr>>,
+    effects: &BTreeMap<Addr, ConfiguredEffect>,
     native: &BTreeSet<Addr>,
 ) -> Result<ContractAnalysis> {
     let lanes = LaneMap::get();
@@ -169,14 +172,19 @@ pub(crate) fn analyze(
         .ir
         .par_iter()
         .map(|(&addr, result)| {
-            result.as_ref().ok().map_or((addr, None, false, None), |fir| {
-                let info = stack_info(program, fir);
-                let tail = fir.exits.iter().any(|(&index, _)| {
-                    fir.insns[index as usize].mnemonic.eq_ignore_ascii_case("JMP")
-                        && fir.succ[index as usize].is_empty()
-                });
-                (addr, info.1, tail, tail_target(fir))
-            })
+            result
+                .as_ref()
+                .ok()
+                .map_or((addr, None, false, None), |fir| {
+                    let info = stack_info(program, fir);
+                    let tail = fir.exits.iter().any(|(&index, _)| {
+                        fir.insns[index as usize]
+                            .mnemonic
+                            .eq_ignore_ascii_case("JMP")
+                            && fir.succ[index as usize].is_empty()
+                    });
+                    (addr, info.1, tail, tail_target(fir))
+                })
         })
         .collect();
     let mut raw_pops = BTreeMap::new();
@@ -218,6 +226,7 @@ pub(crate) fn analyze(
                 program,
                 fir,
                 indirect,
+                indirect_jumps,
                 lanes,
                 has_tails.get(&addr).copied().unwrap_or(false),
             ) {
@@ -240,7 +249,9 @@ pub(crate) fn analyze(
             );
         }
     }
-    let graph = CallGraph::build(analysis, indirect, |addr| prepared_map.contains_key(&addr));
+    let graph = CallGraph::build(analysis, indirect, indirect_jumps, |addr| {
+        prepared_map.contains_key(&addr)
+    });
     let mut contracts: BTreeMap<Addr, Contract> = BTreeMap::new();
     for level in &graph.levels {
         let mut components: Vec<&Vec<u32>> = level
@@ -261,6 +272,7 @@ pub(crate) fn analyze(
                     &prepared_map,
                     &contracts,
                     indirect,
+                    effects,
                     &pops,
                     recursive,
                 )
@@ -307,6 +319,7 @@ fn analyze_component(
     prepared: &BTreeMap<Addr, Prepared>,
     contracts: &BTreeMap<Addr, Contract>,
     indirect: &BTreeMap<Addr, Vec<Addr>>,
+    effects: &BTreeMap<Addr, ConfiguredEffect>,
     pop_facts: &BTreeMap<Addr, i32>,
     recursive: bool,
 ) -> Result<BTreeMap<Addr, Contract>> {
@@ -327,6 +340,7 @@ fn analyze_component(
                 let facts = PreservationCallFacts {
                     contracts,
                     indirect,
+                    effects,
                     excluded: &excluded,
                 };
                 preserved_registers(cg, pop_facts, prep.saved, &facts)
@@ -336,12 +350,7 @@ fn analyze_component(
         preserves.insert(addr, preserved);
     }
     solve_component(
-        &addresses,
-        prepared,
-        contracts,
-        indirect,
-        recursive,
-        &preserves,
+        &addresses, prepared, contracts, indirect, effects, recursive, &preserves,
     )
 }
 
@@ -350,6 +359,7 @@ fn solve_component(
     prepared: &BTreeMap<Addr, Prepared>,
     contracts: &BTreeMap<Addr, Contract>,
     indirect: &BTreeMap<Addr, Vec<Addr>>,
+    effects: &BTreeMap<Addr, ConfiguredEffect>,
     recursive: bool,
     preserves: &BTreeMap<Addr, Fields>,
 ) -> Result<BTreeMap<Addr, Contract>> {
@@ -369,6 +379,7 @@ fn solve_component(
                     prep,
                     |target| lookup(&BTreeMap::new(), target),
                     indirect,
+                    effects,
                     None,
                     preserved(addr),
                 ),
@@ -398,6 +409,7 @@ fn solve_component(
                 prep,
                 |target| lookup(&live, target),
                 indirect,
+                effects,
                 None,
                 preserved(addr),
             );
@@ -421,6 +433,7 @@ fn summarize(
     prep: &Prepared,
     lookup: impl Fn(Addr) -> Option<Contract>,
     _indirect: &BTreeMap<Addr, Vec<Addr>>,
+    effects: &BTreeMap<Addr, ConfiguredEffect>,
     _body: Option<&CgFunction>,
     preserves: Fields,
 ) -> Contract {
@@ -428,12 +441,15 @@ fn summarize(
     let mut defs = prep.defs.clone();
     let mut writes = prep.writes;
     for call in &prep.calls {
-        let contract = if call.targets.is_empty() {
-            None
-        } else {
-            let found: Option<Vec<Contract>> =
-                call.targets.iter().map(|&target| lookup(target)).collect();
-            found.map(|found| join_contracts(&found))
+        let effect = effects.get(&call.site).and_then(crate::effect_contract);
+        let contract = match effect {
+            Some(value) => Some(value),
+            None if call.targets.is_empty() => None,
+            None => {
+                let found: Option<Vec<Contract>> =
+                    call.targets.iter().map(|&target| lookup(target)).collect();
+                found.map(|found| join_contracts(&found))
+            }
         };
         match contract {
             Some(contract) => {
@@ -550,9 +566,12 @@ fn prepare(
     program: &Program,
     fir: &FunctionIr,
     indirect: &BTreeMap<Addr, Vec<Addr>>,
+    indirect_jumps: &BTreeMap<Addr, Vec<Addr>>,
     lanes: &LaneMap,
     has_tails: bool,
 ) -> std::result::Result<Prepared, Reason> {
+    let refined = crate::cfg::bounded_tails(fir, indirect_jumps);
+    let fir = refined.as_ref();
     if fir.insns.len() > MAX_INSTRUCTIONS {
         return Err(Reason::Conservative {
             detail: "SSA instruction budget".into(),
@@ -598,7 +617,7 @@ fn prepare(
                     CallSite {
                         index,
                         site: insn.addr,
-                        targets: Vec::new(),
+                        targets: indirect_jumps.get(&insn.addr).cloned().unwrap_or_default(),
                         indirect: true,
                     },
                 );
@@ -615,10 +634,9 @@ fn prepare(
             detail: "control flow is not closed".into(),
         });
     }
-    let cg =
-        rk_ir::lower(fir, &program.image, &Recipes).map_err(|error| Reason::Conservative {
-            detail: format!("lowering failed: {error}"),
-        })?;
+    let cg = rk_ir::lower(fir, &program.image, &Recipes).map_err(|error| Reason::Conservative {
+        detail: format!("lowering failed: {error}"),
+    })?;
     let n = fir.insns.len();
     let mut use_ = vec![0u64; n];
     let mut defs = vec![0u64; n];
@@ -644,10 +662,7 @@ fn prepare(
                     continue;
                 }
                 Op::CallInd => {
-                    let targets = indirect
-                        .get(&(insn.addr + insn.length as Addr))
-                        .cloned()
-                        .unwrap_or_default();
+                    let targets = indirect.get(&insn.addr).cloned().unwrap_or_default();
                     call_rows.entry(insn.insn).or_insert(CallSite {
                         index: insn.insn,
                         site: insn.addr,
@@ -734,7 +749,7 @@ fn prepare(
     let raw = stack_info(program, fir);
     let calls: Vec<CallSite> = call_rows.into_values().collect();
     let entry = cg.index_of(fir.addr).unwrap();
-    let preserve = PRESERVATION && raw.0 && !has_tails && !raw.2.is_empty();
+    let preserve = PRESERVATION && raw.0 && !has_tails && tails.is_empty() && !raw.2.is_empty();
     Ok(Prepared {
         entry,
         order,
@@ -761,14 +776,22 @@ fn preservation_cg(mut cg: CgFunction) -> CgFunction {
             };
             match x87.memory() {
                 Some(MemoryEffect::Read) => {
-                    let address = op.inputs.first().copied().unwrap_or(Varnode::constant(0, 4));
+                    let address = op
+                        .inputs
+                        .first()
+                        .copied()
+                        .unwrap_or(Varnode::constant(0, 4));
                     op.op = Op::P(OpCode::Load);
                     op.output = None;
                     op.inputs = vec![address];
                     ops.push(op);
                 }
                 Some(MemoryEffect::Write) => {
-                    let address = op.inputs.first().copied().unwrap_or(Varnode::constant(0, 4));
+                    let address = op
+                        .inputs
+                        .first()
+                        .copied()
+                        .unwrap_or(Varnode::constant(0, 4));
                     op.op = Op::P(OpCode::Store);
                     op.output = None;
                     op.inputs = vec![address, Varnode::constant(0, x87_store_size(x87))];
@@ -790,8 +813,7 @@ fn x87_store_size(x87: X87Op) -> u32 {
         X87Op::Environment(X87Environment::StoreCw | X87Environment::StoreSw) => 2,
         X87Op::Environment(X87Environment::StoreEnv)
         | X87Op::LegacyEnvironment(X87Legacy::StoreEnv) => 32,
-        X87Op::Environment(X87Environment::Save)
-        | X87Op::LegacyEnvironment(X87Legacy::Save) => 128,
+        X87Op::Environment(X87Environment::Save) | X87Op::LegacyEnvironment(X87Legacy::Save) => 128,
         X87Op::LegacyEnvironment(X87Legacy::BcdStore) => 10,
         _ => 16,
     }
@@ -815,29 +837,25 @@ fn reachable(fir: &FunctionIr, entry: u32) -> Vec<u32> {
 struct PreservationCallFacts<'a> {
     contracts: &'a BTreeMap<Addr, Contract>,
     indirect: &'a BTreeMap<Addr, Vec<Addr>>,
+    effects: &'a BTreeMap<Addr, ConfiguredEffect>,
     excluded: &'a BTreeSet<Addr>,
-}
-
-impl PreservationCallFacts<'_> {
-    fn effect(contract: Contract) -> CallEffect {
-        CallEffect {
-            reads: contract.reads,
-            kills: contract.kills,
-            writes: contract.writes,
-            preserves: contract.preserves,
-        }
-    }
 }
 
 impl CallFacts for PreservationCallFacts<'_> {
     fn call(&self, site: Addr, target: Option<Addr>) -> CallEffect {
+        if let Some(effect) = self.effects.get(&site) {
+            if let Some(contract) = crate::effect_contract(effect) {
+                return crate::call_effect(contract);
+            }
+        }
         let contract = match target {
             Some(target) if !self.excluded.contains(&target) => {
                 self.contracts.get(&target).copied()
             }
             Some(_) => None,
             None => self.indirect.get(&site).and_then(|targets| {
-                if targets.is_empty() || targets.iter().any(|target| self.excluded.contains(target)) {
+                if targets.is_empty() || targets.iter().any(|target| self.excluded.contains(target))
+                {
                     return None;
                 }
                 targets
@@ -847,7 +865,7 @@ impl CallFacts for PreservationCallFacts<'_> {
                     .map(|found| join_contracts(&found))
             }),
         };
-        contract.map_or(CallEffect::CONSERVATIVE, Self::effect)
+        contract.map_or(CallEffect::CONSERVATIVE, crate::call_effect)
     }
 }
 
@@ -879,7 +897,11 @@ impl StackSolver<'_> {
         result
     }
 
-    fn all(&self, args: &[rk_ssa::ValueId], skip: Option<rk_ssa::ValueId>) -> Option<(rk_ssa::ValueId, i32)> {
+    fn all(
+        &self,
+        args: &[rk_ssa::ValueId],
+        skip: Option<rk_ssa::ValueId>,
+    ) -> Option<(rk_ssa::ValueId, i32)> {
         let mut found = None;
         for &arg in args {
             if Some(arg) == skip {
@@ -1144,7 +1166,11 @@ fn stack_info(program: &Program, fir: &FunctionIr) -> (bool, Option<i32>, Fields
     if leave && pushed.contains(Field::Ebp) {
         saved.insert(Field::Ebp);
     }
-    (!pushed.is_empty() && (!popped.is_empty() || leave), pops, saved)
+    (
+        !pushed.is_empty() && (!popped.is_empty() || leave),
+        pops,
+        saved,
+    )
 }
 
 fn flag_free(mnemonic: &str) -> bool {

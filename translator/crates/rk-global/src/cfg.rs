@@ -1,7 +1,33 @@
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rk_core::ir::{FunctionIr, Insn, OpCode};
+use rk_core::Addr;
+
+pub(crate) fn bounded_tails<'a>(
+    fir: &'a FunctionIr,
+    bounds: &BTreeMap<Addr, Vec<Addr>>,
+) -> Cow<'a, FunctionIr> {
+    let mut refined = Cow::Borrowed(fir);
+    for (&index, original) in &fir.exits {
+        let insn = &fir.insns[index as usize];
+        let Some(targets) = bounds.get(&insn.addr) else {
+            continue;
+        };
+        if !original.is_empty()
+            || targets.is_empty()
+            || !insn.mnemonic.eq_ignore_ascii_case("JMP")
+            || !insn.ops.iter().any(|op| op.opcode == OpCode::BranchInd)
+            || targets.iter().any(|&target| fir.index_of(target).is_some())
+        {
+            continue;
+        }
+        let body = refined.to_mut();
+        body.succ[index as usize].clear();
+        body.exits.insert(index, targets.clone());
+    }
+    refined
+}
 
 pub(crate) fn closed(fir: &FunctionIr, tails: &BTreeSet<u32>) -> bool {
     for (index, insn) in fir.insns.iter().enumerate() {

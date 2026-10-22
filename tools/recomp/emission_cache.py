@@ -68,6 +68,8 @@ def identity(settings, *, code_map=True):
         inputs['code_map'] = x87_facts.tree_digest(settings.code_map, ('*',))
     if settings.indirect_targets:
         inputs['indirect_targets'] = hashlib.sha256(settings.indirect_targets.read_bytes()).hexdigest()
+    if getattr(settings, 'analysis_facts', None):
+        inputs['analysis_facts'] = hashlib.sha256(settings.analysis_facts.read_bytes()).hexdigest()
     return x87_facts.digest(inputs)
 
 

@@ -146,6 +146,8 @@ def _domain(summaries, opaque_targets, recursive, call_boundaries, call_effects)
 
     def override(row):
         value = call_effects["sites"].get(row.site, {}).get("x87")
+        if value is None and row.import_key is not None:
+            value = call_effects["imports"].get(row.import_key, {}).get("x87")
         return call_sites.MISSING if value is None else _configured_summary(value)
 
     def indirect(row, facts):

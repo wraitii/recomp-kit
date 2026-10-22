@@ -358,6 +358,45 @@ def translation_input(cfg):
             "curated": stable(cfg["curated"]), "aux_modules": stable(cfg["aux_modules"])}
 
 
+def rust_analysis(build_root):
+    """Build the offline analysis producer and return its executable."""
+    target = Path(build_root) / "recomp/cargo"
+    subprocess.run(["cargo", "build", "--release", "--quiet", "-p", "rk-analysis",
+                    "--manifest-path", str(ROOT / "translator/Cargo.toml"), "--target-dir", str(target)],
+                   check=True)
+    return target / "release" / ("rk-analysis.exe" if os.name == "nt" else "rk-analysis")
+
+
+def analysis_input(cfg):
+    value = translation_input(cfg)
+    value["analysis"] = cfg.get("analysis") or {}
+    return value
+
+
+def write_analysis_input(cfg, build_root):
+    path = Path(build_root) / "recomp/analysis-input.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(analysis_input(cfg), indent=1, sort_keys=True) + "\n"
+    if not path.is_file() or path.read_text() != text:
+        path.write_text(text)
+    return path
+
+
+def run_analysis(args, cfg, build_root):
+    """Generate a fresh facts candidate with the configured discovery policy."""
+    observations = list(args.analysis_observation)
+    command = [str(rust_analysis(build_root)),
+               "--input", str(write_analysis_input(cfg, build_root)),
+               "--out", str(args.produce_analysis_facts.resolve())]
+    for observation in observations:
+        command += ["--observation", str(observation.resolve())]
+    if args.analysis_report:
+        command += ["--report", str(args.analysis_report.resolve())]
+    if args.analysis_compare:
+        command += ["--compare", str(args.analysis_compare.resolve())]
+    subprocess.run(command, cwd=ROOT, check=True)
+
+
 def rust_translator(build_root):
     """Build the Rust translator into the build root and return its executable."""
     target = Path(build_root) / "recomp/cargo"
@@ -400,7 +439,7 @@ def rust_translation_dependencies(cfg, key):
     translate = cfg["translate"]
     digest = hashlib.sha256()
     if key == "main":
-        for name in ("x87_facts", "x87_mode_metadata", "indirect_targets", "discovery_evidence"):
+        for name in ("x87_facts", "x87_mode_metadata", "analysis_facts", "indirect_targets", "discovery_evidence"):
             value = translate.get(name)
             digest.update(name.encode() + b"\0")
             if value:
@@ -699,6 +738,12 @@ def parse_args(argv, system=None):
                         help="Compile out indirect-transfer observation")
     parser.add_argument("--check-call-facts", action="store_true",
                         help="Build with RECOMP_CHECK_CALL_FACTS: abort on indirect calls outside the translator's target facts and on imports that change the x87 control word")
+    parser.add_argument("--produce-analysis-facts", type=Path, metavar="PATH",
+                        help="build/run the offline analysis producer into PATH without merging existing facts")
+    parser.add_argument("--analysis-observation", type=Path, action="append", default=[], metavar="TSV",
+                        help="observation file for --produce-analysis-facts (repeatable; defaults to [analysis] observations)")
+    parser.add_argument("--analysis-report", type=Path, help="producer report for --produce-analysis-facts")
+    parser.add_argument("--analysis-compare", type=Path, help="old facts for a separate comparison report")
     parser.add_argument("--diff-harness", action="store_true",
                         help="Compile the Unicorn diff harness for the translated archive and exit")
     parser.add_argument("--harness-out", type=Path, default=None,
@@ -711,6 +756,11 @@ def parse_args(argv, system=None):
                         help="Android: push the configured game install minus [bundle].exclude before launch")
     parser.add_argument("--console", action="store_true", help="After launching on the device, stream its console")
     args = parser.parse_args(argv)
+    if args.produce_analysis_facts and any((args.regenerate, args.regen_function, args.diff_harness,
+                                          args.function_corpus, args.stub, args.target != "app")):
+        parser.error("--produce-analysis-facts is an isolated offline mode")
+    if not args.produce_analysis_facts and any((args.analysis_observation, args.analysis_report, args.analysis_compare)):
+        parser.error("--analysis-* options require --produce-analysis-facts")
     args.cache_emission = args.cache_emission or not args.no_emission_cache
     if not args.cache_emission and args.regen_function:
         parser.error("--regen-function requires the emission cache")
@@ -787,6 +837,10 @@ def main():
         return
     cfg = game_config.load(args.game_dir, args.build_root)
     cfg["translate_engine"] = args.engine or cfg["translate"].get("engine", "python")
+    if args.produce_analysis_facts:
+        with buildlock.BuildLock(args.build_root.parent, "tools/build.py --produce-analysis-facts"):
+            run_analysis(args, cfg, args.build_root)
+        return
     if args.regen_function and cfg["translate_engine"] == "rust":
         parser.error("--regen-function is not available with the Rust translator")
     if args.regen_function:

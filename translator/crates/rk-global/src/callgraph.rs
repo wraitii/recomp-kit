@@ -16,6 +16,7 @@ impl CallGraph {
     pub fn build(
         analysis: &Analysis,
         indirect: &BTreeMap<Addr, Vec<Addr>>,
+        indirect_jumps: &BTreeMap<Addr, Vec<Addr>>,
         include: impl Fn(Addr) -> bool,
     ) -> Self {
         let nodes: Vec<Addr> = analysis
@@ -47,12 +48,19 @@ impl CallGraph {
                             succ[n].push(target);
                         }
                     } else if op.opcode == OpCode::CallInd {
-                        if let Some(targets) = indirect.get(&ins.end()) {
+                        if let Some(targets) = indirect.get(&ins.addr) {
                             for &target in targets {
                                 if let Some(&target) = index.get(&target) {
                                     succ[n].push(target);
                                 }
                             }
+                        }
+                    }
+                }
+                if let Some(targets) = indirect_jumps.get(&ins.addr) {
+                    for &target in targets {
+                        if let Some(&target) = index.get(&target) {
+                            succ[n].push(target);
                         }
                     }
                 }

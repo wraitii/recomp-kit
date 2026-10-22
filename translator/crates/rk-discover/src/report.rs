@@ -95,6 +95,7 @@ pub struct RejectionCounts {
 pub struct DiscoveryReport {
     pub instructions: usize,
     pub passes: usize,
+    pub converged: bool,
     pub entry_seeds: usize,
     pub excluded_bytes: u64,
     pub discovered_functions: usize,
@@ -116,6 +117,6 @@ pub struct DiscoveryReport {
 
 impl DiscoveryReport {
     pub fn empty() -> Self {
-        Self::default()
+        Self { converged: true, ..Self::default() }
     }
 }

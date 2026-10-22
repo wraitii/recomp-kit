@@ -216,7 +216,7 @@ includes the original mapped spans, entries and tables for comparison.
 `RECOMP_DISCOVERY=<file>` writes the addresses the translation still does not carry,
 with the instruction that named them (`runtime/discovery.h`); naming such a file as
 `discovery_evidence` in `[translate]` seeds the next sweep with them, as
-`indirect_targets` already does. Meanwhile
+`analysis_facts` and legacy `indirect_targets` already do. Meanwhile
 `runtime/interp.cpp` runs what the translation lacks, so a gap costs speed rather
 than correctness.
 

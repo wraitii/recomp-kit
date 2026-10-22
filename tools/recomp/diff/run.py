@@ -867,6 +867,7 @@ def main():
     translate = cfg.get("translate", {})
     facts, boundaries = translate.get("x87_facts"), translate.get("x87_mode_metadata")
     indirect = translate.get("indirect_targets")
+    analysis = translate.get("analysis_facts")
     stamp = build_root / "recomp/translate.stamp"
     run_meta = {
         "format": "recomp-diff-run-v1",
@@ -888,6 +889,7 @@ def main():
         "x87_facts_sha256": sha256_or_none(args.game_dir / facts) if facts else None,
         "x87_boundaries_sha256": sha256_or_none(args.game_dir / boundaries) if boundaries else None,
         "indirect_targets_sha256": sha256_or_none(args.game_dir / indirect) if indirect else None,
+        "analysis_facts_sha256": sha256_or_none(args.game_dir / analysis) if analysis else None,
         "seed": args.seed,
         "iterations": args.iterations,
         "fpu_cws": ["%04x" % cw for cw in args.fpu_cw],

@@ -469,6 +469,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "rk-analysis"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "rayon",
+ "rk-core",
+ "rk-decode",
+ "rk-discover",
+ "rk-frontend",
+ "rk-global",
+ "rk-image",
+ "rk-ir",
+ "rk-sleigh",
+ "rk-ssa",
+ "rk-x87",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "rk-core"
 version = "0.1.0"
 dependencies = [

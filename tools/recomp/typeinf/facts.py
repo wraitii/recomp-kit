@@ -131,6 +131,7 @@ def source_key(settings, *extra):
                      if p.is_file() and p.suffix in (".tsv", ".txt", ".toml")
                      and "__pycache__" not in p.parts)
     for path in (settings.indirect_targets,
+                 getattr(settings, "analysis_facts", None),
                  settings.game_dir / settings.native_header if settings.native_header else None):
         if path is not None and path.is_file():
             files.add(path.resolve())

@@ -505,8 +505,13 @@ def load(game_dir, build_root=None):
         raise ValueError("%s: x87_imports_preserve_pc_rc must be a boolean" % source)
     if translate.get("x87_facts") is not None and (not isinstance(translate["x87_facts"], str) or not translate["x87_facts"]):
         raise ValueError("%s: x87_facts must name a compiler fact file" % source)
+    if translate.get("analysis_facts") is not None and (not isinstance(translate["analysis_facts"], str) or not translate["analysis_facts"]):
+        raise ValueError("%s: analysis_facts must name an analysis fact file" % source)
     if translate.get("indirect_targets") is not None and (not isinstance(translate["indirect_targets"], str) or not translate["indirect_targets"]):
         raise ValueError("%s: indirect_targets must name an indirect target file" % source)
+    if translate.get("analysis_facts") is not None and (translate.get("indirect_targets") is not None
+            or translate.get("call_effects")):
+        raise ValueError("%s: analysis_facts cannot be combined with indirect_targets or call_effects" % source)
     if translate.get("discovery_evidence") is not None and (not isinstance(translate["discovery_evidence"], str) or not translate["discovery_evidence"]):
         raise ValueError("%s: discovery_evidence must name a RECOMP_DISCOVERY file" % source)
     effects = translate.setdefault("call_effects", [])
@@ -538,7 +543,8 @@ def load(game_dir, build_root=None):
             if isinstance(x87, dict):
                 valid = (set(x87) == {"preserved", "known", "value"}
                          and all(type(x87[k]) is int and 0 <= x87[k] <= 0xffff for k in x87)
-                         and not x87["value"] & ~x87["known"])
+                         and not x87["value"] & ~x87["known"]
+                         and not x87["known"] & x87["preserved"])
             else:
                 valid = x87 in ("preserve", "unknown")
             if not valid:

@@ -1,0 +1,25 @@
+[package]
+name = "rk-analysis"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+rk-core.workspace = true
+rk-image.workspace = true
+rk-decode.workspace = true
+rk-discover.workspace = true
+rk-frontend.workspace = true
+rk-ir.workspace = true
+rk-ssa.workspace = true
+rk-global.workspace = true
+rk-sleigh.workspace = true
+rk-x87.workspace = true
+rayon.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

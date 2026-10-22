@@ -1,0 +1,1203 @@
+{
+  "format": "recomp-com-methods-v1",
+  "reference_sha256": "e03c863023535cdb80a7adf97f274da6d74c23ec78e20a3cc2447451c572f89b",
+  "methods": [
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3D8",
+      "method": "QueryInterface",
+      "slot": 0,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3D8",
+      "method": "AddRef",
+      "slot": 4,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3D8",
+      "method": "Release",
+      "slot": 8,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3D8",
+      "method": "RegisterSoftwareDevice",
+      "slot": 12,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3D8",
+      "method": "GetAdapterCount",
+      "slot": 16,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3D8",
+      "method": "GetAdapterIdentifier",
+      "slot": 20,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3D8",
+      "method": "GetAdapterModeCount",
+      "slot": 24,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3D8",
+      "method": "EnumAdapterModes",
+      "slot": 28,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3D8",
+      "method": "GetAdapterDisplayMode",
+      "slot": 32,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3D8",
+      "method": "CheckDeviceType",
+      "slot": 36,
+      "argc": 6
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3D8",
+      "method": "CheckDeviceFormat",
+      "slot": 40,
+      "argc": 7
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3D8",
+      "method": "CheckDeviceMultiSampleType",
+      "slot": 44,
+      "argc": 6
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3D8",
+      "method": "CheckDepthStencilMatch",
+      "slot": 48,
+      "argc": 6
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3D8",
+      "method": "GetDeviceCaps",
+      "slot": 52,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3D8",
+      "method": "GetAdapterMonitor",
+      "slot": 56,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3D8",
+      "method": "CreateDevice",
+      "slot": 60,
+      "argc": 7
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "QueryInterface",
+      "slot": 0,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "AddRef",
+      "slot": 4,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "Release",
+      "slot": 8,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "TestCooperativeLevel",
+      "slot": 12,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetAvailableTextureMem",
+      "slot": 16,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "ResourceManagerDiscardBytes",
+      "slot": 20,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetDirect3D",
+      "slot": 24,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetDeviceCaps",
+      "slot": 28,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetDisplayMode",
+      "slot": 32,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetCreationParameters",
+      "slot": 36,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "SetCursorProperties",
+      "slot": 40,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "SetCursorPosition",
+      "slot": 44,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "ShowCursor",
+      "slot": 48,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "CreateAdditionalSwapChain",
+      "slot": 52,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "Reset",
+      "slot": 56,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "Present",
+      "slot": 60,
+      "argc": 5
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetBackBuffer",
+      "slot": 64,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetRasterStatus",
+      "slot": 68,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "SetGammaRamp",
+      "slot": 72,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetGammaRamp",
+      "slot": 76,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "CreateTexture",
+      "slot": 80,
+      "argc": 8
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "CreateVolumeTexture",
+      "slot": 84,
+      "argc": 9
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "CreateCubeTexture",
+      "slot": 88,
+      "argc": 7
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "CreateVertexBuffer",
+      "slot": 92,
+      "argc": 6
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "CreateIndexBuffer",
+      "slot": 96,
+      "argc": 6
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "CreateRenderTarget",
+      "slot": 100,
+      "argc": 7
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "CreateDepthStencilSurface",
+      "slot": 104,
+      "argc": 6
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "CreateImageSurface",
+      "slot": 108,
+      "argc": 5
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "CopyRects",
+      "slot": 112,
+      "argc": 6
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "UpdateTexture",
+      "slot": 116,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetFrontBuffer",
+      "slot": 120,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "SetRenderTarget",
+      "slot": 124,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetRenderTarget",
+      "slot": 128,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetDepthStencilSurface",
+      "slot": 132,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "BeginScene",
+      "slot": 136,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "EndScene",
+      "slot": 140,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "Clear",
+      "slot": 144,
+      "argc": 7
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "SetTransform",
+      "slot": 148,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetTransform",
+      "slot": 152,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "MultiplyTransform",
+      "slot": 156,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "SetViewport",
+      "slot": 160,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetViewport",
+      "slot": 164,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "SetMaterial",
+      "slot": 168,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetMaterial",
+      "slot": 172,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "SetLight",
+      "slot": 176,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetLight",
+      "slot": 180,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "LightEnable",
+      "slot": 184,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetLightEnable",
+      "slot": 188,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "SetClipPlane",
+      "slot": 192,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetClipPlane",
+      "slot": 196,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "SetRenderState",
+      "slot": 200,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetRenderState",
+      "slot": 204,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "BeginStateBlock",
+      "slot": 208,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "EndStateBlock",
+      "slot": 212,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "ApplyStateBlock",
+      "slot": 216,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "CaptureStateBlock",
+      "slot": 220,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "DeleteStateBlock",
+      "slot": 224,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "CreateStateBlock",
+      "slot": 228,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "SetClipStatus",
+      "slot": 232,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetClipStatus",
+      "slot": 236,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetTexture",
+      "slot": 240,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "SetTexture",
+      "slot": 244,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetTextureStageState",
+      "slot": 248,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "SetTextureStageState",
+      "slot": 252,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "ValidateDevice",
+      "slot": 256,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetInfo",
+      "slot": 260,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "SetPaletteEntries",
+      "slot": 264,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetPaletteEntries",
+      "slot": 268,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "SetCurrentTexturePalette",
+      "slot": 272,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetCurrentTexturePalette",
+      "slot": 276,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "DrawPrimitive",
+      "slot": 280,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "DrawIndexedPrimitive",
+      "slot": 284,
+      "argc": 6
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "DrawPrimitiveUP",
+      "slot": 288,
+      "argc": 5
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "DrawIndexedPrimitiveUP",
+      "slot": 292,
+      "argc": 9
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "ProcessVertices",
+      "slot": 296,
+      "argc": 6
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "CreateVertexShader",
+      "slot": 300,
+      "argc": 5
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "SetVertexShader",
+      "slot": 304,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetVertexShader",
+      "slot": 308,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "DeleteVertexShader",
+      "slot": 312,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "SetVertexShaderConstant",
+      "slot": 316,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetVertexShaderConstant",
+      "slot": 320,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetVertexShaderDeclaration",
+      "slot": 324,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetVertexShaderFunction",
+      "slot": 328,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "SetStreamSource",
+      "slot": 332,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetStreamSource",
+      "slot": 336,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "SetIndices",
+      "slot": 340,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetIndices",
+      "slot": 344,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "CreatePixelShader",
+      "slot": 348,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "SetPixelShader",
+      "slot": 352,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetPixelShader",
+      "slot": 356,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "DeletePixelShader",
+      "slot": 360,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "SetPixelShaderConstant",
+      "slot": 364,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetPixelShaderConstant",
+      "slot": 368,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "GetPixelShaderFunction",
+      "slot": 372,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "DrawRectPatch",
+      "slot": 376,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "DrawTriPatch",
+      "slot": 380,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DDevice8",
+      "method": "DeletePatch",
+      "slot": 384,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DSurface8",
+      "method": "QueryInterface",
+      "slot": 0,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DSurface8",
+      "method": "AddRef",
+      "slot": 4,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DSurface8",
+      "method": "Release",
+      "slot": 8,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DSurface8",
+      "method": "GetDevice",
+      "slot": 12,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DSurface8",
+      "method": "SetPrivateData",
+      "slot": 16,
+      "argc": 5
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DSurface8",
+      "method": "GetPrivateData",
+      "slot": 20,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DSurface8",
+      "method": "FreePrivateData",
+      "slot": 24,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DSurface8",
+      "method": "GetContainer",
+      "slot": 28,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DSurface8",
+      "method": "GetDesc",
+      "slot": 32,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DSurface8",
+      "method": "LockRect",
+      "slot": 36,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DSurface8",
+      "method": "UnlockRect",
+      "slot": 40,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DTexture8",
+      "method": "QueryInterface",
+      "slot": 0,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DTexture8",
+      "method": "AddRef",
+      "slot": 4,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DTexture8",
+      "method": "Release",
+      "slot": 8,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DTexture8",
+      "method": "GetDevice",
+      "slot": 12,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DTexture8",
+      "method": "SetPrivateData",
+      "slot": 16,
+      "argc": 5
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DTexture8",
+      "method": "GetPrivateData",
+      "slot": 20,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DTexture8",
+      "method": "FreePrivateData",
+      "slot": 24,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DTexture8",
+      "method": "SetPriority",
+      "slot": 28,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DTexture8",
+      "method": "GetPriority",
+      "slot": 32,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DTexture8",
+      "method": "PreLoad",
+      "slot": 36,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DTexture8",
+      "method": "GetType",
+      "slot": 40,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DTexture8",
+      "method": "SetLOD",
+      "slot": 44,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DTexture8",
+      "method": "GetLOD",
+      "slot": 48,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DTexture8",
+      "method": "GetLevelCount",
+      "slot": 52,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DTexture8",
+      "method": "GetLevelDesc",
+      "slot": 56,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DTexture8",
+      "method": "GetSurfaceLevel",
+      "slot": 60,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DTexture8",
+      "method": "LockRect",
+      "slot": 64,
+      "argc": 5
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DTexture8",
+      "method": "UnlockRect",
+      "slot": 68,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DTexture8",
+      "method": "AddDirtyRect",
+      "slot": 72,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DVertexBuffer8",
+      "method": "QueryInterface",
+      "slot": 0,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DVertexBuffer8",
+      "method": "AddRef",
+      "slot": 4,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DVertexBuffer8",
+      "method": "Release",
+      "slot": 8,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DVertexBuffer8",
+      "method": "GetDevice",
+      "slot": 12,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DVertexBuffer8",
+      "method": "SetPrivateData",
+      "slot": 16,
+      "argc": 5
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DVertexBuffer8",
+      "method": "GetPrivateData",
+      "slot": 20,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DVertexBuffer8",
+      "method": "FreePrivateData",
+      "slot": 24,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DVertexBuffer8",
+      "method": "SetPriority",
+      "slot": 28,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DVertexBuffer8",
+      "method": "GetPriority",
+      "slot": 32,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DVertexBuffer8",
+      "method": "PreLoad",
+      "slot": 36,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DVertexBuffer8",
+      "method": "GetType",
+      "slot": 40,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DVertexBuffer8",
+      "method": "Lock",
+      "slot": 44,
+      "argc": 5
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DVertexBuffer8",
+      "method": "Unlock",
+      "slot": 48,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DVertexBuffer8",
+      "method": "GetDesc",
+      "slot": 52,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DIndexBuffer8",
+      "method": "QueryInterface",
+      "slot": 0,
+      "argc": 3
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DIndexBuffer8",
+      "method": "AddRef",
+      "slot": 4,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DIndexBuffer8",
+      "method": "Release",
+      "slot": 8,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DIndexBuffer8",
+      "method": "GetDevice",
+      "slot": 12,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DIndexBuffer8",
+      "method": "SetPrivateData",
+      "slot": 16,
+      "argc": 5
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DIndexBuffer8",
+      "method": "GetPrivateData",
+      "slot": 20,
+      "argc": 4
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DIndexBuffer8",
+      "method": "FreePrivateData",
+      "slot": 24,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DIndexBuffer8",
+      "method": "SetPriority",
+      "slot": 28,
+      "argc": 2
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DIndexBuffer8",
+      "method": "GetPriority",
+      "slot": 32,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DIndexBuffer8",
+      "method": "PreLoad",
+      "slot": 36,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DIndexBuffer8",
+      "method": "GetType",
+      "slot": 40,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DIndexBuffer8",
+      "method": "Lock",
+      "slot": 44,
+      "argc": 5
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DIndexBuffer8",
+      "method": "Unlock",
+      "slot": 48,
+      "argc": 1
+    },
+    {
+      "dll": "d3d8.dll",
+      "interface": "IDirect3DIndexBuffer8",
+      "method": "GetDesc",
+      "slot": 52,
+      "argc": 2
+    }
+  ]
+}

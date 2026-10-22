@@ -1,5 +1,6 @@
 pub mod contract;
 pub mod diag;
+pub mod facts;
 pub mod ir;
 pub mod lookup;
 pub mod program;

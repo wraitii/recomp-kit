@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rk_core::ir::{FunctionIr, OpCode, Space, Varnode};
+use rk_core::settings::{CallEffect as ConfiguredEffect, X87Effect};
 use rk_core::{Addr, Lookup};
 use rk_frontend::Analysis;
 
@@ -93,6 +94,7 @@ struct ModePrepared {
     calls: Vec<ModeCall>,
     returns: Vec<u32>,
     x87_count: u32,
+    jumps_used: usize,
 }
 
 pub(crate) struct ModeAnalysis {
@@ -101,11 +103,14 @@ pub(crate) struct ModeAnalysis {
     pub prepared: BTreeSet<Addr>,
     pub calls: BTreeSet<Addr>,
     pub sccs: usize,
+    pub jump_bounds_consumed: usize,
 }
 
 pub(crate) fn analyze(
     analysis: &Analysis,
     indirect: &BTreeMap<Addr, Vec<Addr>>,
+    indirect_jumps: &BTreeMap<Addr, Vec<Addr>>,
+    effects: &BTreeMap<Addr, ConfiguredEffect>,
     noreturn: &BTreeSet<Addr>,
     opaque: &BTreeSet<Addr>,
 ) -> ModeAnalysis {
@@ -117,11 +122,14 @@ pub(crate) fn analyze(
             if opaque.contains(&addr) {
                 return None;
             }
-            prepare(fir, indirect).map(|p| (addr, p))
+            prepare(fir, indirect, indirect_jumps).map(|p| (addr, p))
         })
         .collect();
+    let jump_bounds_consumed = prepared.iter().map(|(_, body)| body.jumps_used).sum();
     let prepared: BTreeMap<Addr, ModePrepared> = prepared.into_iter().collect();
-    let graph = CallGraph::build(analysis, indirect, |addr| prepared.contains_key(&addr));
+    let graph = CallGraph::build(analysis, indirect, indirect_jumps, |addr| {
+        prepared.contains_key(&addr)
+    });
     let mut summaries: BTreeMap<Addr, ReturnSummary> = BTreeMap::new();
     let mut site_facts: BTreeMap<Addr, BTreeMap<u32, Fact>> = BTreeMap::new();
     for &addr in noreturn {
@@ -157,6 +165,7 @@ pub(crate) fn analyze(
             let (summary, facts) = run(
                 prep,
                 &summaries,
+                effects,
                 root,
                 recursive.then_some(&recursive_targets),
             );
@@ -221,6 +230,7 @@ pub(crate) fn analyze(
         prepared: prepared_addresses,
         calls,
         sccs,
+        jump_bounds_consumed,
     }
 }
 
@@ -248,7 +258,10 @@ fn key_of(
     match defs.get(&varnode).filter(|_| depth > 0) {
         Some((opcode, inputs)) => AddressKey::Op(
             *opcode,
-            inputs.iter().map(|input| key_of(*input, defs, depth - 1)).collect(),
+            inputs
+                .iter()
+                .map(|input| key_of(*input, defs, depth - 1))
+                .collect(),
         ),
         None => AddressKey::Leaf(varnode),
     }
@@ -277,7 +290,11 @@ fn control_word() -> Option<Varnode> {
     rk_ir::Registers::get().register("FPUControlWord")
 }
 
-fn traces_to(varnode: Varnode, target: Varnode, defs: &BTreeMap<Varnode, (OpCode, Vec<Varnode>)>) -> bool {
+fn traces_to(
+    varnode: Varnode,
+    target: Varnode,
+    defs: &BTreeMap<Varnode, (OpCode, Vec<Varnode>)>,
+) -> bool {
     let mut value = varnode;
     for _ in 0..8 {
         if value == target {
@@ -327,12 +344,20 @@ fn load_keys(insn: &rk_core::ir::Insn) -> Vec<LoadKey> {
             continue;
         }
         let Some(loaded) = op.output else { continue };
-        let address = op.inputs.first().copied().unwrap_or(Varnode::constant(0, 0));
+        let address = op
+            .inputs
+            .first()
+            .copied()
+            .unwrap_or(Varnode::constant(0, 0));
         if control_word().is_none_or(|cw| {
-            !insn
-                .ops
-                .iter()
-                .any(|candidate| candidate.output == Some(cw) && traces_to(candidate.inputs.first().copied().unwrap_or(loaded), loaded, &defs))
+            !insn.ops.iter().any(|candidate| {
+                candidate.output == Some(cw)
+                    && traces_to(
+                        candidate.inputs.first().copied().unwrap_or(loaded),
+                        loaded,
+                        &defs,
+                    )
+            })
         }) {
             continue;
         }
@@ -365,7 +390,8 @@ fn saved_restores(
                     break;
                 }
                 let prev = previous[0];
-                let some_stores = stores[prev as usize].get_or_insert_with(|| store_keys(&fir.insns[prev as usize]));
+                let some_stores = stores[prev as usize]
+                    .get_or_insert_with(|| store_keys(&fir.insns[prev as usize]));
                 let writes_key = fir.insns[prev as usize].ops.iter().any(|op| {
                     op.output.is_some_and(|output| {
                         output.space == Space::Register && key_regs.contains(&output)
@@ -374,16 +400,26 @@ fn saved_restores(
                 if writes_key {
                     break;
                 }
-                if let Some((_, _, true)) = some_stores.iter().find(|(candidate, _, _)| *candidate == key) {
+                if let Some((_, _, true)) = some_stores
+                    .iter()
+                    .find(|(candidate, _, _)| *candidate == key)
+                {
                     found = Some(prev);
                     break;
                 }
-                if some_stores.iter().any(|(candidate, _, _)| *candidate == key) {
+                if some_stores
+                    .iter()
+                    .any(|(candidate, _, _)| *candidate == key)
+                {
                     break;
                 }
                 if fir.insns[prev as usize].ops.iter().any(|op| {
-                    matches!(op.opcode, OpCode::Call | OpCode::CallInd | OpCode::CallOther)
-                }) || roots.contains(&prev) {
+                    matches!(
+                        op.opcode,
+                        OpCode::Call | OpCode::CallInd | OpCode::CallOther
+                    )
+                }) || roots.contains(&prev)
+                {
                     break;
                 }
                 cur = prev;
@@ -396,12 +432,19 @@ fn saved_restores(
     restores
 }
 
-fn prepare(fir: &FunctionIr, indirect: &BTreeMap<Addr, Vec<Addr>>) -> Option<ModePrepared> {
+fn prepare(
+    fir: &FunctionIr,
+    indirect: &BTreeMap<Addr, Vec<Addr>>,
+    indirect_jumps: &BTreeMap<Addr, Vec<Addr>>,
+) -> Option<ModePrepared> {
+    let refined = crate::cfg::bounded_tails(fir, indirect_jumps);
+    let fir = refined.as_ref();
     if fir.insns.is_empty() {
         return None;
     }
     let mut tails = BTreeSet::new();
     let mut rows: BTreeMap<u32, ModeCall> = BTreeMap::new();
+    let mut jumps_used = 0;
     for (&index, targets) in &fir.exits {
         let insn = &fir.insns[index as usize];
         let mnemonic = mnemonic(insn);
@@ -412,13 +455,11 @@ fn prepare(fir: &FunctionIr, indirect: &BTreeMap<Addr, Vec<Addr>>) -> Option<Mod
         }
         if indirect_jump {
             tails.insert(index);
-            rows.insert(
-                index,
-                ModeCall {
-                    index,
-                    targets: Vec::new(),
-                },
-            );
+            let targets = indirect_jumps.get(&insn.addr).cloned().unwrap_or_default();
+            if !targets.is_empty() {
+                jumps_used += 1;
+            }
+            rows.insert(index, ModeCall { index, targets });
         } else if targets.len() == 1 {
             tails.insert(index);
             rows.insert(
@@ -524,6 +565,7 @@ fn prepare(fir: &FunctionIr, indirect: &BTreeMap<Addr, Vec<Addr>>) -> Option<Mod
         calls,
         returns,
         x87_count,
+        jumps_used,
     })
 }
 
@@ -537,7 +579,7 @@ fn direct_targets(insn: &rk_core::ir::Insn, indirect: &BTreeMap<Addr, Vec<Addr>>
             }
         }
         if op.opcode == OpCode::CallInd {
-            return indirect.get(&insn.end()).cloned().unwrap_or_default();
+            return indirect.get(&insn.addr).cloned().unwrap_or_default();
         }
     }
     Vec::new()
@@ -546,6 +588,7 @@ fn direct_targets(insn: &rk_core::ir::Insn, indirect: &BTreeMap<Addr, Vec<Addr>>
 fn run(
     prep: &ModePrepared,
     summaries: &BTreeMap<Addr, ReturnSummary>,
+    effects: &BTreeMap<Addr, ConfiguredEffect>,
     root: u32,
     recursive: Option<&BTreeSet<Addr>>,
 ) -> (ReturnSummary, BTreeMap<u32, Fact>) {
@@ -574,7 +617,7 @@ fn run(
         }
         incoming.insert(index, state);
         if let Some(call) = call_of.get(&index) {
-            let summary = call_summary(call, summaries, recursive);
+            let summary = call_summary(prep, call, summaries, effects, recursive);
             state = apply_summary(state, summary);
         }
         match prep.effects[index as usize] {
@@ -607,10 +650,25 @@ fn run(
 }
 
 fn call_summary(
+    prep: &ModePrepared,
     call: &ModeCall,
     summaries: &BTreeMap<Addr, ReturnSummary>,
+    effects: &BTreeMap<Addr, ConfiguredEffect>,
     recursive: Option<&BTreeSet<Addr>>,
 ) -> Option<ReturnSummary> {
+    if let Some(effect) = effects.get(&prep.sites[call.index as usize]) {
+        if let Some(x87) = effect.x87 {
+            return match x87 {
+                X87Effect::Named(rk_core::settings::X87Named::Preserve) => Some(PRESERVE),
+                X87Effect::Named(rk_core::settings::X87Named::Unknown) => None,
+                X87Effect::Masked(mask) => Some(ReturnSummary {
+                    preserved: mask.preserved,
+                    known: mask.known,
+                    value: mask.value,
+                }),
+            };
+        }
+    }
     if call.targets.is_empty() {
         return None;
     }
@@ -698,8 +756,10 @@ fn mode_leaf(prep: &ModePrepared) -> bool {
     prep.x87_count > 0
         && !prep.returns.is_empty()
         && prep.calls.is_empty()
-        && prep
-            .order
-            .iter()
-            .all(|&index| matches!(prep.effects[index as usize], Effect::Keep | Effect::Restore(_)))
+        && prep.order.iter().all(|&index| {
+            matches!(
+                prep.effects[index as usize],
+                Effect::Keep | Effect::Restore(_)
+            )
+        })
 }

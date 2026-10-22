@@ -45,7 +45,19 @@ fields! {
     Of => "OF",
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+const fn fields_bits(fields: &[Field]) -> Fields {
+    let mut bits = 0u16;
+    let mut index = 0;
+    while index < fields.len() {
+        bits |= 1 << fields[index] as u8;
+        index += 1;
+    }
+    Fields(bits)
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub struct Fields(pub u16);
 
 impl Fields {
@@ -70,6 +82,10 @@ impl Fields {
         Fields(self.0 & !other.0 & Fields::ALL.0)
     }
 
+    pub fn contains_all(self) -> bool {
+        self.0 == Fields::ALL.0
+    }
+
     pub fn insert(&mut self, field: Field) {
         self.0 |= field.bit();
     }
@@ -81,7 +97,8 @@ impl Fields {
 
 impl FromIterator<Field> for Fields {
     fn from_iter<I: IntoIterator<Item = Field>>(iter: I) -> Self {
-        iter.into_iter().fold(Fields::NONE, |fields, field| fields | Fields(field.bit()))
+        iter.into_iter()
+            .fold(Fields::NONE, |fields, field| fields | Fields(field.bit()))
     }
 }
 
@@ -126,5 +143,23 @@ impl Contract {
         kills: Fields::NONE,
         writes: Fields::ALL,
         preserves: Fields::NONE,
+    };
+
+    pub const ABI: Contract = Contract {
+        reads: Fields::ALL,
+        kills: Fields::NONE,
+        writes: fields_bits(&[
+            Field::Eax,
+            Field::Ecx,
+            Field::Edx,
+            Field::Esp,
+            Field::Cf,
+            Field::Pf,
+            Field::Af,
+            Field::Zf,
+            Field::Sf,
+            Field::Of,
+        ]),
+        preserves: fields_bits(&[Field::Ebx, Field::Ebp, Field::Esi, Field::Edi]),
     };
 }
