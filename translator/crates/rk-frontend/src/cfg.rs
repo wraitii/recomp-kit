@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use rk_core::ir::{FunctionIr, Insn, SehEffect};
+use rk_core::ir::{FunctionIr, Insn, OpCode, SehEffect, Space};
 use rk_core::program::Program;
 use rk_core::{Addr, Diagnostic, Result};
 use rk_decode::{branch_target, gpr32, imm, DecodedInsn, Decoder, OperandKind, JCC};
@@ -11,25 +11,15 @@ use crate::seh::{
     seh_restore_sites, MSVC_EH3_FRAME_LEN,
 };
 use crate::tables::{recover_tables, table_jumps};
-use crate::{R_EAX, R_EBP, R_ECX, R_EDX, R_ESP};
+use crate::{R_EBP, R_ESP};
 
 const TERMINATORS: [&str; 2] = ["RET", "JMP"];
-const READONLY: [&str; 17] = [
-    "CMP", "TEST", "PUSH", "CALL", "JMP", "RET", "NOP", "WAIT", "PAUSE", "CLC", "STC",
-    "CMC", "CLD", "STD", "SAHF", "CLI", "STI",
-];
-const DEST_WRITE: [&str; 38] = [
-    "MOV", "MOVZX", "MOVSX", "LEA", "POP", "ADD", "ADC", "SUB", "SBB", "AND", "OR",
-    "XOR", "INC", "DEC", "NEG", "NOT", "SHL", "SHR", "SAR", "ROL", "ROR", "RCL", "RCR",
-    "SHLD", "SHRD", "BSWAP", "BSF", "BSR", "BTS", "BTR", "BTC", "IMUL", "PUSHAD",
-    "PUSHFD", "PUSHF", "POPFD", "POPF", "LEAVE",
-];
-
 #[derive(Clone)]
 pub(crate) struct RawFunction {
     pub(crate) addr: Addr,
     pub(crate) decoded: Vec<DecodedInsn>,
     pub(crate) insns: Vec<Insn>,
+    register_writes: Vec<Option<BTreeSet<u8>>>,
     pub(crate) index: BTreeMap<Addr, u32>,
     pub(crate) contiguous: Vec<bool>,
     pub(crate) fallthrough: Vec<Addr>,
@@ -198,7 +188,7 @@ impl RawFunction {
             {
                 continue;
             }
-            let out = self.transfer(ins, state);
+            let out = self.transfer(index, state);
             if ins.mnemonic == "JMP" && self.branch_target(index).is_none() {
                 if !unknown_indirect_seen {
                     for j in 0..self.decoded.len() as u32 {
@@ -254,46 +244,18 @@ impl RawFunction {
         }
     }
 
-    fn transfer(&self, ins: &DecodedInsn, state: ReturnState) -> ReturnState {
+    fn transfer(&self, index: usize, state: ReturnState) -> ReturnState {
+        let ins = &self.decoded[index];
         let m = ins.mnemonic.as_str();
-        let mut saved = state.saved.clone();
-        let mut writes: BTreeSet<u8> = BTreeSet::new();
-        let ops = &ins.operands;
-        if READONLY.contains(&m) || JCC.contains(&m) || m.starts_with('F') {
-            if m == "FNSTSW" || m == "FSTSW" {
-                writes.insert(R_EAX);
-            }
-        } else if DEST_WRITE.contains(&m) || m.starts_with("SET") || m.starts_with("CMOV") {
-            if let Some(reg) = ops.first().and_then(gpr32) {
-                writes.insert(reg);
-            }
-        } else if matches!(m, "XCHG" | "XADD" | "CMPXCHG") {
-            for reg in ops.iter().filter_map(gpr32) {
-                writes.insert(reg);
-            }
-            if m == "CMPXCHG" {
-                writes.insert(R_EAX);
-            }
-        } else if matches!(m, "PUSHAD" | "PUSHFD" | "PUSHF" | "POPFD" | "POPF") {
-            writes.insert(R_ESP);
-        } else if m == "LEAVE" {
-            writes.extend([R_ESP, R_EBP]);
-        } else if matches!(m, "MUL" | "DIV" | "IDIV" | "RDTSC") {
-            writes.extend([R_EAX, R_EDX]);
-        } else if matches!(m, "CDQ" | "CWD") {
-            writes.insert(R_EDX);
-        } else if matches!(m, "CBW" | "CWDE" | "LAHF" | "XLAT") {
-            writes.insert(R_EAX);
-        } else {
+        if m == "CALL" {
             return ReturnState::unknown();
         }
-        if m == "IMUL" && ops.len() == 1 {
-            writes.extend([R_EAX, R_EDX]);
-        }
-        if m.starts_with("LOOP") {
-            writes.insert(R_ECX);
-        }
-        for reg in &writes {
+        let Some(writes) = &self.register_writes[index] else {
+            return ReturnState::unknown();
+        };
+        let mut saved = state.saved.clone();
+        let ops = &ins.operands;
+        for reg in writes {
             saved.remove(reg);
         }
         if m == "POP" && state.delta == Some(0) {
@@ -540,9 +502,24 @@ pub(crate) fn build_raw(
     if !decoded.iter().any(|ins| ins.addr == addr) {
         return Err(Diagnostic::error(addr, rk_core::Reason::EntryNotInstructionBoundary));
     }
+    let gprs: Vec<(u8, u64, u32)> = lifter.registers()
+        .filter_map(|(name, offset, size)| {
+            rk_decode::REG32.iter().position(|&reg| reg == name)
+                .map(|index| (index as u8, offset, size))
+        }).collect();
+    let mut register_writes = Vec::with_capacity(decoded.len());
     let mut insns = Vec::with_capacity(decoded.len());
     for ins in &decoded {
         let lifted = lifter.lift(ins.addr, &ins.raw[..ins.length as usize])?;
+        register_writes.push(if lifted.ops.iter().any(|op| matches!(op.opcode, OpCode::CallOther | OpCode::Unknown)) {
+            None
+        } else {
+            Some(lifted.ops.iter().filter_map(|op| op.output)
+                .filter(|v| v.space == Space::Register)
+                .flat_map(|v| gprs.iter().filter_map(move |&(reg, offset, size)| {
+                    (v.offset < offset + size as u64 && offset < v.offset + v.size as u64).then_some(reg)
+                })).collect())
+        });
         insns.push(Insn {
             addr: ins.addr,
             length: lifted.length,
@@ -565,6 +542,7 @@ pub(crate) fn build_raw(
         addr,
         decoded,
         insns,
+        register_writes,
         index: BTreeMap::new(),
         contiguous,
         fallthrough: Vec::new(),
