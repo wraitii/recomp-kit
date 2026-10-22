@@ -1,3 +1,9 @@
+//! Per-function planning between SSA and C. For each boundary it decides which guest state lanes to
+//! publish (skipping those already resident), which values stay live and where lazy flag
+//! descriptors settle. It also chooses what hook-guarded calls republish and which output fields
+//! each direct private-contract call needs. It then attaches the x87 plan. `PlannedFunction` holds
+//! every decision that `rk-emit` prints.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use rk_core::contract::Fields;

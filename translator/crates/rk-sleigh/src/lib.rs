@@ -1,3 +1,8 @@
+//! Wraps the pinned Ghidra x86-32 SLEIGH specification embedded by `sleigh-config`: instruction
+//! lengths, flow ends, and p-code lifting into `rk_core::ir`. Unknown address spaces fail with a
+//! diagnostic and unmapped opcodes become `OpCode::Unknown`. A `Lifter` numbers its own unique
+//! varnodes, so callers keep one per thread.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use libsla::{

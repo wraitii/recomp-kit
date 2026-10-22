@@ -1,3 +1,11 @@
+//! Builds one `FunctionIr` per mapped function. It decodes and lifts each span, builds instruction
+//! successors and external exits, and recovers jump tables; an unresolved indirect jump
+//! conservatively reaches every instruction. It also proves `PUSH; RET` continuations and
+//! popped-return jumps, marks noreturn and dead code, and classifies SEH frames, helpers and import
+//! tails.
+//! Functions are analyzed in parallel, and failures stay per-function diagnostics in
+//! `Analysis::ir`.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 

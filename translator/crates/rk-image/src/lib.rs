@@ -1,3 +1,9 @@
+//! Loads and cross-checks the translation inputs: the PE32 image (`pe`, rebased through its HIGHLOW
+//! relocations when needed) and the Ghidra `recomp-code-map-v3` directory (`code_map`), whose
+//! executable hash and image base must match the settings. `index_entries` classifies every entry
+//! as function, table target, interior, thunk target, relocated pointer or configured entry;
+//! `details` re-reads unrelocated PE metadata for discovery.
+
 pub mod code_map;
 pub mod details;
 pub mod pe;

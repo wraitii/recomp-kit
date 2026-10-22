@@ -1,5 +1,8 @@
 # Translator and instruction IR
 
+This describes the Python engine under `tools/recomp/`, the default. The Rust
+engine under `translator/` shares its concepts; see [the Rust translator](translator.md).
+
 Translation reads the Ghidra code map and the executable, lifts each mapped
 function with SLEIGH, builds an integer SSA with scalar x87 tracking and emits C.
 Game measurements and the optimization history live in the game repository.

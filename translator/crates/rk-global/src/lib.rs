@@ -1,3 +1,10 @@
+//! Whole-program analysis between lifting and planning. `contracts` builds SSA for every function
+//! and solves register and flag call contracts over call-graph SCCs, using indirect call and jump
+//! bounds and configured site effects. Functions it cannot prove stay conservative, with a reason.
+//! `modes` propagates x87 control-word facts. `private` selects private-contract targets and
+//! checked returns, and `specialize` merges the planner's call-site requests into variant layouts.
+//! `GlobalFacts::call_facts` feeds the contracts back into SSA.
+
 mod callgraph;
 mod cfg;
 mod contracts;

@@ -1,3 +1,9 @@
+//! Prints a `PlannedFunction` as C: the body (blocks, phi moves, publications, flag descriptors,
+//! calls, dynamic dispatch, x87 clones) plus its entry, checked-return, alternate-entry and
+//! private-contract wrappers. Unrepresentable forms return a diagnostic, and the driver then emits
+//! a trap body. Individual unsupported instructions become named runtime traps listed in
+//! `EmitReport`. `preludes` holds the generated C helpers.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 

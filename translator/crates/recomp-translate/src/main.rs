@@ -1,3 +1,10 @@
+//! Driver that `tools/build.py` runs once per image. It reads the `recomp-translate-input-v1` JSON,
+//! loads the image and code map, discovers uncovered code, lifts every function, validates analysis
+//! facts against the lifted code (`facts`), runs whole-program analysis, then plans and emits every
+//! function in two parallel passes: the second re-emits callers of private-contract targets once
+//! `rk_global::specialize` has merged their requests. A function that fails planning or emission
+//! becomes a named trap body. See `docs/translator.md`.
+
 mod facts;
 
 use std::collections::{BTreeMap, BTreeSet};

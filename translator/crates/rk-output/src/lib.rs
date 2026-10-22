@@ -1,3 +1,8 @@
+//! Writes the generated tree: address-bucketed body chunks, entry-thunk chunks, `funcs.h`,
+//! `body.h`, the dispatch `table.c`, `call_facts.c` and `symbols.json`. It also defines the
+//! emitted-body model (`Body`, `Declaration`, `Requires`, `Preludes`) that `rk-emit` fills. Callers
+//! stage into a fresh directory because stale chunks are not removed.
+
 mod symbols;
 mod table;
 

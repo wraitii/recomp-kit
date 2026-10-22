@@ -6,7 +6,7 @@ Use those wrappers for an ordinary first build.
 
 | Tool | Responsibility |
 | --- | --- |
-| `driver.py`, `program.py`, `settings.py`, `output.py` | Translate from the Ghidra code map (`code_map.py` packs and reads it): load the program, lift and emit each function (`ir/` SSA, or the `decoded.py` fallback), write chunks, tables, symbols and the report. See [the IR](../../docs/ir.md) |
+| `driver.py`, `program.py`, `settings.py`, `output.py` | Translate from the Ghidra code map (`code_map.py` packs and reads it): load the program, lift and emit each function (`ir/` SSA, or the `decoded.py` fallback), write chunks, tables, symbols and the report. See [the IR](../../docs/ir.md); the Rust engine is [documented separately](../../docs/translator.md) |
 | `runtime/x86.h` | Register/flag/x87 state and instruction semantics used by generated code |
 | `buildlock.sh`, `buildlock.py` | The shared process lock over build/recomp, as a shell entry and a Python module |
 | `build_core.py`, `finish_bundle.py`, `snapshot_gen.py` | Install core mods reproducibly, finish the app bundle, copy one consistent generation of gen/ |

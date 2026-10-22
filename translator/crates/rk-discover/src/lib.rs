@@ -1,3 +1,11 @@
+//! Recovers code the code map does not cover. Seeds come from the PE entry point, exports, TLS
+//! callbacks, relocated pointers, mapped flow, analysis-fact targets and `discovery_evidence`.
+//! Discovery traces direct flow, pointer runs and switch tables, then sweeps unclaimed executable
+//! bytes; higher-ranked evidence retracts lower-ranked evidence. Fragment filters discard padding,
+//! stubs and low-entropy bodies, and passes repeat until nothing changes. iced-x86 decodes,
+//! cross-checked against SLEIGH lengths through `DecodeCheck`. The map stays authoritative: `merge`
+//! adds only new, provisional functions, and every rejection is reported with its pass and reason.
+
 pub mod report;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

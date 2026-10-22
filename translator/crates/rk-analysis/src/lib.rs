@@ -1,3 +1,11 @@
+//! Offline producer of `recomp-analysis-facts-v2`, run by `tools/build.py
+//! --produce-analysis-facts`. It reruns discovery, lifting and contract analysis (`guest`) and
+//! refines indirect call and jump bounds to a fixed point from tables (`guest::tables`), SSA site
+//! shapes (`guest::summary`) and stack cleanup proofs (`guest::stack`). It then joins them with the
+//! `[analysis]` method and effect catalogs and runtime observation TSVs. The facts record their
+//! input digests and assumptions and are validated before being written; the translator only
+//! consumes them.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 

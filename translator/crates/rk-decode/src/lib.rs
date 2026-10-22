@@ -1,3 +1,8 @@
+//! Capstone-backed structural decoder for one instruction whose bytes are already known; a `WAIT`
+//! followed by an `FN*` instruction is fused into one. Produces the canonical mnemonics, typed
+//! operands and listing text that the frontend, x87 recipes and slow-path emission read. Also holds
+//! the MSVC SEH and EH3 byte-pattern recognizers.
+
 use capstone::arch::x86::{ArchMode, X86OperandType};
 use capstone::prelude::*;
 use capstone::{Capstone, Insn};

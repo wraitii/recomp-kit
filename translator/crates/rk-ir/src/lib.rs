@@ -1,3 +1,10 @@
+//! Lowers lifted p-code into codegen IR (`CgFunction`). Lowering makes flags explicit, linearizes
+//! read-modify-write instructions, corrects CMOV, CMPXCHG and SSE lane shapes, identifies string
+//! instructions (`string`) and replaces x87 instructions with `X87Recipes` output (`x87`). `op`
+//! defines the operation vocabulary and effect properties shared by every later stage, including
+//! SSA-only operations; `regs` maps SLEIGH registers to guest state lanes. Unsupported shapes
+//! become `Op::Slow` instead of failing lowering.
+
 pub mod lower;
 pub mod op;
 pub mod regs;

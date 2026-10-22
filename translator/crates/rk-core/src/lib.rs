@@ -1,3 +1,9 @@
+//! Shared vocabulary of the translator: guest addresses, the lifted p-code IR (`ir`), CPU-field
+//! call contracts (`contract`), the program model (`program`), named diagnostics (`diag`), the
+//! resolved translation settings (`settings`), the validated `recomp-analysis-facts` format
+//! (`facts`), and lookup and phase-timing helpers. Output must not depend on hashing order, so
+//! `clippy.toml` bans hash maps and `lookup` offers maps that cannot be iterated.
+
 pub mod contract;
 pub mod diag;
 pub mod facts;
