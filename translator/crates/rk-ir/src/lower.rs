@@ -1115,6 +1115,7 @@ fn correct_cmpxchg(
     out.extend(add_af(acc, old, result, regs, fresh));
     out.extend(select_value(condition, acc, old, acc, fresh));
     if let Some((_, _, unique)) = captured {
+        // x86 writes the old value back on mismatch; Ghidra's p-code skips that store.
         let selected = fresh(result.size);
         out.extend(select_value(condition, source, old, selected, fresh));
         out.push(PcodeOp {
@@ -1202,6 +1203,7 @@ fn correct_cmpxchg8b(
         op(OpCode::IntOr, desired, vec![shifted, low]),
     ]);
     let selected = fresh(8);
+    // x86 writes the old value back on mismatch; Ghidra's p-code skips that store.
     out.extend(select_value(zf, desired, old, selected, fresh));
     out.push(PcodeOp {
         opcode: OpCode::Store,
@@ -1244,7 +1246,7 @@ fn wide_lanes(
     }
     if value.space == Space::Const {
         return Ok(std::array::from_fn(|lane| {
-            Varnode::constant((value.offset >> (lane * 32)) & 0xffff_ffff, 4)
+            Varnode::constant(value.offset.checked_shr(lane as u32 * 32).unwrap_or(0) & 0xffff_ffff, 4)
         }));
     }
     Err(Reason::Unsupported {
@@ -1628,11 +1630,7 @@ fn normalize_direct_ram(
         return Ok(out);
     }
     if has_write {
-        if let Some(index) = touched
-            .iter()
-            .copied()
-            .find(|&i| ops[i].output.is_some_and(|v| v.space == Space::Ram))
-        {
+        for &index in touched.iter().rev() {
             let dst = fresh(size);
             ops[index].output = Some(dst);
             ops.insert(
@@ -1920,6 +1918,8 @@ fn correct_arithmetic(
     Ok(ops)
 }
 
+// OF is undefined for counts above 1; this and correct_sar match the runtime's
+// shl/shr/sar _f helpers (docs/ir.md, Lazy flags) instead of Ghidra's preserved OF.
 fn correct_shift(
     mnem: &str,
     ops: &[PcodeOp],
