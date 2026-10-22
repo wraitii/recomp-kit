@@ -21,7 +21,6 @@ use rk_core::settings::Settings;
 use rk_core::timing::Phases;
 use rk_core::{parse_hex, Addr, Diagnostic, Hex};
 use rk_output::{Body, Requires, Translation};
-use rk_sleigh::Lifter;
 
 #[derive(Parser)]
 #[command(about = "Translate a game image from its code map to C")]
@@ -94,39 +93,6 @@ fn parse_addr8(text: &str) -> Option<Addr> {
     (text.len() == 8 && text.bytes().all(|b| b.is_ascii_hexdigit()))
         .then(|| Addr::from_str_radix(text, 16).ok())
         .flatten()
-}
-
-struct SleighLengths {
-    cache: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU8]>>,
-}
-
-thread_local! {
-    static SLEIGH_LIFTER: std::cell::RefCell<Option<Lifter>> = const { std::cell::RefCell::new(None) };
-}
-
-impl rk_discover::DecodeCheck for SleighLengths {
-    fn length(&self, image: &rk_core::program::Image, at: Addr) -> Option<u8> {
-        let cache = self.cache.get_or_init(|| {
-            (0..image.size)
-                .map(|_| std::sync::atomic::AtomicU8::new(0))
-                .collect()
-        });
-        let slot = cache.get(at.saturating_sub(image.base) as usize)?;
-        let cached = slot.load(std::sync::atomic::Ordering::Relaxed);
-        if cached != 0 {
-            return (cached != u8::MAX).then_some(cached);
-        }
-        let available = image.end().saturating_sub(at).min(15) as usize;
-        let bytes = image.bytes(at, available)?;
-        let out = SLEIGH_LIFTER.with(|lifter| {
-            let mut lifter = lifter.borrow_mut();
-            let lifter =
-                lifter.get_or_insert_with(|| Lifter::new().expect("SLEIGH initialization"));
-            lifter.length(at, bytes).ok()
-        });
-        slot.store(out.unwrap_or(u8::MAX), std::sync::atomic::Ordering::Relaxed);
-        out
-    }
 }
 
 type BodyRow = (
@@ -979,10 +945,7 @@ fn main() -> Result<()> {
     phases.mark("settings");
     let mut program = rk_image::load(&settings)?;
     phases.mark("load");
-    let lengths = SleighLengths {
-        cache: Default::default(),
-    };
-    let discovered = rk_discover::discover(&settings, &program, Some(&lengths))?;
+    let discovered = rk_discover::discover(&settings, &program)?;
     if let Some(path) = &args.discovery_report {
         write_discovery_report(path, &settings, &program, &discovered)?;
     }

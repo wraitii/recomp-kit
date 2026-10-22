@@ -1,13 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::OnceLock;
 
 use rayon::prelude::*;
 use rk_core::facts::Summary as FactSummary;
 use rk_core::program::Program;
 use rk_core::settings::{CallEffect as ConfiguredEffect, Settings};
 use rk_core::{Addr, Result};
-use rk_discover::DecodeCheck;
 use rk_ir::Op;
 use rk_ssa::{prepare, PrepareOptions, Ssa, ValueId};
 
@@ -65,43 +62,8 @@ impl Options {
     }
 }
 
-struct Lengths {
-    cache: OnceLock<Box<[AtomicU8]>>,
-}
-
-thread_local! {
-    static LIFTER: std::cell::RefCell<Option<rk_sleigh::Lifter>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-impl DecodeCheck for Lengths {
-    fn length(&self, image: &rk_core::program::Image, at: Addr) -> Option<u8> {
-        let cache = self
-            .cache
-            .get_or_init(|| (0..image.size).map(|_| AtomicU8::new(0)).collect());
-        let slot = cache.get(at.saturating_sub(image.base) as usize)?;
-        let cached = slot.load(Ordering::Relaxed);
-        if cached != 0 {
-            return (cached != u8::MAX).then_some(cached);
-        }
-        let available = image.end().saturating_sub(at).min(15) as usize;
-        let bytes = image.bytes(at, available)?;
-        let out = LIFTER.with(|lifter| {
-            let mut lifter = lifter.borrow_mut();
-            let lifter = lifter
-                .get_or_insert_with(|| rk_sleigh::Lifter::new().expect("SLEIGH initialization"));
-            lifter.length(at, bytes).ok()
-        });
-        slot.store(out.unwrap_or(u8::MAX), Ordering::Relaxed);
-        out
-    }
-}
-
 pub fn discover_program(settings: &Settings, program: &Program) -> Result<(Program, bool)> {
-    let lengths = Lengths {
-        cache: OnceLock::new(),
-    };
-    let discovered = rk_discover::discover(settings, program, Some(&lengths))?;
+    let discovered = rk_discover::discover(settings, program)?;
     let converged = discovered.report.converged;
     let mut program = program.clone();
     rk_discover::merge(&mut program, &discovered)?;

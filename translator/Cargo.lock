@@ -461,7 +461,6 @@ dependencies = [
  "rk-ir",
  "rk-output",
  "rk-plan",
- "rk-sleigh",
  "rk-ssa",
  "rk-x87",
  "serde_json",
@@ -480,7 +479,6 @@ dependencies = [
  "rk-global",
  "rk-image",
  "rk-ir",
- "rk-sleigh",
  "rk-ssa",
  "rk-x87",
  "serde",
@@ -516,6 +514,7 @@ dependencies = [
  "rayon",
  "rk-core",
  "rk-image",
+ "rk-sleigh",
  "serde",
 ]
 

@@ -3,13 +3,15 @@
 //! Discovery traces direct flow, pointer runs and switch tables, then sweeps unclaimed executable
 //! bytes; higher-ranked evidence retracts lower-ranked evidence. Fragment filters discard padding,
 //! stubs and low-entropy bodies, and passes repeat until nothing changes. iced-x86 decodes,
-//! cross-checked against SLEIGH lengths through `DecodeCheck`. The map stays authoritative: `merge`
+//! with every length cross-checked against SLEIGH. The map stays authoritative: `merge`
 //! adds only new, provisional functions, and every rejection is reported with its pass and reason.
 
 pub mod report;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::OnceLock;
 
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use rk_core::program::{Function, Image, InteriorKind, Program, Span};
@@ -62,8 +64,33 @@ const NORETURN_IMPORTS: &[&str] = &[
 type Functions = BTreeMap<Addr, Vec<Span>>;
 type Entries = BTreeMap<Addr, (Addr, InteriorKind)>;
 
-pub trait DecodeCheck: Sync {
-    fn length(&self, image: &Image, at: Addr) -> Option<u8>;
+#[derive(Default)]
+struct SleighLengths {
+    cache: OnceLock<Box<[AtomicU8]>>,
+}
+
+thread_local! {
+    static LIFTER: std::cell::RefCell<Option<rk_sleigh::Lifter>> = const { std::cell::RefCell::new(None) };
+}
+
+impl SleighLengths {
+    fn length(&self, image: &Image, at: Addr) -> Option<u8> {
+        let cache = self.cache.get_or_init(|| (0..image.size).map(|_| AtomicU8::new(0)).collect());
+        let slot = cache.get(at.saturating_sub(image.base) as usize)?;
+        let cached = slot.load(Ordering::Relaxed);
+        if cached != 0 {
+            return (cached != u8::MAX).then_some(cached);
+        }
+        let available = image.end().saturating_sub(at).min(15) as usize;
+        let bytes = image.bytes(at, available)?;
+        let out = LIFTER.with(|lifter| {
+            let mut lifter = lifter.borrow_mut();
+            let lifter = lifter.get_or_insert_with(|| rk_sleigh::Lifter::new().expect("SLEIGH initialization"));
+            lifter.length(at, bytes).ok()
+        });
+        slot.store(out.unwrap_or(u8::MAX), Ordering::Relaxed);
+        out
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -195,11 +222,7 @@ pub struct Discovered {
     pub report: DiscoveryReport,
 }
 
-pub fn discover(
-    settings: &Settings,
-    program: &Program,
-    check: Option<&dyn DecodeCheck>,
-) -> Result<Discovered> {
+pub fn discover(settings: &Settings, program: &Program) -> Result<Discovered> {
     if !settings.discover {
         return Ok(Discovered {
             functions: BTreeMap::new(),
@@ -209,6 +232,7 @@ pub fn discover(
         });
     }
     let details = rk_image::details::load(&settings.exe, program.image.base)?;
+    let check = SleighLengths::default();
     let mut suppressions = Vec::new();
     let mut rejections = Vec::new();
     let mut functions = BTreeMap::new();
@@ -216,7 +240,7 @@ pub fn discover(
     let mut recovery = None;
     let mut converged = false;
     for pass in 1..=MAX_DISCOVERY_PASSES {
-        let mut current = Recovery::new(program, details.clone(), check, suppressions.clone());
+        let mut current = Recovery::new(program, details.clone(), &check, suppressions.clone());
         current.pass = pass;
         current.function_rejections = rejections;
         run_discovery(&mut current, settings)?;
@@ -278,7 +302,7 @@ pub fn merge(program: &mut Program, discovered: &Discovered) -> Result<()> {
 struct Recovery<'a> {
     image: &'a Image,
     details: rk_image::details::PeDetails,
-    check: Option<&'a dyn DecodeCheck>,
+    check: &'a SleighLengths,
     delta: u32,
     instructions: BTreeMap<Addr, Insn>,
     covered: Vec<Addr>,
@@ -321,7 +345,7 @@ impl<'a> Recovery<'a> {
     fn new(
         program: &'a Program,
         details: rk_image::details::PeDetails,
-        check: Option<&'a dyn DecodeCheck>,
+        check: &'a SleighLengths,
         mut suppressed: Vec<(Addr, Addr)>,
     ) -> Self {
         let image = &program.image;
@@ -1774,7 +1798,7 @@ fn address(path: &Path, text: &str) -> Result<Addr> {
 
 fn span_lengths(
     image: &Image,
-    check: Option<&dyn DecodeCheck>,
+    check: &SleighLengths,
     start: Addr,
     end: Addr,
 ) -> Result<Vec<u8>> {
@@ -1792,7 +1816,7 @@ fn span_lengths(
     Ok(lengths)
 }
 
-fn decode_at(image: &Image, check: Option<&dyn DecodeCheck>, at: Addr) -> Option<Insn> {
+fn decode_at(image: &Image, check: &SleighLengths, at: Addr) -> Option<Insn> {
     let end = image
         .exec_ranges
         .iter()
@@ -1803,7 +1827,7 @@ fn decode_at(image: &Image, check: Option<&dyn DecodeCheck>, at: Addr) -> Option
 
 fn decode_between(
     image: &Image,
-    check: Option<&dyn DecodeCheck>,
+    check: &SleighLengths,
     at: Addr,
     end: Addr,
 ) -> Option<Insn> {
@@ -1819,12 +1843,7 @@ fn decode_between(
     } else {
         decode_one(bytes, at, None)?
     };
-    if let Some(check) = check {
-        if check.length(image, at)? != found.size {
-            return None;
-        }
-    }
-    Some(found)
+    (check.length(image, at)? == found.size).then_some(found)
 }
 
 fn decode_one(bytes: &[u8], at: Addr, folded: Option<u8>) -> Option<Insn> {
