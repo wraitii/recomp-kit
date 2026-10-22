@@ -910,7 +910,7 @@ impl<'a> Emitter<'a> {
                 let vector = match mnemonic.as_str() {
                     "INT1" => Some(1),
                     "INTO" => Some(4),
-                    _ => parse_slow_operands(&insn).and_then(|ops| match ops.first() {
+                    _ => slow_operands(&insn).and_then(|ops| match ops.first() {
                         Some(SlowOperand::Imm(value)) => Some(*value as u32),
                         _ => None,
                     }),
@@ -934,7 +934,7 @@ impl<'a> Emitter<'a> {
 
     fn slow_port(&mut self, insn: &Insn, input: bool, addr: Addr) -> Result<bool> {
         let mnemonic = insn.mnemonic.to_ascii_uppercase();
-        let repeat = insn.text.to_ascii_uppercase().contains(".REP");
+        let repeat = insn.repeat.is_some();
         let prefix = if repeat { "rep_" } else { "" };
         if mnemonic.starts_with("INS") || mnemonic.starts_with("OUTS") {
             let suffix = mnemonic.chars().last().unwrap_or('B').to_ascii_lowercase();
@@ -945,7 +945,7 @@ impl<'a> Emitter<'a> {
             let _ = writeln!(self.out, "{prefix}{root}{suffix}(c);");
             return Ok(true);
         }
-        let Some(operands) = parse_slow_operands(insn) else {
+        let Some(operands) = slow_operands(insn) else {
             return self.unsupported(addr, &mnemonic);
         };
         if input && mnemonic == "IN" {
@@ -982,7 +982,7 @@ impl<'a> Emitter<'a> {
     fn slow_segment(&mut self, insn: &Insn, addr: Addr) -> Result<bool> {
         let mnemonic = insn.mnemonic.to_ascii_uppercase();
         if matches!(mnemonic.as_str(), "LDS" | "LES") {
-            let Some(operands) = parse_slow_operands(insn) else {
+            let Some(operands) = slow_operands(insn) else {
                 return self.unsupported(addr, &mnemonic);
             };
             let (Some(SlowOperand::Gpr { index, shift, mask }), Some(SlowOperand::Mem(address))) =
@@ -1006,7 +1006,7 @@ impl<'a> Emitter<'a> {
             self.out.push_str("__atomic_thread_fence(__ATOMIC_RELEASE);\n");
             return Ok(true);
         }
-        let Some(SlowOperand::Mem(address)) = parse_slow_operands(insn).and_then(|ops| ops.into_iter().next()) else {
+        let Some(SlowOperand::Mem(address)) = slow_operands(insn).and_then(|ops| ops.into_iter().next()) else {
             return self.unsupported(addr, &mnemonic);
         };
         let call = match mnemonic.as_str() {
@@ -1024,7 +1024,7 @@ impl<'a> Emitter<'a> {
             self.out.push_str("c->fpu_tag = 0xffffu;\n");
             return Ok(true);
         }
-        let Some(operands) = parse_slow_operands(insn) else {
+        let Some(operands) = slow_operands(insn) else {
             return self.unsupported(addr, &mnemonic);
         };
         let Some(dst) = operands.first() else {

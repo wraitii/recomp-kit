@@ -523,6 +523,7 @@ pub(crate) fn build_raw(
         insns.push(Insn {
             addr: ins.addr,
             length: lifted.length,
+            address_size: ins.address_size,
             mnemonic: ins.mnemonic.clone(),
             operands: ins
                 .operands
@@ -530,6 +531,8 @@ pub(crate) fn build_raw(
                 .map(|o| o.display.clone())
                 .collect::<Vec<_>>()
                 .join(","),
+            typed_operands: ins.operands.clone(),
+            repeat: ins.rep,
             text: ins.text.clone(),
             ops: lifted.ops,
             x87: lifted.x87,

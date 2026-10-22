@@ -8,48 +8,7 @@ use capstone::{Capstone, Insn};
 use rk_core::{Addr, Result};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Part {
-    L,
-    H,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OperandKind {
-    Reg {
-        gpr: u8,
-        part: Option<Part>,
-    },
-    Xmm(u8),
-    Mm(u8),
-    St(u8),
-    Sreg {
-        name: String,
-        selector: u32,
-    },
-    Imm(i64),
-    Mem {
-        base: Option<u8>,
-        index: Option<u8>,
-        scale: u8,
-        disp: i64,
-        seg: Option<String>,
-    },
-    Other(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Operand {
-    pub kind: OperandKind,
-    pub size: Option<u16>,
-    pub display: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Repeat {
-    Rep,
-    Repne,
-}
+pub use rk_core::ir::{Operand, OperandKind, Part, Repeat};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DecodedInsn {

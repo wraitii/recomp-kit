@@ -9,117 +9,43 @@ pub(crate) enum SlowOperand {
     Mem(String),
 }
 
-pub(crate) fn parse_slow_operands(insn: &Insn) -> Option<Vec<SlowOperand>> {
-    if insn.operands.is_empty() {
-        return Some(Vec::new());
-    }
-    insn.operands.split(',').map(parse_slow_operand).collect()
-}
-
-pub(crate) fn parse_slow_operand(text: &str) -> Option<SlowOperand> {
-    let mut text = text.trim();
-    let lower = text.to_ascii_lowercase();
-    for prefix in [
-        "extended double ptr ",
-        "float ptr ",
-        "xmmword ptr ",
-        "mmword ptr ",
-        "qword ptr ",
-        "dword ptr ",
-        "word ptr ",
-        "byte ptr ",
-    ] {
-        if lower.starts_with(prefix) {
-            text = &text[prefix.len()..];
-            break;
-        }
-    }
-    let mut segment = None;
-    if let Some((prefix, rest)) = text.split_once(':') {
-        let name = prefix.trim().to_ascii_uppercase();
-        if matches!(name.as_str(), "CS" | "DS" | "ES" | "FS" | "GS" | "SS") {
-            segment = Some(name);
-            text = rest.trim();
-        }
-    }
-    if text.starts_with('[') {
-        return Some(SlowOperand::Mem(memory_expr(text, segment.as_deref())?));
-    }
-    if let Some(index) = text.strip_prefix("MM").and_then(|n| n.parse().ok()) {
-        return Some(SlowOperand::Mm(index));
-    }
-    if let Some(index) = text.strip_prefix("XMM").and_then(|n| n.parse().ok()) {
-        return Some(SlowOperand::Xmm(index));
-    }
-    if let Some((index, shift, mask)) = gpr_parts(text) {
-        return Some(SlowOperand::Gpr { index, shift, mask });
-    }
-    if let Some(value) = parse_imm(text) {
-        return Some(SlowOperand::Imm(value));
-    }
-    None
-}
-
-pub(crate) fn parse_imm(text: &str) -> Option<u64> {
-    let text = text.trim();
-    let (negative, digits) = text
-        .strip_prefix('-')
-        .map_or((false, text), |digits| (true, digits));
-    let value = if let Some(hex) = digits.strip_prefix("0x") {
-        u64::from_str_radix(hex, 16).ok()?
-    } else {
-        digits.parse().ok()?
-    };
-    Some(if negative { value.wrapping_neg() } else { value })
-}
-
-pub(crate) fn memory_expr(text: &str, segment: Option<&str>) -> Option<String> {
-    let inner = text.trim().strip_prefix('[')?.strip_suffix(']')?.trim();
-    let mut terms = Vec::new();
-    for part in inner.split('+').map(str::trim).filter(|part| !part.is_empty()) {
-        if let Some((register, scale)) = part.split_once('*') {
-            let register = gpr_expr(register.trim())?;
-            let scale = parse_imm(scale.trim())?;
-            terms.push(format!("({register} * 0x{scale:x}u)"));
-        } else if let Some(value) = parse_imm(part) {
-            terms.push(format!("0x{value:x}u"));
-        } else {
-            terms.push(gpr_expr(part)?);
-        }
-    }
-    if segment == Some("FS") {
-        terms.push("c->fs_base".to_string());
-    }
-    Some(if terms.is_empty() { "0u".to_string() } else { terms.join(" + ") })
-}
-
-pub(crate) fn gpr_parts(name: &str) -> Option<(usize, u32, u32)> {
-    const R32: [&str; 8] = ["EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI"];
-    const R16: [&str; 8] = ["AX", "CX", "DX", "BX", "SP", "BP", "SI", "DI"];
-    const R8L: [&str; 4] = ["AL", "CL", "DL", "BL"];
-    const R8H: [&str; 4] = ["AH", "CH", "DH", "BH"];
-    if let Some(index) = R32.iter().position(|r| *r == name) {
-        return Some((index, 0, 0xffff_ffff));
-    }
-    if let Some(index) = R16.iter().position(|r| *r == name) {
-        return Some((index, 0, 0xffff));
-    }
-    if let Some(index) = R8L.iter().position(|r| *r == name) {
-        return Some((index, 0, 0xff));
-    }
-    if let Some(index) = R8H.iter().position(|r| *r == name) {
-        return Some((index, 8, 0xff));
-    }
-    None
-}
-
-pub(crate) fn gpr_expr(name: &str) -> Option<String> {
-    let (index, shift, mask) = gpr_parts(name)?;
-    Some(if shift == 0 && mask == 0xffff_ffff {
-        format!("c->r[{index}]")
-    } else {
-        format!("((c->r[{index}] >> {shift}) & 0x{mask:x}u)")
-    })
+pub(crate) fn slow_operands(insn: &Insn) -> Option<Vec<SlowOperand>> {
+    insn.typed_operands.iter().map(|operand| {
+        use rk_core::ir::{OperandKind, Part};
+        Some(match &operand.kind {
+            OperandKind::Reg { gpr, part } => SlowOperand::Gpr {
+                index: *gpr as usize,
+                shift: if *part == Some(Part::H) { 8 } else { 0 },
+                mask: match operand.size? { 8 => 0xff, 16 => 0xffff, 32 => u32::MAX, _ => return None },
+            },
+            OperandKind::Mm(index) => SlowOperand::Mm(*index),
+            OperandKind::Xmm(index) => SlowOperand::Xmm(*index),
+            OperandKind::Imm(value) => SlowOperand::Imm(*value as u64),
+            OperandKind::Mem { base, index, scale, disp, seg } => {
+                if !matches!(insn.address_size, 2 | 4) { return None; }
+                let register = |reg: u8| {
+                    if insn.address_size == 2 {
+                        format!("((c->r[{reg}] >> 0) & 0xffffu)")
+                    } else {
+                        format!("c->r[{reg}]")
+                    }
+                };
+                let mut terms = Vec::new();
+                if let Some(base) = base { terms.push(register(*base)); }
+                if let Some(index) = index { terms.push(format!("({} * 0x{scale:x}u)", register(*index))); }
+                if *disp != 0 || terms.is_empty() { terms.push(format!("0x{:x}u", *disp as u64)); }
+                let mut address = terms.join(" + ");
+                if insn.address_size == 2 { address = format!("(({address}) & 0xffffu)"); }
+                match seg.as_deref() {
+                    Some("FS") => address.push_str(" + c->fs_base"),
+                    None | Some("CS" | "DS" | "ES" | "SS") => {},
+                    _ => return None,
+                }
+                SlowOperand::Mem(address)
+            },
+            _ => return None,
+        })
+    }).collect()
 }
 
 pub(crate) fn port_expr(operand: &SlowOperand) -> Option<String> {

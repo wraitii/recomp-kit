@@ -130,12 +130,58 @@ pub struct PcodeOp {
     pub userop: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Part {
+    L,
+    H,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OperandKind {
+    Reg {
+        gpr: u8,
+        part: Option<Part>,
+    },
+    Xmm(u8),
+    Mm(u8),
+    St(u8),
+    Sreg {
+        name: String,
+        selector: u32,
+    },
+    Imm(i64),
+    Mem {
+        base: Option<u8>,
+        index: Option<u8>,
+        scale: u8,
+        disp: i64,
+        seg: Option<String>,
+    },
+    Other(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Operand {
+    pub kind: OperandKind,
+    pub size: Option<u16>,
+    pub display: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Repeat {
+    Rep,
+    Repne,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Insn {
     pub addr: Addr,
     pub length: u8,
+    pub address_size: u8,
     pub mnemonic: String,
     pub operands: String,
+    pub typed_operands: Vec<Operand>,
+    pub repeat: Option<Repeat>,
     pub text: String,
     pub ops: Vec<PcodeOp>,
     pub x87: bool,
