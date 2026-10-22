@@ -87,3 +87,20 @@ pub fn field_lane(key: StateKey) -> Option<(Field, u8)> {
     }
     None
 }
+
+pub fn xmm_offset(key: StateKey) -> Option<(usize, u8)> {
+    let StateKey::Register(offset) = key else { return None };
+    let (name, register) = Registers::get().covering(offset as u64)?;
+    let (reg, lane) = name.strip_prefix("XMM")?.split_once('_')?;
+    let reg = reg.parse().ok().filter(|reg| *reg < 8)?;
+    let mut chars = lane.bytes();
+    let kind = chars.next()?;
+    let index = (chars.next()? as usize).checked_sub('a' as usize)?;
+    let within = (offset as u64 - register.offset) as usize;
+    let offset = match kind {
+        b'B' if index < 16 => index,
+        b'D' if index < 4 => index * 4 + within,
+        _ => return None,
+    };
+    Some((reg, offset as u8))
+}

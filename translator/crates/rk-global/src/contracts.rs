@@ -205,6 +205,15 @@ pub(crate) fn analyze(
                     }),
                 );
             }
+            if program.is_setjmp_thunk(addr) {
+                return (
+                    addr,
+                    None,
+                    Some(Reason::Conservative {
+                        detail: "setjmp".into(),
+                    }),
+                );
+            }
             match prepare(
                 program,
                 fir,

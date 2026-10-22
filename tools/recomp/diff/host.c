@@ -145,6 +145,7 @@ const char *diff_run(uint32_t addr, DiffState *s, uint32_t fs_base) {
     x86_set_eflags(c, s->eflags);
     x87_finit(c);
     x87_set_cw(c, s->fpu_cw);
+    c->mxcsr = 0x1f80u;
     c->fs_base = fs_base;
     if (setjmp(escape_jb)) {
         s->escape_addr = escape_addr;

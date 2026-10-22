@@ -1,7 +1,6 @@
 use capstone::arch::x86::{ArchMode, X86OperandType};
 use capstone::prelude::*;
 use capstone::{Capstone, Insn};
-use rk_core::program::Program;
 use rk_core::{Addr, Result};
 use serde::{Deserialize, Serialize};
 
@@ -607,16 +606,4 @@ pub fn seh_constructor_helper(image: &rk_core::program::Image, va: Addr) -> Opti
     }
     let candidate = image.rd32(va + prefix.len() as u32)?;
     image.is_exec(candidate).then_some(candidate)
-}
-
-pub fn import_thunk_name(program: &Program, va: Addr) -> Option<String> {
-    if !program.image.is_exec(va) || va + 6 > program.image.end() {
-        return None;
-    }
-    let raw = program.image.bytes(va, 6)?;
-    if raw[..2] != [0xff, 0x25] {
-        return None;
-    }
-    let slot = u32::from_le_bytes([raw[2], raw[3], raw[4], raw[5]]);
-    program.image.imports.get(&slot).map(|i| i.name.clone())
 }

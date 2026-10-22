@@ -23,6 +23,7 @@ pub struct EmitContext<'a> {
     pub private_input_arguments: &'a BTreeMap<Addr, String>,
     pub known_modes: &'a BTreeSet<Addr>,
     pub known_entries: &'a BTreeSet<Addr>,
+    pub setjmp_targets: &'a BTreeSet<Addr>,
     pub private: Option<&'a PrivateEmit>,
 }
 
@@ -865,6 +866,9 @@ impl<'a> Emitter<'a> {
                     if let Some(insn) = self.insn_at(addr) {
                         self.slow_ops.insert((addr, insn.mnemonic.to_ascii_uppercase()));
                     }
+                    if self.plan.settle_sites.contains(&value) {
+                        self.out.push_str("x86_cc_settle(c);\n");
+                    }
                 }
                 Ok(emitted)
             }
@@ -926,7 +930,13 @@ impl<'a> Emitter<'a> {
                 self.seh(kind, addr);
                 Ok(true)
             }
-            Op::Div { .. } | Op::Idiv { .. } => self.divide(value, addr).map(|_| true),
+            Op::Div { .. } | Op::Idiv { .. } => {
+                self.divide(value, addr)?;
+                if self.plan.settle_sites.contains(&value) {
+                    self.out.push_str("x86_cc_settle(c);\n");
+                }
+                Ok(true)
+            }
             Op::String(name) => {
                 self.publish(value)?;
                 let _ = writeln!(self.out, "{} (c);", name.0);
@@ -1020,6 +1030,7 @@ impl<'a> Emitter<'a> {
             SlowFamily::In => self.slow_port(&insn, true, addr),
             SlowFamily::Out => self.slow_port(&insn, false, addr),
             SlowFamily::Mmx => self.slow_mmx(&insn, addr),
+            SlowFamily::Sse => self.slow_sse(&insn, addr),
             SlowFamily::Segment => self.slow_segment(&insn, addr),
             _ => {
                 self.unsupported(addr, &mnemonic)
@@ -1095,6 +1106,24 @@ impl<'a> Emitter<'a> {
         self.unsupported(addr, &mnemonic)
     }
 
+    fn slow_sse(&mut self, insn: &Insn, addr: Addr) -> Result<bool> {
+        let mnemonic = insn.mnemonic.to_ascii_uppercase();
+        if mnemonic == "SFENCE" {
+            self.out.push_str("__atomic_thread_fence(__ATOMIC_RELEASE);\n");
+            return Ok(true);
+        }
+        let Some(SlowOperand::Mem(address)) = parse_slow_operands(insn).and_then(|ops| ops.into_iter().next()) else {
+            return self.unsupported(addr, &mnemonic);
+        };
+        let call = match mnemonic.as_str() {
+            "FXSAVE" => format!("recomp_fxsave(c, (uint32_t)({address}));"),
+            "STMXCSR" => format!("recomp_stmxcsr(c, (uint32_t)({address}));"),
+            _ => format!("recomp_ldmxcsr(c, 0x{addr:08x}u, (uint32_t)({address}));"),
+        };
+        let _ = writeln!(self.out, "{call}");
+        Ok(true)
+    }
+
     fn slow_mmx(&mut self, insn: &Insn, addr: Addr) -> Result<bool> {
         let mnemonic = insn.mnemonic.to_ascii_uppercase();
         if matches!(mnemonic.as_str(), "EMMS" | "FEMMS") {
@@ -1133,6 +1162,12 @@ impl<'a> Emitter<'a> {
         match mnemonic.as_str() {
             "MOVD" => return self.slow_movd(dst, operands.get(1), addr),
             "MOVQ" => return self.slow_movq(dst, operands.get(1), addr),
+            "CVTPI2PS" => return self.slow_cvtpi2ps(dst, operands.get(1), addr),
+            "CVTPS2PI" => return self.slow_cvtps2pi(dst, operands.get(1), addr),
+            "CVTTPS2DQ" => return self.slow_cvttps2dq(dst, operands.get(1), addr),
+            "CVTTSD2SI" => return self.slow_cvttsd2si(dst, operands.get(1), addr),
+            "PEXTRW" => return self.slow_pextrw(dst, operands.get(1), operands.get(2), addr),
+            "MOVDQ2Q" => return self.slow_movdq2q(dst, operands.get(1), addr),
             "MOVNTQ" => {
                 if let (SlowOperand::Mem(address), Some(SlowOperand::Mm(source))) = (dst, operands.get(1)) {
                     let _ = writeln!(
@@ -1160,6 +1195,76 @@ impl<'a> Emitter<'a> {
                 return self.unsupported(addr, &mnemonic);
             }
             _ => {}
+        }
+        if let SlowOperand::Xmm(destination) = dst {
+            if let Some((function, bits)) = xmm_binary(&mnemonic) {
+                let Some(source) = operands.get(1) else {
+                    return self.unsupported(addr, &mnemonic);
+                };
+                let Some((source, close)) = self.xmm_pair(source) else {
+                    return self.unsupported(addr, &mnemonic);
+                };
+                if let Some(bits) = bits {
+                    let _ = writeln!(
+                        self.out,
+                        "{function}(c->xmm[{destination}], {source}, {bits}u);"
+                    );
+                } else {
+                    let _ = writeln!(
+                        self.out,
+                        "{function}(c->xmm[{destination}], {source});"
+                    );
+                }
+                if close {
+                    self.out.push_str("}\n");
+                }
+                return Ok(true);
+            }
+            if let Some((function, bits)) = xmm_shift(&mnemonic) {
+                let Some(count) = operands.get(1).and_then(|source| self.xmm_count(source)) else {
+                    return self.unsupported(addr, &mnemonic);
+                };
+                self.out.push_str("{\n");
+                let _ = writeln!(self.out, "uint64_t n_ = {count};");
+                let _ = writeln!(
+                    self.out,
+                    "{function}(c->xmm[{destination}], n_, {bits}u);"
+                );
+                self.out.push_str("}\n");
+                return Ok(true);
+            }
+            if let Some((from, is_signed)) = xmm_pack(&mnemonic) {
+                let Some(source) = operands.get(1) else {
+                    return self.unsupported(addr, &mnemonic);
+                };
+                let Some((source, close)) = self.xmm_pair(source) else {
+                    return self.unsupported(addr, &mnemonic);
+                };
+                let _ = writeln!(
+                    self.out,
+                    "xmm_pack(c->xmm[{destination}], {source}, {from}u, {is_signed}u);"
+                );
+                if close {
+                    self.out.push_str("}\n");
+                }
+                return Ok(true);
+            }
+            if let Some((bits, high)) = xmm_unpack(&mnemonic) {
+                let Some(source) = operands.get(1) else {
+                    return self.unsupported(addr, &mnemonic);
+                };
+                let Some((source, close)) = self.xmm_pair(source) else {
+                    return self.unsupported(addr, &mnemonic);
+                };
+                let _ = writeln!(
+                    self.out,
+                    "xmm_punpck(c->xmm[{destination}], {source}, {bits}u, {high});"
+                );
+                if close {
+                    self.out.push_str("}\n");
+                }
+                return Ok(true);
+            }
         }
         let SlowOperand::Mm(destination) = dst else {
             return self.unsupported(addr, &mnemonic);
@@ -1191,6 +1296,192 @@ impl<'a> Emitter<'a> {
         self.unsupported(addr, &mnemonic)
     }
 
+    fn xmm_pair(&mut self, source: &SlowOperand) -> Option<(String, bool)> {
+        match source {
+            SlowOperand::Xmm(index) => Some((format!("c->xmm[{index}]"), false)),
+            SlowOperand::Mem(address) => {
+                self.out.push_str("{\nuint32_t s_[4];\n");
+                for lane in 0..4u32 {
+                    let _ = writeln!(
+                        self.out,
+                        "s_[{lane}] = recomp_rd32_(g_mem, (uint32_t)({address}) + {}u);",
+                        lane * 4
+                    );
+                }
+                Some(("s_".to_string(), true))
+            }
+            _ => None,
+        }
+    }
+
+    fn xmm_count(&self, source: &SlowOperand) -> Option<String> {
+        match source {
+            SlowOperand::Xmm(index) => Some(format!("xmm_low64(c->xmm[{index}])")),
+            SlowOperand::Mem(address) => {
+                Some(format!("recomp_rd64_(g_mem, (uint32_t)({address}))"))
+            }
+            SlowOperand::Mm(index) => Some(format!("c->mm[{index}]")),
+            SlowOperand::Imm(value) => Some(format!("(uint64_t)0x{value:x}u")),
+            SlowOperand::Gpr { .. } => mmx_source(source, 64),
+        }
+    }
+
+    fn xmm_low_source(&self, source: &SlowOperand) -> Option<String> {
+        match source {
+            SlowOperand::Xmm(index) => Some(format!("xmm_low64(c->xmm[{index}])")),
+            SlowOperand::Mem(address) => {
+                Some(format!("recomp_rd64_(g_mem, (uint32_t)({address}))"))
+            }
+            SlowOperand::Mm(index) => Some(format!("c->mm[{index}]")),
+            SlowOperand::Gpr { .. } | SlowOperand::Imm(_) => mmx_source(source, 64),
+        }
+    }
+
+    fn slow_cvtpi2ps(
+        &mut self,
+        dst: &SlowOperand,
+        src: Option<&SlowOperand>,
+        addr: Addr,
+    ) -> Result<bool> {
+        let (SlowOperand::Xmm(destination), Some(source)) = (dst, src) else {
+            return self.unsupported(addr, "CVTPI2PS form");
+        };
+        let Some(source) = mmx_source(source, 64) else {
+            return self.unsupported(addr, "CVTPI2PS source");
+        };
+        self.out.push_str("{\n");
+        let _ = writeln!(self.out, "uint64_t v_ = {source};");
+        let _ = writeln!(
+            self.out,
+            "c->xmm[{destination}][0] = recomp_sse_f32_bits((float)(int32_t)(uint32_t)v_);"
+        );
+        let _ = writeln!(
+            self.out,
+            "c->xmm[{destination}][1] = recomp_sse_f32_bits((float)(int32_t)(uint32_t)(v_ >> 32));"
+        );
+        self.out.push_str("}\n");
+        Ok(true)
+    }
+
+    fn slow_cvtps2pi(
+        &mut self,
+        dst: &SlowOperand,
+        src: Option<&SlowOperand>,
+        addr: Addr,
+    ) -> Result<bool> {
+        let (SlowOperand::Mm(destination), Some(source)) = (dst, src) else {
+            return self.unsupported(addr, "CVTPS2PI form");
+        };
+        let Some(source) = self.xmm_low_source(source) else {
+            return self.unsupported(addr, "CVTPS2PI source");
+        };
+        self.out.push_str("{\n");
+        let _ = writeln!(self.out, "uint64_t v_ = {source};");
+        let _ = writeln!(
+            self.out,
+            "uint32_t a_ = (uint32_t)recomp_sse_cvtss2si(recomp_sse_f32((uint32_t)v_));"
+        );
+        let _ = writeln!(
+            self.out,
+            "uint32_t b_ = (uint32_t)recomp_sse_cvtss2si(recomp_sse_f32((uint32_t)(v_ >> 32)));"
+        );
+        let _ = writeln!(
+            self.out,
+            "c->mm[{destination}] = (uint64_t)a_ | ((uint64_t)b_ << 32);"
+        );
+        self.out.push_str("}\n");
+        Ok(true)
+    }
+
+    fn slow_cvttps2dq(
+        &mut self,
+        dst: &SlowOperand,
+        src: Option<&SlowOperand>,
+        addr: Addr,
+    ) -> Result<bool> {
+        let (SlowOperand::Xmm(destination), Some(source)) = (dst, src) else {
+            return self.unsupported(addr, "CVTTPS2DQ form");
+        };
+        let Some((source, close)) = self.xmm_pair(source) else {
+            return self.unsupported(addr, "CVTTPS2DQ source");
+        };
+        for lane in 0..4u32 {
+            let _ = writeln!(
+                self.out,
+                "c->xmm[{destination}][{lane}] = (uint32_t)recomp_sse_cvttss2si(recomp_sse_f32({source}[{lane}]));"
+            );
+        }
+        if close {
+            self.out.push_str("}\n");
+        }
+        Ok(true)
+    }
+
+    fn slow_cvttsd2si(
+        &mut self,
+        dst: &SlowOperand,
+        src: Option<&SlowOperand>,
+        addr: Addr,
+    ) -> Result<bool> {
+        let (SlowOperand::Gpr { index, shift, mask }, Some(source)) = (dst, src) else {
+            return self.unsupported(addr, "CVTTSD2SI form");
+        };
+        let source = match source {
+            SlowOperand::Xmm(register) => format!("xmm_f64(c, {register})"),
+            SlowOperand::Mem(address) => format!("rdf64((uint32_t)({address}))"),
+            _ => return self.unsupported(addr, "CVTTSD2SI source"),
+        };
+        let line = write_gpr(
+            *index,
+            *shift,
+            *mask,
+            &format!("(uint32_t)recomp_sse_cvttsd2si({source})"),
+        );
+        let _ = writeln!(self.out, "{line}");
+        Ok(true)
+    }
+
+    fn slow_pextrw(
+        &mut self,
+        dst: &SlowOperand,
+        src: Option<&SlowOperand>,
+        imm: Option<&SlowOperand>,
+        addr: Addr,
+    ) -> Result<bool> {
+        let (SlowOperand::Gpr { index, shift, mask }, Some(SlowOperand::Xmm(register)), Some(SlowOperand::Imm(order))) =
+            (dst, src, imm)
+        else {
+            return self.unsupported(addr, "PEXTRW form");
+        };
+        let word = order & 7;
+        let lane = word / 2;
+        let bits = (word % 2) * 16;
+        let line = write_gpr(
+            *index,
+            *shift,
+            *mask,
+            &format!("(c->xmm[{register}][{lane}] >> {bits}) & 0xffffu"),
+        );
+        let _ = writeln!(self.out, "{line}");
+        Ok(true)
+    }
+
+    fn slow_movdq2q(
+        &mut self,
+        dst: &SlowOperand,
+        src: Option<&SlowOperand>,
+        addr: Addr,
+    ) -> Result<bool> {
+        let (SlowOperand::Mm(destination), Some(SlowOperand::Xmm(source))) = (dst, src) else {
+            return self.unsupported(addr, "MOVDQ2Q form");
+        };
+        let _ = writeln!(
+            self.out,
+            "c->mm[{destination}] = xmm_low64(c->xmm[{source}]);"
+        );
+        Ok(true)
+    }
+
     fn slow_movd(&mut self, dst: &SlowOperand, src: Option<&SlowOperand>, addr: Addr) -> Result<bool> {
         match (dst, src) {
             (SlowOperand::Mm(destination), Some(source)) => {
@@ -1207,6 +1498,28 @@ impl<'a> Emitter<'a> {
             }
             (SlowOperand::Gpr { index, shift, mask }, Some(SlowOperand::Mm(source))) => {
                 let line = write_gpr(*index, *shift, *mask, &format!("(uint32_t)c->mm[{source}]"));
+                let _ = writeln!(self.out, "{line}");
+            }
+            (SlowOperand::Xmm(destination), Some(source)) => {
+                let Some(source) = mmx_source(source, 32) else {
+                    return self.unsupported(addr, "MOVD source");
+                };
+                self.out.push_str("{\n");
+                let _ = writeln!(self.out, "uint32_t v_ = (uint32_t)({source});");
+                let _ = writeln!(
+                    self.out,
+                    "c->xmm[{destination}][0] = v_; c->xmm[{destination}][1] = 0u; c->xmm[{destination}][2] = 0u; c->xmm[{destination}][3] = 0u;"
+                );
+                self.out.push_str("}\n");
+            }
+            (SlowOperand::Mem(address), Some(SlowOperand::Xmm(source))) => {
+                let _ = writeln!(
+                    self.out,
+                    "recomp_wr32_(g_mem, (uint32_t)({address}), c->xmm[{source}][0]);"
+                );
+            }
+            (SlowOperand::Gpr { index, shift, mask }, Some(SlowOperand::Xmm(source))) => {
+                let line = write_gpr(*index, *shift, *mask, &format!("c->xmm[{source}][0]"));
                 let _ = writeln!(self.out, "{line}");
             }
             _ => {
@@ -1230,6 +1543,24 @@ impl<'a> Emitter<'a> {
                     "recomp_wr64_(g_mem, (uint32_t)({address}), c->mm[{source}]);"
                 );
             }
+            (SlowOperand::Xmm(destination), Some(source)) => {
+                let Some(source) = self.xmm_low_source(source) else {
+                    return self.unsupported(addr, "MOVQ source");
+                };
+                self.out.push_str("{\n");
+                let _ = writeln!(self.out, "uint64_t v_ = {source};");
+                let _ = writeln!(
+                    self.out,
+                    "c->xmm[{destination}][0] = (uint32_t)v_; c->xmm[{destination}][1] = (uint32_t)(v_ >> 32); c->xmm[{destination}][2] = 0u; c->xmm[{destination}][3] = 0u;"
+                );
+                self.out.push_str("}\n");
+            }
+            (SlowOperand::Mem(address), Some(SlowOperand::Xmm(source))) => {
+                let _ = writeln!(
+                    self.out,
+                    "recomp_wr64_(g_mem, (uint32_t)({address}), xmm_low64(c->xmm[{source}]));"
+                );
+            }
             _ => {
                 return self.unsupported(addr, "MOVQ form");
             }
@@ -1240,6 +1571,10 @@ impl<'a> Emitter<'a> {
     fn call(&mut self, value: ValueId, target: Addr) -> Result<()> {
         self.publish(value)?;
         self.publish_guard(value)?;
+        if self.ctx.setjmp_targets.contains(&target) {
+            self.out.push_str("RECOMP_SETJMP3(c);\n");
+            return Ok(());
+        }
         if let Some((private_target, wanted)) = self.plan.call_masks.get(&value).copied() {
             if private_target == target {
                 if let Some(mask) = self
@@ -1274,7 +1609,7 @@ impl<'a> Emitter<'a> {
                         self.out,
                         "if (entry_contract_prepare_{target:08x}(c, 0)) {{ entry_contract_{target:08x}_{:04x}({args}); }} else {{ CALL_FN_CHECKED({target:08x}, 0x{expected:08x}u); }}", mask.0
                     );
-                    if self.plan.settle_calls.contains(&value) {
+                    if self.plan.settle_sites.contains(&value) {
                         self.out.push_str("x86_cc_settle(c);\n");
                     }
                     return Ok(());
@@ -1295,7 +1630,7 @@ impl<'a> Emitter<'a> {
             self.declare_entry(target);
             let _ = writeln!(self.out, "CALL_FN({target:08x});");
         }
-        if self.plan.settle_calls.contains(&value) {
+        if self.plan.settle_sites.contains(&value) {
             self.out.push_str("x86_cc_settle(c);\n");
         }
         Ok(())
@@ -1314,7 +1649,7 @@ impl<'a> Emitter<'a> {
             self.out,
             "recomp_icall(c, (uint32_t)({target}), &{name}, 0x{addr:08x}u);"
         );
-        if self.plan.settle_calls.contains(&value) {
+        if self.plan.settle_sites.contains(&value) {
             self.out.push_str("x86_cc_settle(c);\n");
         }
         Ok(())
@@ -1606,7 +1941,7 @@ impl<'a> Emitter<'a> {
             });
         }
         for location in locations {
-            self.publish_location(location, &state)?;
+            self.publish_location(location, &state, keys)?;
         }
         if let Some((descriptor, mask)) = descriptor {
             self.publish_descriptor(&descriptor, mask)?;
@@ -1673,30 +2008,71 @@ impl<'a> Emitter<'a> {
         result
     }
 
-    fn publish_location(&mut self, location: Location, state: &BTreeMap<StateKey, ValueId>) -> Result<()> {
+    fn publish_location(
+        &mut self,
+        location: Location,
+        state: &BTreeMap<StateKey, ValueId>,
+        keys: &[StateKey],
+    ) -> Result<()> {
         match location {
             Location::Gpr(index) => {
                 let field = Field::ALL[index];
                 let lanes = rk_ir::lanes(field);
-                let values: Vec<Option<ValueId>> = (0..4)
-                    .map(|lane| lanes.get(lane).and_then(|key| state.get(key).copied()))
-                    .collect();
+                let mut values = Vec::with_capacity(4);
+                for lane in 0..4 {
+                    let Some(&key) = lanes.get(lane) else {
+                        values.push(None);
+                        continue;
+                    };
+                    values.push(self.listed_value(state, keys, key)?);
+                }
                 self.publish_lanes(&format!("r[{index}]"), values)?;
             }
             Location::Flag(field) => {
                 let key = rk_ir::lanes(field).first().copied();
-                let value = key.and_then(|key| state.get(&key).copied());
+                let value = match key {
+                    Some(key) => self.listed_value(state, keys, key)?,
+                    None => None,
+                };
                 let expr = match value {
                     Some(value) => self.expr(value)?,
                     None => format!("c->eflags_{}", field.name().to_ascii_lowercase()),
                 };
                 let _ = writeln!(self.out, "c->eflags_{} = (uint32_t)(({expr}) & 1u);", field.name().to_ascii_lowercase());
             }
-            Location::Eip => self.publish_register("eip", "EIP", state)?,
-            Location::Fs => self.publish_register("fs_base", "FS_OFFSET", state)?,
+            Location::Xmm(reg, lane) => {
+                let register = Registers::get().require(&format!("XMM{reg}"));
+                let mut values = Vec::with_capacity(4);
+                for byte in 0..4 {
+                    let key = StateKey::Register((register.offset + lane as u64 * 4 + byte as u64) as u32);
+                    values.push(self.listed_value(state, keys, key)?);
+                }
+                let text = match values.iter().copied().collect::<Option<Vec<_>>>() {
+                    Some(all) => self.pack_lanes(&all),
+                    None => None,
+                };
+                let expr = match text {
+                    Some(text) => text,
+                    None => values
+                        .iter()
+                        .enumerate()
+                        .map(|(byte, value)| {
+                            let expr = match value {
+                                Some(value) => self.expr(*value),
+                                None => Ok(format!("((c->xmm[{reg}][{lane}] >> {}) & 0xffu)", byte * 8)),
+                            }?;
+                            Ok(format!("((({expr}) & 0xffu) << {})", byte * 8))
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                        .join(" | "),
+                };
+                let _ = writeln!(self.out, "c->xmm[{reg}][{lane}] = (uint32_t)({expr});");
+            }
+            Location::Eip => self.publish_register("eip", "EIP", state, keys)?,
+            Location::Fs => self.publish_register("fs_base", "FS_OFFSET", state, keys)?,
             Location::Df => {
                 let key = StateKey::Register(Registers::get().require("DF").offset as u32);
-                let value = state.get(&key).copied();
+                let value = self.listed_value(state, keys, key)?;
                 let expr = match value {
                     Some(value) => self.expr(value)?,
                     None => "c->eflags_df".to_string(),
@@ -1712,12 +2088,34 @@ impl<'a> Emitter<'a> {
         field: &str,
         register: &str,
         state: &BTreeMap<StateKey, ValueId>,
+        keys: &[StateKey],
     ) -> Result<()> {
         let varnode = Registers::get().require(register);
-        let values: Vec<Option<ValueId>> = (0..varnode.size)
-            .map(|lane| state.get(&StateKey::Register((varnode.offset + lane as u64) as u32)).copied())
-            .collect();
+        let mut values = Vec::with_capacity(varnode.size as usize);
+        for lane in 0..varnode.size {
+            let key = StateKey::Register((varnode.offset + lane as u64) as u32);
+            values.push(self.listed_value(state, keys, key)?);
+        }
         self.publish_lanes(field, values)
+    }
+
+    fn listed_value(
+        &self,
+        state: &BTreeMap<StateKey, ValueId>,
+        keys: &[StateKey],
+        key: StateKey,
+    ) -> Result<Option<ValueId>> {
+        if !keys.contains(&key) {
+            return Ok(None);
+        }
+        let value = state
+            .get(&key)
+            .copied()
+            .ok_or_else(|| self.error(0, "missing publish value"))?;
+        if !self.available(value) {
+            return Err(self.error(0, "unavailable publish value"));
+        }
+        Ok(Some(value))
     }
 
     fn publish_lanes(&mut self, field: &str, values: Vec<Option<ValueId>>) -> Result<()> {
@@ -1909,6 +2307,25 @@ impl<'a> Emitter<'a> {
         let cast = |text: String| if wide { format!("(uint64_t)({text})") } else { text };
         let zero = if wide { "0ull" } else { "0u" };
         let one = if wide { "1ull" } else { "1u" };
+        if let Op::P(
+            OpCode::FloatNan
+            | OpCode::FloatEqual
+            | OpCode::FloatLess
+            | OpCode::FloatAdd
+            | OpCode::FloatSub
+            | OpCode::FloatMult
+            | OpCode::FloatDiv
+            | OpCode::FloatMin
+            | OpCode::FloatMax
+            | OpCode::Cvtss2si
+            | OpCode::Cvttss2si
+            | OpCode::Cvtsi2ss,
+        ) = item.op
+        {
+            if args.iter().any(|arg| self.s.value(*arg).size != 4) {
+                return Err(self.error(0, "non-binary32 scalar float operand"));
+            }
+        }
         let result = match item.op {
             Op::Const(data) => const_expr(data, item.size),
             Op::Input(key) => self.field_expr(key, item.size)?,
@@ -1932,6 +2349,56 @@ impl<'a> Emitter<'a> {
             Op::Memory => "0u".to_string(),
             Op::Phi => format!("v{value}"),
             Op::P(code) => match code {
+                OpCode::FloatNan => format!("!!isnan(recomp_sse_f32((uint32_t)({})))", a(0)?),
+                OpCode::FloatEqual => format!(
+                    "(recomp_sse_f32((uint32_t)({})) == recomp_sse_f32((uint32_t)({})))",
+                    a(0)?, a(1)?
+                ),
+                OpCode::FloatNotEqual => format!(
+                    "(recomp_sse_f32((uint32_t)({})) != recomp_sse_f32((uint32_t)({})))",
+                    a(0)?, a(1)?
+                ),
+                OpCode::FloatLess => format!(
+                    "(recomp_sse_f32((uint32_t)({})) < recomp_sse_f32((uint32_t)({})))",
+                    a(0)?, a(1)?
+                ),
+                OpCode::FloatLessEqual => format!(
+                    "(recomp_sse_f32((uint32_t)({})) <= recomp_sse_f32((uint32_t)({})))",
+                    a(0)?, a(1)?
+                ),
+                OpCode::FloatSqrt => format!(
+                    "recomp_sse_sqrtps((uint32_t)({}))", a(0)?
+                ),
+                OpCode::FloatRcp => format!(
+                    "recomp_sse_rcpps((uint32_t)({}))", a(0)?
+                ),
+                OpCode::FloatRsqrt => format!(
+                    "recomp_sse_rsqrtps((uint32_t)({}))", a(0)?
+                ),
+                OpCode::FloatAdd
+                | OpCode::FloatSub
+                | OpCode::FloatMult
+                | OpCode::FloatDiv
+                | OpCode::FloatMin
+                | OpCode::FloatMax => {
+                    let helper = match code {
+                        OpCode::FloatAdd => "add",
+                        OpCode::FloatSub => "sub",
+                        OpCode::FloatMult => "mul",
+                        OpCode::FloatDiv => "div",
+                        OpCode::FloatMin => "min",
+                        _ => "max",
+                    };
+                    let context = if matches!(code, OpCode::FloatMin | OpCode::FloatMax) { "" } else { "c, " };
+                    format!("recomp_sse_{helper}ps({context}(uint32_t)({}), (uint32_t)({}))", a(0)?, a(1)?)
+                }
+                OpCode::Cvtss2si | OpCode::Cvttss2si => {
+                    let helper = if code == OpCode::Cvtss2si { "cvtss2si" } else { "cvttss2si" };
+                    format!("(uint32_t)recomp_sse_{helper}(recomp_sse_f32((uint32_t)({})))", a(0)?)
+                }
+                OpCode::Cvtsi2ss => {
+                    format!("recomp_sse_f32_bits((float)(int32_t)(uint32_t)({}))", a(0)?)
+                }
                 OpCode::Copy | OpCode::IntZExt => a(0)?,
                 OpCode::IntSExt => {
                     let from = args.first().map_or(1, |arg| self.s.value(*arg).size) * 8;
@@ -2061,6 +2528,9 @@ impl<'a> Emitter<'a> {
                 0,
                 1,
             ));
+        }
+        if let Some((reg, offset)) = rk_ir::xmm_offset(key) {
+            return Some((format!("c->xmm[{reg}][{}]", offset / 4), (offset % 4) as u32, 4));
         }
         let StateKey::Register(offset) = key else {
             return None;
@@ -2271,6 +2741,7 @@ fn parse_slow_operand(text: &str) -> Option<SlowOperand> {
     let lower = text.to_ascii_lowercase();
     for prefix in [
         "extended double ptr ",
+        "float ptr ",
         "xmmword ptr ",
         "mmword ptr ",
         "qword ptr ",
@@ -2491,6 +2962,78 @@ fn mmx_binary(mnemonic: &str) -> Option<(&'static str, u32)> {
     })
 }
 
+fn xmm_binary(mnemonic: &str) -> Option<(&'static str, Option<u32>)> {
+    Some(match mnemonic {
+        "PADDB" => ("xmm_padd", Some(8)),
+        "PADDW" => ("xmm_padd", Some(16)),
+        "PADDD" => ("xmm_padd", Some(32)),
+        "PADDQ" => ("xmm_padd", Some(64)),
+        "PSUBB" => ("xmm_psub", Some(8)),
+        "PSUBW" => ("xmm_psub", Some(16)),
+        "PSUBD" => ("xmm_psub", Some(32)),
+        "PSUBQ" => ("xmm_psub", Some(64)),
+        "PADDSB" => ("xmm_padds", Some(8)),
+        "PADDSW" => ("xmm_padds", Some(16)),
+        "PSUBSB" => ("xmm_psubs", Some(8)),
+        "PSUBSW" => ("xmm_psubs", Some(16)),
+        "PADDUSB" => ("xmm_paddus", Some(8)),
+        "PADDUSW" => ("xmm_paddus", Some(16)),
+        "PSUBUSB" => ("xmm_psubus", Some(8)),
+        "PSUBUSW" => ("xmm_psubus", Some(16)),
+        "PMULLW" => ("xmm_pmullw", None),
+        "PMULHW" => ("xmm_pmulhw", None),
+        "PMADDWD" => ("xmm_pmaddwd", None),
+        "PCMPEQB" => ("xmm_pcmpeq", Some(8)),
+        "PCMPEQW" => ("xmm_pcmpeq", Some(16)),
+        "PCMPEQD" => ("xmm_pcmpeq", Some(32)),
+        "PCMPGTB" => ("xmm_pcmpgt", Some(8)),
+        "PCMPGTW" => ("xmm_pcmpgt", Some(16)),
+        "PCMPGTD" => ("xmm_pcmpgt", Some(32)),
+        "PMINUB" => ("xmm_pminub", None),
+        "PMAXUB" => ("xmm_pmaxub", None),
+        "PAND" => ("xmm_pand", None),
+        "PANDN" => ("xmm_pandn", None),
+        "POR" => ("xmm_por", None),
+        "PXOR" => ("xmm_pxor", None),
+        _ => return None,
+    })
+}
+
+fn xmm_shift(mnemonic: &str) -> Option<(&'static str, u32)> {
+    Some(match mnemonic {
+        "PSRLW" => ("xmm_psrl", 16),
+        "PSRLD" => ("xmm_psrl", 32),
+        "PSRLQ" => ("xmm_psrl", 64),
+        "PSRAW" => ("xmm_psra", 16),
+        "PSRAD" => ("xmm_psra", 32),
+        "PSLLW" => ("xmm_psll", 16),
+        "PSLLD" => ("xmm_psll", 32),
+        "PSLLQ" => ("xmm_psll", 64),
+        _ => return None,
+    })
+}
+
+fn xmm_pack(mnemonic: &str) -> Option<(u32, u32)> {
+    Some(match mnemonic {
+        "PACKSSWB" => (16, 1),
+        "PACKSSDW" => (32, 1),
+        "PACKUSWB" => (16, 0),
+        _ => return None,
+    })
+}
+
+fn xmm_unpack(mnemonic: &str) -> Option<(u32, u32)> {
+    Some(match mnemonic {
+        "PUNPCKLBW" => (8, 0),
+        "PUNPCKLWD" => (16, 0),
+        "PUNPCKLDQ" => (32, 0),
+        "PUNPCKHBW" => (8, 1),
+        "PUNPCKHWD" => (16, 1),
+        "PUNPCKHDQ" => (32, 1),
+        _ => return None,
+    })
+}
+
 struct ValueNames<'b, 'a>(&'b Emitter<'a>);
 
 impl rk_x87::External for ValueNames<'_, '_> {
@@ -2503,6 +3046,7 @@ impl rk_x87::External for ValueNames<'_, '_> {
 enum Location {
     Gpr(usize),
     Flag(Field),
+    Xmm(usize, usize),
     Eip,
     Fs,
     Df,
@@ -2537,6 +3081,9 @@ fn location(key: StateKey) -> Option<Location> {
             return Some(Location::Gpr(field as usize));
         }
         return Some(Location::Flag(field));
+    }
+    if let Some((reg, offset)) = rk_ir::xmm_offset(key) {
+        return Some(Location::Xmm(reg, (offset / 4) as usize));
     }
     let StateKey::Register(offset) = key else { return None };
     let (name, _) = Registers::get().covering(offset as u64)?;

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use rk_core::ir::Policy;
 use rk_core::settings::FaultState;
 use rk_core::LookupSet;
-use rk_ir::{Op, StateKey};
+use rk_ir::{xmm_offset, Op, StateKey};
 
 use crate::{
     canonicalize, forward, simplify, BuildOptions, CallFacts, ConservativeCallFacts, Ssa, ValueId,
@@ -108,6 +108,7 @@ pub fn publications(s: &Ssa, call_facts: &dyn CallFacts) -> BTreeMap<ValueId, Ve
                     .enumerate()
                     .filter(|(index, key)| {
                         **key == StateKey::Memory
+                            || xmm_offset(**key).is_some()
                             || s.field_of[*index].is_some_and(|field| wanted.contains(&field))
                     })
                     .map(|(_, key)| *key)

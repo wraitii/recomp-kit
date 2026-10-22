@@ -104,8 +104,9 @@ void recomp_rdtsc(X86 *c) {
     c->r[R_EAX] = (uint32_t)fake_tsc;
     c->r[R_EDX] = (uint32_t)(fake_tsc >> 32);
 }
-/* Deterministic CPUID (plan correction 5): GenuineIntel, family 6 model 3,
- * features FPU|TSC|CMOV|MMX.  The real runtime must report the same values. */
+/* Deterministic CPUID (plan correction 5): GenuineIntel, family 6 model 7,
+ * features FPU|TSC|CMOV|MMX|FXSR|SSE.  The real runtime must report the same
+ * values. */
 void recomp_cpuid(X86 *c) {
     switch (c->r[R_EAX]) {
     case 0:
@@ -115,15 +116,25 @@ void recomp_cpuid(X86 *c) {
         c->r[R_ECX] = 0x6c65746e; /* "ntel" */
         break;
     case 1:
-        c->r[R_EAX] = 0x00000633; /* family 6, model 3, stepping 3 */
+        c->r[R_EAX] = 0x00000672; /* family 6, model 7, stepping 2 */
         c->r[R_EBX] = 0;
         c->r[R_ECX] = 0;
-        c->r[R_EDX] = (1u << 0) | (1u << 4) | (1u << 15) | (1u << 23); /* FPU TSC CMOV MMX */
+        c->r[R_EDX] = (1u << 0) | (1u << 4) | (1u << 15) | (1u << 23) | (1u << 24) |
+                      (1u << 25); /* FPU TSC CMOV MMX FXSR SSE */
         break;
     default:
         c->r[R_EAX] = c->r[R_EBX] = c->r[R_ECX] = c->r[R_EDX] = 0;
         break;
     }
+}
+
+void recomp_ldmxcsr(X86 *c, uint32_t addr, uint32_t a) {
+    uint32_t value = rd32(a);
+    if ((value & ~0xffbfu) || (value & 0x7f80u) != 0x1f80u) {
+        harness_escape("unmodelled MXCSR", addr);
+        abort();
+    }
+    c->mxcsr = value;
 }
 
 /* setjmp/longjmp intrinsics: the tests never exercise a guest longjmp, so

@@ -404,16 +404,11 @@ struct X86 {
      * use.  Initialise to 0xffff (the post-FINIT all-empty state). */
     uint16_t fpu_tag;
     uint32_t fs_base;
-    /* SSE2. The translator models the data-movement subset only -
-     * loads, stores, a dword broadcast - which is all a Delphi runtime's
-     * FillChar and Move use, and byte order is then the only thing that has
-     * to be right. There are eight in 32-bit mode. CPUID advertises no SSE,
-     * so nothing chooses one of these paths from a feature test; the RTL
-     * takes them unconditionally because every CPU it supports has SSE2.
-     * Held as dwords: every modelled form - load, store, MOVD, MOVQ and
-     * PSHUFD's selector - addresses the register in dword lanes, and on a
-     * little-endian host the byte order of a copy then takes care of
-     * itself. Lane 0 is the low four bytes. */
+    /* MXCSR. Initialise to 0x1f80 (round to nearest, every exception masked). */
+    uint32_t mxcsr;
+    /* Held as dwords: SSE arithmetic and moves address the register in
+     * dword lanes, and on a little-endian host the byte order of a copy then
+     * takes care of itself. Lane 0 is the low four bytes. */
     uint32_t xmm[8][4];
     /* The eight MMX registers. Kept apart from the x87 stack: a program that
      * leaves MMX without EMMS and then uses the FPU sees its old values, not
@@ -469,21 +464,23 @@ static inline double recomp_sse_sqrt(double v) {
     }
     return sqrt(v);
 }
+static inline int recomp_sse_nan_bits(uint32_t bits) {
+    return (bits & 0x7fffffffu) > 0x7f800000u;
+}
 static inline float recomp_sse_sqrtf(float v) {
-    uint32_t bits;
-    memcpy(&bits, &v, 4);
-    if ((bits >> 31) && (bits << 1) != 0) {
-        uint32_t indefinite = 0xffc00000u;
-        float r;
-        memcpy(&r, &indefinite, 4);
-        return r;
+    float r = sqrtf(v);
+    if (RECOMP_UNLIKELY(isnan(r))) {
+        uint32_t bits;
+        memcpy(&bits, &v, 4);
+        bits = recomp_sse_nan_bits(bits) ? (bits | 0x00400000u) : 0xffc00000u;
+        memcpy(&r, &bits, 4);
     }
-    return sqrtf(v);
+    return r;
 }
 
-/* CVTSS2SI/CVTSD2SI round according to MXCSR. The runtime exposes the reset
- * MXCSR, whose rounding mode is round-to-nearest-even, and models no guest
- * writes to it. Values that round outside int32 produce the indefinite result. */
+/* CVTSS2SI/CVTSD2SI round according to MXCSR, which recomp_ldmxcsr holds at
+ * round-to-nearest-even. Values that round outside int32 produce the
+ * indefinite result. */
 static inline int32_t recomp_sse_cvtsd2si(double v) {
     double rounded = nearbyint(v);
     if (!(rounded >= -2147483648.0 && rounded <= 2147483647.0))
@@ -493,11 +490,13 @@ static inline int32_t recomp_sse_cvtsd2si(double v) {
 static inline int32_t recomp_sse_cvtss2si(float v) {
     return recomp_sse_cvtsd2si((double)v);
 }
-static inline int32_t recomp_sse_cvttss2si(float v) {
-    double d = (double)v;
-    if (!(d >= -2147483648.0 && d < 2147483648.0))
+static inline int32_t recomp_sse_cvttsd2si(double v) {
+    if (!(v >= -2147483648.0 && v < 2147483648.0))
         return INT32_MIN;
-    return (int32_t)d;
+    return (int32_t)v;
+}
+static inline int32_t recomp_sse_cvttss2si(float v) {
+    return recomp_sse_cvttsd2si((double)v);
 }
 
 static inline float recomp_sse_f32(uint32_t bits) {
@@ -510,17 +509,41 @@ static inline uint32_t recomp_sse_f32_bits(float v) {
     memcpy(&bits, &v, 4);
     return bits;
 }
-static inline uint32_t recomp_sse_addps(uint32_t a, uint32_t b) {
-    return recomp_sse_f32_bits(recomp_sse_f32(a) + recomp_sse_f32(b));
+/* MXCSR.FTZ replaces a tiny result with a zero of the same sign. x86 detects
+ * tininess after rounding to an unbounded exponent, so a result the host
+ * rounds up to the smallest normal can still flush; the exact value, which
+ * double precision holds for these operations, scaled out of the denormal
+ * range, decides it. */
+static inline uint32_t recomp_sse_result(const X86 *c, uint32_t a, uint32_t b, float r, double exact) {
+    uint32_t bits = recomp_sse_f32_bits(r), magnitude = bits & 0x7fffffffu;
+    if (RECOMP_UNLIKELY(magnitude - 1u < 0x00800000u)) {
+        if ((c->mxcsr & 0x8000u) && fabsf((float)(exact * 0x1p64)) < 0x1p-62f)
+            return bits & 0x80000000u;
+        return bits;
+    }
+    if (!RECOMP_UNLIKELY(magnitude > 0x7f800000u))
+        return bits;
+    if (recomp_sse_nan_bits(a))
+        return a | 0x00400000u;
+    if (recomp_sse_nan_bits(b))
+        return b | 0x00400000u;
+    return 0xffc00000u;
 }
-static inline uint32_t recomp_sse_subps(uint32_t a, uint32_t b) {
-    return recomp_sse_f32_bits(recomp_sse_f32(a) - recomp_sse_f32(b));
+static inline uint32_t recomp_sse_addps(const X86 *c, uint32_t a, uint32_t b) {
+    float x = recomp_sse_f32(a), y = recomp_sse_f32(b);
+    return recomp_sse_result(c, a, b, x + y, (double)x + (double)y);
 }
-static inline uint32_t recomp_sse_mulps(uint32_t a, uint32_t b) {
-    return recomp_sse_f32_bits(recomp_sse_f32(a) * recomp_sse_f32(b));
+static inline uint32_t recomp_sse_subps(const X86 *c, uint32_t a, uint32_t b) {
+    float x = recomp_sse_f32(a), y = recomp_sse_f32(b);
+    return recomp_sse_result(c, a, b, x - y, (double)x - (double)y);
 }
-static inline uint32_t recomp_sse_divps(uint32_t a, uint32_t b) {
-    return recomp_sse_f32_bits(recomp_sse_f32(a) / recomp_sse_f32(b));
+static inline uint32_t recomp_sse_mulps(const X86 *c, uint32_t a, uint32_t b) {
+    float x = recomp_sse_f32(a), y = recomp_sse_f32(b);
+    return recomp_sse_result(c, a, b, x * y, (double)x * (double)y);
+}
+static inline uint32_t recomp_sse_divps(const X86 *c, uint32_t a, uint32_t b) {
+    float x = recomp_sse_f32(a), y = recomp_sse_f32(b);
+    return recomp_sse_result(c, a, b, x / y, (double)x / (double)y);
 }
 static inline uint32_t recomp_sse_minps(uint32_t a, uint32_t b) {
     float x = recomp_sse_f32(a), y = recomp_sse_f32(b);
@@ -535,19 +558,22 @@ static inline uint32_t recomp_sse_sqrtps(uint32_t a) {
 }
 /* The original RCPPS/RSQRTPS are approximate. These return the IEEE result,
  * which is also what the Unicorn oracle produces. DIVERGENCE(original): the
- * low bits may differ from a real x86 approximation instruction. */
+ * low bits may differ from a real x86 approximation instruction. RCPPS
+ * flushes a tiny result to zero whatever MXCSR says. */
 static inline uint32_t recomp_sse_rcpps(uint32_t a) {
-    return recomp_sse_f32_bits(1.0f / recomp_sse_f32(a));
+    float r = 1.0f / recomp_sse_f32(a);
+    uint32_t bits = recomp_sse_f32_bits(r);
+    if (RECOMP_UNLIKELY(isnan(r)))
+        return recomp_sse_nan_bits(a) ? (a | 0x00400000u) : 0xffc00000u;
+    if (RECOMP_UNLIKELY((bits & 0x7fffffffu) < 0x00800000u))
+        return bits & 0x80000000u;
+    return bits;
 }
 static inline uint32_t recomp_sse_rsqrtps(uint32_t a) {
-    float x = recomp_sse_f32(a);
-    if (isnan(x))
-        return recomp_sse_f32_bits(x);
-    if (x == 0.0f)
-        return (a >> 31) ? 0xff800000u : 0x7f800000u;
-    if (a >> 31)
-        return 0xffc00000u;
-    return recomp_sse_f32_bits(1.0f / recomp_sse_sqrtf(x));
+    float r = 1.0f / recomp_sse_sqrtf(recomp_sse_f32(a));
+    if (RECOMP_UNLIKELY(isnan(r)))
+        return recomp_sse_nan_bits(a) ? (a | 0x00400000u) : 0xffc00000u;
+    return recomp_sse_f32_bits(r);
 }
 static inline float recomp_sse_rcpss(float v) {
     return recomp_sse_f32(recomp_sse_rcpps(recomp_sse_f32_bits(v)));
@@ -585,18 +611,6 @@ static inline uint32_t recomp_sse_cmpps(unsigned pred, uint32_t a, uint32_t b) {
         break;
     }
     return r ? 0xffffffffu : 0u;
-}
-
-/* FXSAVE is used here only to probe MXCSR_MASK. The runtime exposes the reset
- * x87/SSE environment and does not model guest MXCSR writes, so publish that
- * environment and a mask advertising the usual DAZ support. */
-static inline void recomp_fxsave(uint32_t addr) {
-    for (uint32_t offset = 0; offset < 512; offset += 4)
-        wr32(addr + offset, 0u);
-    wr16(addr, 0x037fu);
-    wr16(addr + 4, 0xffffu);
-    wr32(addr + 0x18, 0x1f80u);
-    wr32(addr + 0x1c, 0xffffu);
 }
 
 /* COMISD/UCOMISD and their single-precision forms: the one place SSE writes
@@ -700,6 +714,7 @@ void recomp_div_error(X86 *c, uint32_t addr);
 
 void recomp_rdtsc(X86 *c); /* -> EDX:EAX */
 void recomp_cpuid(X86 *c); /* EAX in -> EAX EBX ECX EDX */
+void recomp_ldmxcsr(X86 *c, uint32_t addr, uint32_t a);
 uint32_t recomp_in(X86 *c, uint32_t port, int size);
 void recomp_out(X86 *c, uint32_t port, uint32_t val, int size);
 void recomp_cli(X86 *c);
@@ -2017,6 +2032,34 @@ static inline void x87_frstor(X86 *c, uint32_t a) {
     c->fpu_tag = rd16(a + 8);
 }
 
+/* FXSAVE m512: control and status words, the abridged tag byte (one bit per
+ * physical register, set when in use), the exception pointers this model
+ * does not track, MXCSR and MXCSR_MASK, then ST(0) through ST(7) in 16-byte
+ * slots and XMM0-7. The mask leaves out DAZ: the modelled CPU, a Pentium III,
+ * has none, and recomp_ldmxcsr refuses it. */
+static inline void recomp_fxsave(const X86 *c, uint32_t a) {
+    unsigned i, tags = 0;
+    for (uint32_t offset = 0; offset < 512; offset += 4)
+        wr32(a + offset, 0u);
+    for (i = 0; i < 8; i++)
+        if (((c->fpu_tag >> (2 * i)) & 3u) != 3u)
+            tags |= 1u << i;
+    wr16(a, c->fpu_cw);
+    wr16(a + 2, fstsw(c));
+    wr8(a + 4, (uint8_t)tags);
+    wr32(a + 0x18, c->mxcsr);
+    wr32(a + 0x1c, 0xffbfu);
+    for (i = 0; i < 8; i++)
+        wrf80(a + 0x20 + 16 * i, ST(c, i));
+    for (i = 0; i < 8; i++)
+        for (unsigned lane = 0; lane < 4; lane++)
+            wr32(a + 0xa0 + 16 * i + 4 * lane, c->xmm[i][lane]);
+}
+
+static inline void recomp_stmxcsr(const X86 *c, uint32_t a) {
+    wr32(a, c->mxcsr);
+}
+
 /* One binary32 ULP toward +infinity (up) or -infinity, bit for bit what
  * nextafterf gives for the inputs the directed-rounding step reaches: finite
  * nonzero values, infinities (stepping FLT_MAX out of an infinity) and zero
@@ -2464,6 +2507,10 @@ RECOMP_XMM_BIN64(xmm_pmulhw, mmx_pmulhw)
 RECOMP_XMM_BIN64(xmm_pmaddwd, mmx_pmaddwd)
 RECOMP_XMM_BIN64(xmm_pminub, mmx_pminub)
 RECOMP_XMM_BIN64(xmm_pmaxub, mmx_pmaxub)
+RECOMP_XMM_BIN64(xmm_pand, mmx_pand)
+RECOMP_XMM_BIN64(xmm_pandn, mmx_pandn)
+RECOMP_XMM_BIN64(xmm_por, mmx_por)
+RECOMP_XMM_BIN64(xmm_pxor, mmx_pxor)
 #undef RECOMP_XMM_BIN
 #undef RECOMP_XMM_BIN64
 #define RECOMP_XMM_SHIFT(name, fn)                                                                 \
@@ -2485,10 +2532,10 @@ static inline void xmm_punpck(uint32_t d[4], const uint32_t s[4], unsigned bits,
         hi = high ? sh : sl;
     } else if (high) {
         lo = mmx_punpckl(dh, sh, bits);
-        hi = bits == 32 ? 0 : mmx_punpckh(dh, sh, bits);
+        hi = mmx_punpckh(dh, sh, bits);
     } else {
         lo = mmx_punpckl(dl, sl, bits);
-        hi = bits == 32 ? 0 : mmx_punpckh(dl, sl, bits);
+        hi = mmx_punpckh(dl, sl, bits);
     }
     xmm_put64(d, 0, lo);
     xmm_put64(d, 1, hi);

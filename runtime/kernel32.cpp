@@ -1892,8 +1892,8 @@ void k_SetLastError(X86 *c) {
     set_eax(c, 0);
 }
 
-// The guest CPU is fixed by recomp_cpuid(): GenuineIntel family 6, model 3
-// (Pentium II), with FPU, TSC, CMOV and MMX. Answer from that same model
+// The guest CPU is fixed by recomp_cpuid(): GenuineIntel family 6, model 7
+// (Pentium III), with FPU, TSC, CMOV, MMX, FXSR and SSE. Answer from that same model
 // so CPUID and this API can never disagree. Feature codes follow winnt.h; an
 // unknown code is FALSE, as on Windows.
 void k_IsProcessorFeaturePresent(X86 *c) {
@@ -1916,9 +1916,10 @@ void k_IsProcessorFeaturePresent(X86 *c) {
     // Do not infer it from the nominal CPU family/model.
     case PF_MMX_INSTRUCTIONS_AVAILABLE:  // CPUID EDX bit 23 is advertised
     case PF_RDTSC_INSTRUCTION_AVAILABLE: // CPUID EDX bit 4 is advertised
+    case PF_XMMI_INSTRUCTIONS_AVAILABLE: // CPUID EDX bit 25 is advertised
         present = true;
         break;
-    default: // the FDIV erratum, FPU emulation, SSE/3DNow and the rest
+    default: // the FDIV erratum, FPU emulation, SSE2/3DNow and the rest
         present = false;
         break;
     }
@@ -3933,6 +3934,7 @@ bool thread_prepare_context(GuestThread *t) {
     t->ctx.fpu_tag = 0xffff;
     t->ctx.fpu_top = 0;
     t->ctx.eflags_misc = 0x00000202u;
+    t->ctx.mxcsr = 0x1f80u;
     t->ctx.fs_base = t->teb;
     wr32(t->teb + 0x00, 0xffffffffu); // SEH chain head: empty
     wr32(t->teb + 0x04, t->stack_hi);

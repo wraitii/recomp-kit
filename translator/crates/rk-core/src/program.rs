@@ -160,6 +160,22 @@ pub struct Program {
 }
 
 impl Program {
+    pub fn import_thunk_name(&self, va: Addr) -> Option<&str> {
+        if !self.image.is_exec(va) || va + 6 > self.image.end() {
+            return None;
+        }
+        let raw = self.image.bytes(va, 6)?;
+        if raw[..2] != [0xff, 0x25] {
+            return None;
+        }
+        let slot = u32::from_le_bytes([raw[2], raw[3], raw[4], raw[5]]);
+        self.image.imports.get(&slot).map(|import| import.name.as_str())
+    }
+
+    pub fn is_setjmp_thunk(&self, va: Addr) -> bool {
+        self.import_thunk_name(va).is_some_and(|name| name.trim_start_matches('_') == "setjmp3")
+    }
+
     pub fn containing(&self, addr: Addr) -> Option<Addr> {
         let k = self.spans.partition_point(|&(start, _, _)| start <= addr);
         let &(_, end, owner) = self.spans.get(k.checked_sub(1)?)?;

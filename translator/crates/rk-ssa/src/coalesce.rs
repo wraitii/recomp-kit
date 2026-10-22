@@ -2,9 +2,37 @@ use std::collections::BTreeMap;
 
 use rk_core::contract::Field;
 use rk_core::Lookup;
-use rk_ir::{lanes, Op, StateKey};
+use rk_ir::{lanes, xmm_offset, Op, StateKey};
 
 use crate::{canonical::rewrite_aliases, LaneGroup, LaneGroupLane, Ssa, ValueId};
+
+fn channels(s: &Ssa) -> Vec<Vec<usize>> {
+    let key_index: BTreeMap<StateKey, usize> =
+        s.keys.iter().enumerate().map(|(index, key)| (*key, index)).collect();
+    let mut channels = Vec::new();
+    for field in Field::ALL {
+        let keys: Vec<usize> = lanes(field)
+            .iter()
+            .filter_map(|key| key_index.get(key).copied())
+            .collect();
+        if keys.len() >= 2 {
+            channels.push(keys);
+        }
+    }
+    let mut xmm: BTreeMap<(usize, u8), Vec<usize>> = BTreeMap::new();
+    for (index, key) in s.keys.iter().enumerate() {
+        if let Some((reg, offset)) = xmm_offset(*key) {
+            xmm.entry((reg, offset / 4)).or_default().push(index);
+        }
+    }
+    for (_, mut keys) in xmm {
+        keys.sort_by_key(|&index| xmm_offset(s.keys[index]).map_or(16, |(_, offset)| offset));
+        if keys.len() == 4 {
+            channels.push(keys);
+        }
+    }
+    channels
+}
 
 enum WordArg {
     Source(ValueId),
@@ -133,21 +161,13 @@ fn candidate(
 }
 
 fn coalesce_roots(s: &mut Ssa) {
-    let key_index: BTreeMap<StateKey, usize> =
-        s.keys.iter().enumerate().map(|(index, key)| (*key, index)).collect();
-    let mut channels = Vec::new();
-    for field in Field::ALL {
-        let keys: Vec<usize> = lanes(field)
-            .iter()
-            .filter_map(|key| key_index.get(key).copied())
-            .collect();
-        if keys.len() == 4 {
-            channels.push(keys);
-        }
-    }
+    let channels = channels(s);
 
     let mut alias: Lookup<ValueId, ValueId> = Lookup::default();
     for keys in &channels {
+        if keys.len() != 4 {
+            continue;
+        }
         let Some(inputs) = keys
             .iter()
             .map(|&key| s.dispatch.loads.iter().find(|(candidate, _)| *candidate == s.keys[key]).map(|(_, value)| *value))
@@ -175,20 +195,18 @@ fn coalesce_roots(s: &mut Ssa) {
             Op::StateReload(key) | Op::StateKeep(key) => key,
             _ => continue,
         };
-        let Some((field, lane)) = rk_ir::field_lane(key) else { continue };
-        if field as usize >= 8 || lane >= 4 {
+        let Some((keys, lane)) = channels.iter().find_map(|keys| {
+            keys.iter()
+                .position(|&index| s.keys[index] == key)
+                .map(|lane| (keys, lane))
+        }) else {
             continue;
-        }
-        let keys = channels
-            .iter()
-            .find(|keys| keys.iter().any(|&index| s.keys[index] == key))
-            .cloned()
-            .unwrap_or_default();
-        if keys.len() != 4 {
+        };
+        if lane >= 4 {
             continue;
         }
         let site = s.args(id)[0];
-        groups.entry((site, keys)).or_insert([None; 4])[lane as usize] = Some(id);
+        groups.entry((site, keys.clone())).or_insert([None; 4])[lane] = Some(id);
     }
 
     for ((site, keys), ids) in groups {
@@ -217,18 +235,7 @@ pub(crate) fn coalesce(s: &mut Ssa) {
     if std::env::var_os("RK_NO_ROOTS").is_none() {
         coalesce_roots(s);
     }
-    let key_index: BTreeMap<StateKey, usize> =
-        s.keys.iter().enumerate().map(|(index, key)| (*key, index)).collect();
-    let mut channels = Vec::new();
-    for field in Field::ALL {
-        let keys: Vec<usize> = lanes(field)
-            .iter()
-            .filter_map(|key| key_index.get(key).copied())
-            .collect();
-        if keys.len() >= 2 {
-            channels.push(keys);
-        }
-    }
+    let channels = channels(s);
 
     let mut phi_by_key: Vec<BTreeMap<usize, ValueId>> =
         vec![BTreeMap::new(); s.blocks.len()];

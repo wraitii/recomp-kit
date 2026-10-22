@@ -1124,6 +1124,7 @@ void loader_init_context(X86 *c) {
     c->fpu_sw = 0;
     c->fpu_tag = 0xffff;
     c->fpu_top = 0;
+    c->mxcsr = 0x1f80u;
     // EFLAGS with only the reserved bit 1 and IF set, so PUSHFD reads 0x202.
     c->eflags_misc = 0x00000202u;
     c->fs_base = TEB_BASE;

@@ -42,7 +42,7 @@ pub struct PlannedFunction {
     pub live: LookupSet<ValueId>,
     pub return_addr: BTreeMap<ValueId, Addr>,
     pub block_addrs: Vec<Addr>,
-    pub settle_calls: BTreeSet<ValueId>,
+    pub settle_sites: BTreeSet<ValueId>,
     pub flag_publish: BTreeMap<ValueId, FlagPublication>,
     pub entry_settle: bool,
     pub call_masks: BTreeMap<ValueId, (Addr, Fields)>,
@@ -101,7 +101,7 @@ pub fn plan_function(cg: &CgFunction, opts: &PlanOptions<'_>) -> Result<PlannedF
         .iter()
         .map(|block| cg.insns[block.start as usize].addr)
         .collect();
-    let mut settle_calls = BTreeSet::new();
+    let mut settle_sites = BTreeSet::new();
     for (index, value) in ssa.values.iter().enumerate() {
         if !live.contains(&(index as ValueId)) {
             continue;
@@ -110,10 +110,7 @@ pub fn plan_function(cg: &CgFunction, opts: &PlanOptions<'_>) -> Result<PlannedF
         if !ssa.field(key).is_some_and(|field| Fields::FLAGS.contains(field)) {
             continue;
         }
-        let site = ssa.args(index as ValueId)[0];
-        if matches!(ssa.value(site).op, rk_ir::Op::Call { .. } | rk_ir::Op::CallInd) {
-            settle_calls.insert(site);
-        }
+        settle_sites.insert(ssa.args(index as ValueId)[0]);
     }
     let mut reload_masks: BTreeMap<ValueId, Fields> = BTreeMap::new();
     for (index, value) in ssa.values.iter().enumerate() {
@@ -163,7 +160,7 @@ pub fn plan_function(cg: &CgFunction, opts: &PlanOptions<'_>) -> Result<PlannedF
         live,
         return_addr,
         block_addrs,
-        settle_calls,
+        settle_sites,
         flag_publish,
         entry_settle,
         call_masks,
@@ -199,13 +196,14 @@ fn reduce_publications(
                 .map(|(_, value)| *value)
         })
         .collect();
+    let phi_lanes = s.phi_lanes();
     let successors = successors(s);
     let mut out = vec![vec![None; n]; block_count];
     let mut pending: std::collections::VecDeque<usize> = (0..block_count).collect();
     let mut queued = vec![true; block_count];
     while let Some(block) = pending.pop_front() {
         queued[block] = false;
-        let mut resident = resident_in(s, block, &out, &dispatch);
+        let mut resident = resident_in(s, block, &out, &dispatch, &phi_lanes[block]);
         walk_block(s, block, base, call_facts, &key_index, &mut resident, None, None);
         if resident != out[block] {
             out[block] = resident;
@@ -220,7 +218,7 @@ fn reduce_publications(
     let mut publish = BTreeMap::new();
     let mut guard = BTreeMap::new();
     for block in 0..block_count {
-        let mut resident = resident_in(s, block, &out, &dispatch);
+        let mut resident = resident_in(s, block, &out, &dispatch, &phi_lanes[block]);
         walk_block(
             s,
             block,
@@ -252,6 +250,7 @@ fn resident_in(
     block: usize,
     out: &[Vec<Option<ValueId>>],
     dispatch: &[Option<ValueId>],
+    lanes: &[(usize, ValueId, Vec<ValueId>)],
 ) -> Vec<Option<ValueId>> {
     let preds = &s.blocks[block].preds;
     let mut resident: Option<Vec<Option<ValueId>>> = None;
@@ -272,7 +271,21 @@ fn resident_in(
             }
         }
     }
-    resident.unwrap_or_else(|| vec![None; dispatch.len()])
+    let mut resident = resident.unwrap_or_else(|| vec![None; dispatch.len()]);
+    for (index, value, args) in lanes {
+        let carries = preds.iter().enumerate().all(|(position, pred)| {
+            let source: &[Option<ValueId>] = if *pred == rk_ssa::DISPATCH_BLOCK {
+                dispatch
+            } else {
+                &out[*pred as usize]
+            };
+            source[*index] == Some(args[position])
+        });
+        if carries {
+            resident[*index] = Some(*value);
+        }
+    }
+    resident
 }
 
 fn walk_block(
@@ -300,17 +313,46 @@ fn walk_block(
                         resident[index] = Some(state_value);
                     }
                 }
+                rk_ir::Op::Byte(lane) => {
+                    let source = s.args(state_value)[0];
+                    match s.value(source).op {
+                        rk_ir::Op::StateReload(loaded)
+                            if same_word_lane(loaded, key, lane) =>
+                        {
+                            resident[index] = Some(state_value);
+                        }
+                        rk_ir::Op::StateKeep(loaded)
+                            if same_word_lane(loaded, key, lane) =>
+                        {
+                            let old = s.args(source)[1];
+                            let old_lane = match s.value(old).op {
+                                rk_ir::Op::Pack => {
+                                    s.args(old).get(lane as usize).copied()
+                                }
+                                _ if lane == 0 => Some(old),
+                                _ => None,
+                            };
+                            if old_lane.is_some_and(|old| resident[index] == Some(old)) {
+                                resident[index] = Some(state_value);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
         }
         let Some(keys) = base.get(&value) else { continue };
         let current: BTreeMap<StateKey, ValueId> =
             state.iter().copied().collect();
+        let escape_only = s.value(value).op == rk_ir::Op::BranchInd;
         for key in keys {
             let Some(&state_value) = current.get(key) else { continue };
             let Some(&index) = key_index.get(key) else { continue };
             if resident[index] != Some(state_value) {
-                resident[index] = Some(state_value);
+                if !escape_only {
+                    resident[index] = Some(state_value);
+                }
                 if let Some(out) = publish.as_deref_mut() {
                     out.entry(value).or_default().push(*key);
                 }
@@ -345,6 +387,23 @@ fn walk_block(
             }
         }
     }
+}
+
+fn same_word_lane(loaded: StateKey, key: StateKey, lane: u8) -> bool {
+    if let (Some((loaded_field, loaded_lane)), Some((field, key_lane))) =
+        (rk_ir::field_lane(loaded), rk_ir::field_lane(key))
+    {
+        return loaded_field == field && loaded_lane == 0 && key_lane == lane;
+    }
+    if let (Some((loaded_reg, loaded_offset)), Some((reg, offset))) =
+        (rk_ir::xmm_offset(loaded), rk_ir::xmm_offset(key))
+    {
+        return loaded_reg == reg
+            && loaded_offset / 4 == offset / 4
+            && loaded_offset % 4 == 0
+            && offset % 4 == lane;
+    }
+    false
 }
 
 fn boundary_writes(s: &Ssa, call_facts: &dyn CallFacts, value: ValueId) -> Fields {

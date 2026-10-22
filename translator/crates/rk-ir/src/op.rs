@@ -41,6 +41,7 @@ pub enum SlowFamily {
     Bound,
     Bcd,
     Mmx,
+    Sse,
     Flags,
     Segment,
     X87,
@@ -168,9 +169,16 @@ pub fn properties(op: Op) -> Properties {
             | OpCode::FloatDiv
             | OpCode::FloatMult
             | OpCode::FloatSub
+            | OpCode::FloatMin
+            | OpCode::FloatMax
+            | OpCode::Cvtss2si
+            | OpCode::Cvttss2si
+            | OpCode::Cvtsi2ss
             | OpCode::FloatNeg
             | OpCode::FloatAbs
             | OpCode::FloatSqrt
+            | OpCode::FloatRcp
+            | OpCode::FloatRsqrt
             | OpCode::FloatInt2Float
             | OpCode::FloatFloat2Float
             | OpCode::FloatTrunc

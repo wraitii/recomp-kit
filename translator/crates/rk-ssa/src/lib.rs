@@ -199,6 +199,22 @@ impl Ssa {
         self.field_of[index]
     }
 
+    pub fn phi_lanes(&self) -> Vec<Vec<(usize, ValueId, Vec<ValueId>)>> {
+        let mut blocks = vec![Vec::new(); self.blocks.len()];
+        for (block, item) in self.blocks.iter().enumerate() {
+            for &phi in &item.phis {
+                let Some(&key) = self.phi_key.get(&phi) else { continue };
+                blocks[block].push((key, phi, self.args(phi).to_vec()));
+            }
+        }
+        for group in &self.lane_groups {
+            for lane in &group.lanes {
+                blocks[group.block as usize].push((lane.key, lane.value, lane.args.clone()));
+            }
+        }
+        blocks
+    }
+
     pub fn slow(&self, index: u32) -> Option<&SlowInsn> {
         self.slow.get(index as usize)
     }

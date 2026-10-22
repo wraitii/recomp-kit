@@ -517,7 +517,23 @@ void recomp_rdtsc(X86 *c) {
     c->r[R_EDX] = (uint32_t)(tsc >> 32);
 }
 
-// GenuineIntel family 6, model 3, with FPU, TSC, CMOV and translated MMX.
+// LDMXCSR. The translated SSE arithmetic honours FTZ only, so another rounding
+// mode, DAZ (absent from the modelled CPU) or an unmasked exception stops here
+// rather than computing under the wrong mode. DIVERGENCE(original): the sticky
+// exception flags in bits 0-5 keep what the guest wrote and are never raised.
+void recomp_ldmxcsr(X86 *c, uint32_t addr, uint32_t a) {
+    uint32_t value = rd32(a);
+    if ((value & ~0xffbfu) || (value & 0x7f80u) != 0x1f80u) {
+        LOGW("LDMXCSR %08x at %08x: only round-to-nearest with every exception masked and "
+             "no DAZ is modelled",
+             value, addr);
+        abort();
+    }
+    c->mxcsr = value;
+}
+
+// GenuineIntel family 6, model 7 (Pentium III), with FPU, TSC, CMOV, MMX, FXSR
+// and SSE.
 void recomp_cpuid(X86 *c) {
     switch (c->r[R_EAX]) {
     case 0:
@@ -527,10 +543,10 @@ void recomp_cpuid(X86 *c) {
         memcpy(&c->r[R_ECX], "ntel", 4);
         break;
     case 1:
-        c->r[R_EAX] = 0x00000633; // family 6, model 3, stepping 3
+        c->r[R_EAX] = 0x00000672; // family 6, model 7, stepping 2
         c->r[R_EBX] = 0;
         c->r[R_ECX] = 0;
-        c->r[R_EDX] = 0x00808011; // FPU | TSC | CMOV | MMX
+        c->r[R_EDX] = 0x03808011; // FPU | TSC | CMOV | MMX | FXSR | SSE
         break;
     default:
         c->r[R_EAX] = c->r[R_EBX] = c->r[R_ECX] = c->r[R_EDX] = 0;

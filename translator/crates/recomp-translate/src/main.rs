@@ -233,6 +233,7 @@ struct BodyContext<'a> {
     x87_options: rk_x87::Options,
     fault_state: rk_core::settings::FaultState,
     known_entries: &'a BTreeSet<Addr>,
+    setjmp_targets: &'a BTreeSet<Addr>,
     private_targets: &'a BTreeSet<Addr>,
     private_masks: BTreeMap<Addr, BTreeSet<Fields>>,
     private_input_arguments: BTreeMap<Addr, String>,
@@ -252,6 +253,7 @@ impl<'a> BodyContext<'a> {
             private_input_arguments: &self.private_input_arguments,
             known_modes: &self.known_modes,
             known_entries: self.known_entries,
+            setjmp_targets: self.setjmp_targets,
             private,
         }
     }
@@ -399,6 +401,12 @@ fn build_bodies(
         .chain(program.entries.keys())
         .copied()
         .collect();
+    let setjmp_targets: BTreeSet<Addr> = program
+        .functions
+        .keys()
+        .copied()
+        .filter(|&addr| program.is_setjmp_thunk(addr))
+        .collect();
     let private_targets: BTreeSet<Addr> = if std::env::var_os("RK_NO_PRIVATE").is_some() {
         BTreeSet::new()
     } else {
@@ -417,6 +425,7 @@ fn build_bodies(
         },
         fault_state: settings.fault_state,
         known_entries: &known_entries,
+        setjmp_targets: &setjmp_targets,
         private_targets: &private_targets,
         private_masks,
         private_input_arguments,

@@ -555,13 +555,10 @@ class Translator(ControlFlow):
                     "((uint32_t)(int32_t)(int8_t)c->r[0] & 0xffffu);"]
         if m == "CWDE":
             return ["c->r[0] = (uint32_t)(int32_t)(int16_t)c->r[0];"]
-        if m in ("LDMXCSR", "STMXCSR"):
-            # The SSE control word. This kit models one rounding mode and
-            # masks every exception, which is what a guest sets it to; a store
-            # hands back exactly that.
-            if m == "STMXCSR":
-                return [write_op(ops[0], 32, "0x1f80u")]
-            return [";"]
+        if m == "STMXCSR":
+            return ["recomp_stmxcsr(c, %s);" % addr_expr(ops[0])]
+        if m == "LDMXCSR":
+            return ["recomp_ldmxcsr(c, %s, %s);" % (hexlit(ins.addr), addr_expr(ops[0]))]
 
         # ------------------------------------------------------- arith ----
         if m in ("ADD", "ADC", "SUB", "SBB", "CMP"):
@@ -882,8 +879,8 @@ class Translator(ControlFlow):
 
             dst, src = ops[0], ops[1]
             if m in SSE_PACKED_FLOAT:
-                helper = "recomp_sse_%s" % m.lower()
-                L.extend("c->xmm[%d][%d] = %s(c->xmm[%d][%d], %s);"
+                helper = "recomp_sse_%s(%s" % (m.lower(), "" if m in ("MINPS", "MAXPS") else "c, ")
+                L.extend("c->xmm[%d][%d] = %sc->xmm[%d][%d], %s);"
                          % (dst.reg, i, helper, dst.reg, i, lane(src, i)) for i in range(4))
             elif m in SSE_PACKED_UNARY:
                 helper = "recomp_sse_%s" % m.lower()
@@ -1123,11 +1120,8 @@ class Translator(ControlFlow):
             return [";"]
         if m in ('EMMS', 'FEMMS'):
             return self.emit_x87(fn, ins, m, ops)
-        if m == "STMXCSR":
-            # No translated SSE arithmetic changes MXCSR, so expose its reset value.
-            return ["wr32(%s, 0x1f80u);" % addr_expr(ops[0])]
         if m == "FXSAVE":
-            return ["recomp_fxsave(%s);" % addr_expr(ops[0])]
+            return ["recomp_fxsave(c, %s);" % addr_expr(ops[0])]
 
         # ------------------------------------------------------------ x87 --
         if m.startswith("F"):
