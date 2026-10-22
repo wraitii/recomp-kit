@@ -1,3 +1,10 @@
+//! Whole-program analysis between lifting and planning. `contracts` builds SSA for every function
+//! and solves register and flag call contracts over call-graph SCCs, using indirect call and jump
+//! bounds and configured site effects. Functions it cannot prove stay conservative, with a reason.
+//! `modes` propagates x87 control-word facts. `private` selects private-contract targets and
+//! checked returns, and `specialize` merges the planner's call-site requests into variant layouts.
+//! `GlobalFacts::call_facts` feeds the contracts back into SSA.
+
 mod callgraph;
 mod cfg;
 mod contracts;
@@ -8,7 +15,7 @@ pub mod stack;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 
-use rk_core::contract::{Contract, Field, Fields};
+use rk_core::contract::{Contract, Field};
 use rk_core::facts::Summary as FactSummary;
 use rk_core::program::Program;
 use rk_core::settings::CallEffect as ConfiguredEffect;
@@ -57,10 +64,7 @@ impl CallFacts for ContractCallFacts<'_> {
 
 impl From<&X87ModeFacts> for rk_x87::ModeInput {
     fn from(facts: &X87ModeFacts) -> Self {
-        Self {
-            known_modes: facts.known_modes.clone(),
-            sites: facts.sites.clone(),
-        }
+        Self { known_modes: facts.known_modes.clone() }
     }
 }
 
@@ -72,18 +76,6 @@ pub struct GlobalInput<'a> {
     pub indirect_jumps: &'a BTreeMap<Addr, Vec<Addr>>,
     pub site_effects: &'a BTreeMap<Addr, ConfiguredEffect>,
     pub fact_summary: &'a FactSummary,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct PrivateFacts {
-    pub targets: BTreeMap<Addr, Contract>,
-    pub layouts: BTreeMap<Addr, Vec<PrivateLayout>>,
-    pub masks: BTreeMap<Addr, BTreeSet<Fields>>,
-    pub input_arguments: BTreeMap<Addr, Field>,
-    pub checked_returns: BTreeSet<Addr>,
-    pub callers: BTreeSet<Addr>,
-    pub rejections: BTreeMap<Addr, rk_core::Reason>,
-    pub known_modes: BTreeSet<Addr>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -121,7 +113,7 @@ pub struct GlobalFacts {
     pub contracts: BTreeMap<Addr, Contract>,
     pub indirect_contracts: BTreeMap<Addr, Contract>,
     pub site_effects: BTreeMap<Addr, ConfiguredEffect>,
-    pub private: PrivateFacts,
+    pub private: PrivateAnalysis,
     pub x87: X87ModeFacts,
     pub report: GlobalReport,
 }
@@ -209,16 +201,7 @@ impl GlobalFacts {
             contracts: contracts.contracts,
             indirect_contracts: contracts.indirect,
             site_effects: input.site_effects.clone(),
-            private: PrivateFacts {
-                targets: private.targets,
-                layouts: private.layouts,
-                masks: private.masks,
-                input_arguments: private.input_arguments,
-                checked_returns: private.checked_returns,
-                callers: private.callers,
-                rejections: private.rejections,
-                known_modes: private.known_modes.clone(),
-            },
+            private,
             x87: modes.facts,
             report,
         })

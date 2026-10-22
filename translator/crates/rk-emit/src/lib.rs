@@ -1,12 +1,30 @@
+//! Prints a `PlannedFunction` as C: the body (blocks, phi moves, publications, flag descriptors,
+//! calls, dynamic dispatch, x87 clones) plus its entry, checked-return, alternate-entry and
+//! private-contract wrappers. Unrepresentable forms return a diagnostic, and the driver then emits
+//! a trap body. Individual unsupported instructions become named runtime traps listed in
+//! `EmitReport`. It owns all translated C text: `x87` prints x87 clone events, `helpers` holds the
+//! generated C preludes and `model` the emitted-body types that `rk-output` lays out into files.
+
+mod helpers;
+mod model;
+mod slow;
+mod support;
+mod x87;
+
+pub use helpers::preludes;
+pub use model::{Body, Declaration, Preludes, Requires};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+use crate::slow::*;
+use crate::support::*;
+use crate::x87::{External, PlanLines};
 use rk_core::contract::{Field, Fields};
 use rk_core::ir::{FunctionIr, Insn, OpCode, SehEffect};
 use rk_core::{Addr, Diagnostic, Reason, Result};
 use rk_ir::{field_lane, Op, Registers, SlowFamily, StateKey};
 use rk_plan::PlannedFunction;
-use rk_output::{Body, Declaration, Preludes, Requires};
 use rk_ssa::{FlagDescriptor, ValueId, DISPATCH_BLOCK};
 
 #[derive(Clone, Copy)]
@@ -21,137 +39,9 @@ pub struct EmitContext<'a> {
     pub checked_returns: &'a BTreeSet<Addr>,
     pub private_masks: &'a BTreeMap<Addr, BTreeSet<Fields>>,
     pub private_input_arguments: &'a BTreeMap<Addr, String>,
-    pub known_modes: &'a BTreeSet<Addr>,
     pub known_entries: &'a BTreeSet<Addr>,
     pub setjmp_targets: &'a BTreeSet<Addr>,
     pub private: Option<&'a PrivateEmit>,
-}
-
-pub const RETURN_HELPERS: &str = "\
-RECOMP_COLD void recomp_return_slow_(X86 *c) { recomp_return(c); }
-static inline void recomp_return_fast_(X86 *c) {
-    if (RECOMP_UNLIKELY(c->eip == GUEST_RETURN_SENTINEL) ||
-        RECOMP_UNLIKELY(!recomp_is_call_return(c->eip)))
-        recomp_return_slow_(c);
-}
-";
-
-pub const MEMORY_HELPERS: &str = "\
-RECOMP_HOT_INLINE uint8_t recomp_rd8_(uint8_t *arena, uint32_t a) {
-#if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
-    return rd8(a);
-#else
-    uint8_t v;
-    RECOMP_BITCOPY(&v, arena + a, 1);
-    return v;
-#endif
-}
-RECOMP_HOT_INLINE void recomp_wr8_(uint8_t *arena, uint32_t a, uint8_t v) {
-#if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
-    wr8(a, v);
-#else
-    RECOMP_BITCOPY(arena + a, &v, 1);
-#endif
-}
-RECOMP_HOT_INLINE uint16_t recomp_rd16_(uint8_t *arena, uint32_t a) {
-#if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
-    return rd16(a);
-#else
-    uint16_t v;
-    RECOMP_BITCOPY(&v, arena + a, 2);
-    return v;
-#endif
-}
-RECOMP_HOT_INLINE void recomp_wr16_(uint8_t *arena, uint32_t a, uint16_t v) {
-#if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
-    wr16(a, v);
-#else
-    RECOMP_BITCOPY(arena + a, &v, 2);
-#endif
-}
-RECOMP_HOT_INLINE uint32_t recomp_rd32_(uint8_t *arena, uint32_t a) {
-#if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
-    return rd32(a);
-#else
-    uint32_t v;
-    RECOMP_BITCOPY(&v, arena + a, 4);
-    return v;
-#endif
-}
-RECOMP_HOT_INLINE void recomp_wr32_(uint8_t *arena, uint32_t a, uint32_t v) {
-#if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
-    wr32(a, v);
-#else
-    RECOMP_BITCOPY(arena + a, &v, 4);
-#endif
-}
-RECOMP_HOT_INLINE uint64_t recomp_rd64_(uint8_t *arena, uint32_t a) {
-#if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
-    return rd64(a);
-#else
-    uint64_t v;
-    RECOMP_BITCOPY(&v, arena + a, 8);
-    return v;
-#endif
-}
-RECOMP_HOT_INLINE void recomp_wr64_(uint8_t *arena, uint32_t a, uint64_t v) {
-#if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
-    wr64(a, v);
-#else
-    RECOMP_BITCOPY(arena + a, &v, 8);
-#endif
-}
-RECOMP_HOT_INLINE float recomp_rdf32_(uint8_t *arena, uint32_t a) {
-#if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
-    return rdf32(a);
-#else
-    float v;
-    RECOMP_BITCOPY(&v, arena + a, 4);
-    return v;
-#endif
-}
-RECOMP_HOT_INLINE void recomp_wrf32_(uint8_t *arena, uint32_t a, float v) {
-#if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
-    wrf32(a, v);
-#else
-    RECOMP_BITCOPY(arena + a, &v, 4);
-#endif
-}
-RECOMP_HOT_INLINE double recomp_rdf64_(uint8_t *arena, uint32_t a) {
-#if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
-    return rdf64(a);
-#else
-    double v;
-    RECOMP_BITCOPY(&v, arena + a, 8);
-    return v;
-#endif
-}
-RECOMP_HOT_INLINE void recomp_wrf64_(uint8_t *arena, uint32_t a, double v) {
-#if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
-    wrf64(a, v);
-#else
-    RECOMP_BITCOPY(arena + a, &v, 8);
-#endif
-}
-";
-
-pub const FLOAT_HELPERS: &str = "\
-RECOMP_HOT_INLINE void recomp_fcom_(uint16_t *status, double a, double b, int quiet) {
-    if (RECOMP_UNLIKELY(isnan(a) || isnan(b))) {
-        fcom_status(status, a, b, quiet);
-    } else {
-        *status = (uint16_t)((*status & (uint16_t)~0x4700u) |
-                            ((uint16_t)(a < b) << 8) | ((uint16_t)(a == b) << 14));
-    }
-}
-";
-
-pub fn preludes() -> Preludes {
-    Preludes {
-        memory_helpers: MEMORY_HELPERS.to_string(),
-        return_helpers: RETURN_HELPERS.to_string(),
-        float_helpers: FLOAT_HELPERS.to_string(),
-    }
 }
 
 pub struct EmitReport {
@@ -464,7 +354,7 @@ impl<'a> Emitter<'a> {
         self.out.push_str(&signature);
         self.out.push_str(" {\n");
         self.write_declarations();
-        self.write_x87_declarations();
+        self.write_x87_declarations()?;
         if self.ctx.ir.seh.values().any(|kinds| kinds.contains(&SehEffect::Orphan)) {
             self.out.push_str("uint64_t seh_mark_ = recomp_seh_frame_mark(c);\n");
         }
@@ -610,11 +500,11 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn write_x87_declarations(&mut self) {
-        let Some(x87) = self.plan.x87.as_ref() else { return };
-        for line in x87.declaration_lines(&ValueNames(self)) {
+    fn write_x87_declarations(&mut self) -> Result<()> {
+        for line in self.x87_lines(|x87, names| x87.declaration_lines(names))? {
             let _ = writeln!(self.out, "{line}");
         }
+        Ok(())
     }
 
     fn write_inputs(&mut self) -> Result<()> {
@@ -695,9 +585,13 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn x87_lines(&self, lines: impl FnOnce(&rk_x87::Plan) -> Vec<String>) -> Vec<String> {
-        let Some(x87) = self.plan.x87.as_ref() else { return Vec::new() };
-        lines(x87)
+    fn x87_lines(
+        &self,
+        lines: impl FnOnce(&rk_x87::Plan, &ValueNames) -> Result<Vec<String>>,
+    ) -> Result<Vec<String>> {
+        let Some(x87) = self.plan.x87.as_ref() else { return Ok(Vec::new()) };
+        let names = ValueNames { emitter: self };
+        lines(x87, &names)
     }
 
     fn entry_dispatch(&mut self) -> Result<()> {
@@ -763,7 +657,7 @@ impl<'a> Emitter<'a> {
                     insn.addr, insn.text
                 );
             }
-            let block_lines = self.x87_lines(|x87| x87.block_lines(self.clone, block as u32, &ValueNames(self)));
+            let block_lines = self.x87_lines(|x87, names| x87.block_lines(self.clone, block as u32, names))?;
             self.write_x87(block_lines);
             let ops = item.ops.clone();
             let mut continues = true;
@@ -778,7 +672,7 @@ impl<'a> Emitter<'a> {
                         ops.get(position + 1).map(|next| self.s.value(*next).op),
                     ) {
                         if branch == tail {
-                            let lines = self.x87_lines(|x87| x87.event_lines(self.clone, value, &ValueNames(self)));
+                            let lines = self.x87_lines(|x87, names| x87.event_lines(self.clone, value, names))?;
                             self.write_x87(lines);
                             self.publish(value)?;
                             self.materialize_defs(value)?;
@@ -809,7 +703,7 @@ impl<'a> Emitter<'a> {
                     .iter()
                     .copied()
                     .find(|next| Some(self.plan.block_addrs[*next]) == end_addr);
-                let end_lines = self.x87_lines(|x87| x87.end_lines(self.clone, block as u32, &ValueNames(self)));
+                let end_lines = self.x87_lines(|x87, names| x87.end_lines(self.clone, block as u32, names))?;
                 self.write_x87(end_lines);
                 match next {
                     Some(next) if self.can_inline(block, next) => self.inline_block(block, next)?,
@@ -840,7 +734,7 @@ impl<'a> Emitter<'a> {
         let item = *self.s.value(value);
         let addr = self.s.value_addr[value as usize];
         if !matches!(item.op, Op::X87(_)) {
-            let lines = self.x87_lines(|x87| x87.event_lines(self.clone, value, &ValueNames(self)));
+            let lines = self.x87_lines(|x87, names| x87.event_lines(self.clone, value, names))?;
             self.write_x87(lines);
         }
         match item.op {
@@ -849,7 +743,7 @@ impl<'a> Emitter<'a> {
                 if op.touches_memory() {
                     self.publish(value)?;
                 }
-                let lines = self.x87_lines(|x87| x87.event_lines(self.clone, value, &ValueNames(self)));
+                let lines = self.x87_lines(|x87, names| x87.event_lines(self.clone, value, names))?;
                 self.write_x87(lines);
                 Ok(true)
             }
@@ -1809,7 +1703,7 @@ impl<'a> Emitter<'a> {
                 dispatch.span,
                 self.block_prefix()
             );
-            let default_lines = self.x87_lines(|x87| x87.default_lines(self.clone, value, &ValueNames(self)));
+            let default_lines = self.x87_lines(|x87, names| x87.default_lines(self.clone, value, names))?;
             self.write_x87(default_lines);
             self.publish(value)?;
             let _ = writeln!(self.out, "c->eip = 0x{addr:08x}u; recomp_jump(c, t_); return;");
@@ -1822,7 +1716,7 @@ impl<'a> Emitter<'a> {
             self.edge(Some(current), *target_block)?;
         }
         self.out.push_str("default:\n");
-        let default_lines = self.x87_lines(|x87| x87.default_lines(self.clone, value, &ValueNames(self)));
+        let default_lines = self.x87_lines(|x87, names| x87.default_lines(self.clone, value, names))?;
         self.write_x87(default_lines);
         self.publish(value)?;
         let _ = writeln!(self.out, "c->eip = 0x{addr:08x}u; recomp_jump(c, (uint32_t)({target})); return;");
@@ -2671,483 +2565,13 @@ impl<'a> Emitter<'a> {
     }
 }
 
-fn const_expr(data: u64, size: u8) -> String {
-    if size > 4 {
-        format!("0x{data:x}ull")
-    } else {
-        format!("0x{:x}u", data & ((1u64 << (size as u32 * 8)) - 1))
+struct ValueNames<'b, 'a> {
+    emitter: &'b Emitter<'a>,
+}
+
+impl External for ValueNames<'_, '_> {
+    fn value(&self, id: ValueId) -> Result<String> {
+        self.emitter.expr(id)
     }
 }
 
-fn keep_expr(loaded: &str, old: &str) -> String {
-    if loaded == old {
-        old.to_string()
-    } else {
-        format!("(RECOMP_UNLIKELY(recomp_hooks_ever) ? ({loaded}) : ({old}))")
-    }
-}
-
-fn reads_c_field(
-    s: &rk_ssa::Ssa,
-    value: ValueId,
-    materialized: &[bool],
-    private: Option<&PrivateEmit>,
-) -> bool {
-    if materialized[value as usize] {
-        return false;
-    }
-    match s.value(value).op {
-        Op::Input(StateKey::Memory) | Op::StateReload(StateKey::Memory) | Op::StateKeep(StateKey::Memory) => false,
-        Op::Input(key) | Op::StateReload(key) | Op::StateKeep(key) => private_loads(private, key),
-        Op::Byte(_) => s
-            .args(value)
-            .first()
-            .is_some_and(|arg| reads_c_field(s, *arg, materialized, private)),
-        Op::Pack => s
-            .args(value)
-            .iter()
-            .any(|arg| reads_c_field(s, *arg, materialized, private)),
-        Op::P(OpCode::Copy | OpCode::IntZExt) => s
-            .args(value)
-            .first()
-            .is_some_and(|arg| reads_c_field(s, *arg, materialized, private)),
-        _ => false,
-    }
-}
-
-fn identity_assignment(line: &str) -> bool {
-    let text = line.trim().trim_end_matches(';');
-    text.split_once('=').is_some_and(|(target, value)| target.trim() == value.trim())
-}
-
-#[derive(Clone, Debug)]
-enum SlowOperand {
-    Gpr { index: usize, shift: u32, mask: u32 },
-    Mm(u8),
-    Xmm(u8),
-    Imm(u64),
-    Mem(String),
-}
-
-fn parse_slow_operands(insn: &Insn) -> Option<Vec<SlowOperand>> {
-    if insn.operands.is_empty() {
-        return Some(Vec::new());
-    }
-    insn.operands.split(',').map(parse_slow_operand).collect()
-}
-
-fn parse_slow_operand(text: &str) -> Option<SlowOperand> {
-    let mut text = text.trim();
-    let lower = text.to_ascii_lowercase();
-    for prefix in [
-        "extended double ptr ",
-        "float ptr ",
-        "xmmword ptr ",
-        "mmword ptr ",
-        "qword ptr ",
-        "dword ptr ",
-        "word ptr ",
-        "byte ptr ",
-    ] {
-        if lower.starts_with(prefix) {
-            text = &text[prefix.len()..];
-            break;
-        }
-    }
-    let mut segment = None;
-    if let Some((prefix, rest)) = text.split_once(':') {
-        let name = prefix.trim().to_ascii_uppercase();
-        if matches!(name.as_str(), "CS" | "DS" | "ES" | "FS" | "GS" | "SS") {
-            segment = Some(name);
-            text = rest.trim();
-        }
-    }
-    if text.starts_with('[') {
-        return Some(SlowOperand::Mem(memory_expr(text, segment.as_deref())?));
-    }
-    if let Some(index) = text.strip_prefix("MM").and_then(|n| n.parse().ok()) {
-        return Some(SlowOperand::Mm(index));
-    }
-    if let Some(index) = text.strip_prefix("XMM").and_then(|n| n.parse().ok()) {
-        return Some(SlowOperand::Xmm(index));
-    }
-    if let Some((index, shift, mask)) = gpr_parts(text) {
-        return Some(SlowOperand::Gpr { index, shift, mask });
-    }
-    if let Some(value) = parse_imm(text) {
-        return Some(SlowOperand::Imm(value));
-    }
-    None
-}
-
-fn parse_imm(text: &str) -> Option<u64> {
-    let text = text.trim();
-    let (negative, digits) = text
-        .strip_prefix('-')
-        .map_or((false, text), |digits| (true, digits));
-    let value = if let Some(hex) = digits.strip_prefix("0x") {
-        u64::from_str_radix(hex, 16).ok()?
-    } else {
-        digits.parse().ok()?
-    };
-    Some(if negative { value.wrapping_neg() } else { value })
-}
-
-fn memory_expr(text: &str, segment: Option<&str>) -> Option<String> {
-    let inner = text.trim().strip_prefix('[')?.strip_suffix(']')?.trim();
-    let mut terms = Vec::new();
-    for part in inner.split('+').map(str::trim).filter(|part| !part.is_empty()) {
-        if let Some((register, scale)) = part.split_once('*') {
-            let register = gpr_expr(register.trim())?;
-            let scale = parse_imm(scale.trim())?;
-            terms.push(format!("({register} * 0x{scale:x}u)"));
-        } else if let Some(value) = parse_imm(part) {
-            terms.push(format!("0x{value:x}u"));
-        } else {
-            terms.push(gpr_expr(part)?);
-        }
-    }
-    if segment == Some("FS") {
-        terms.push("c->fs_base".to_string());
-    }
-    Some(if terms.is_empty() { "0u".to_string() } else { terms.join(" + ") })
-}
-
-fn gpr_parts(name: &str) -> Option<(usize, u32, u32)> {
-    const R32: [&str; 8] = ["EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI"];
-    const R16: [&str; 8] = ["AX", "CX", "DX", "BX", "SP", "BP", "SI", "DI"];
-    const R8L: [&str; 4] = ["AL", "CL", "DL", "BL"];
-    const R8H: [&str; 4] = ["AH", "CH", "DH", "BH"];
-    if let Some(index) = R32.iter().position(|r| *r == name) {
-        return Some((index, 0, 0xffff_ffff));
-    }
-    if let Some(index) = R16.iter().position(|r| *r == name) {
-        return Some((index, 0, 0xffff));
-    }
-    if let Some(index) = R8L.iter().position(|r| *r == name) {
-        return Some((index, 0, 0xff));
-    }
-    if let Some(index) = R8H.iter().position(|r| *r == name) {
-        return Some((index, 8, 0xff));
-    }
-    None
-}
-
-fn gpr_expr(name: &str) -> Option<String> {
-    let (index, shift, mask) = gpr_parts(name)?;
-    Some(if shift == 0 && mask == 0xffff_ffff {
-        format!("c->r[{index}]")
-    } else {
-        format!("((c->r[{index}] >> {shift}) & 0x{mask:x}u)")
-    })
-}
-
-fn port_expr(operand: &SlowOperand) -> Option<String> {
-    match operand {
-        SlowOperand::Imm(value) => Some(format!("0x{:x}u", value & 0xffff)),
-        SlowOperand::Gpr { index, shift, .. } => Some(format!(
-            "((c->r[{index}] >> {shift}) & 0xffffu)"
-        )),
-        _ => None,
-    }
-}
-
-fn gpr_size(mask: u32) -> usize {
-    if mask == 0xff {
-        1
-    } else if mask == 0xffff {
-        2
-    } else {
-        4
-    }
-}
-
-fn write_gpr(index: usize, shift: u32, mask: u32, expr: &str) -> String {
-    if shift == 0 && mask == 0xffff_ffff {
-        format!("c->r[{index}] = (uint32_t)({expr});")
-    } else {
-        format!(
-            "c->r[{index}] = (c->r[{index}] & ~(0x{mask:x}u << {shift})) | (((uint32_t)({expr}) & 0x{mask:x}u) << {shift});"
-        )
-    }
-}
-
-fn mmx_source(operand: &SlowOperand, width: u32) -> Option<String> {
-    match operand {
-        SlowOperand::Mm(index) => Some(format!("c->mm[{index}]")),
-        SlowOperand::Gpr { index, shift, mask } => {
-            let read = if *shift == 0 && *mask == 0xffff_ffff {
-                format!("c->r[{index}]")
-            } else {
-                format!("((c->r[{index}] >> {shift}) & 0x{mask:x}u)")
-            };
-            Some(format!("(uint64_t)({read})"))
-        }
-        SlowOperand::Imm(value) => Some(format!("(uint64_t)0x{:x}u", value & 0xff)),
-        SlowOperand::Mem(address) => Some(if width == 32 {
-            format!("(uint64_t)recomp_rd32_(g_mem, (uint32_t)({address}))")
-        } else {
-            format!("recomp_rd64_(g_mem, (uint32_t)({address}))")
-        }),
-        _ => None,
-    }
-}
-
-fn sse_logic(mnemonic: &str) -> Option<&'static str> {
-    Some(match mnemonic {
-        "ORPS" | "ORPD" => "|",
-        "XORPS" | "XORPD" => "^",
-        "ANDPS" | "ANDPD" | "ANDNPS" | "ANDNPD" => "&",
-        _ => return None,
-    })
-}
-
-fn mmx_shift(mnemonic: &str) -> Option<(&'static str, u32)> {
-    Some(match mnemonic {
-        "PSRLW" => ("mmx_psrl", 16),
-        "PSRLD" => ("mmx_psrl", 32),
-        "PSRLQ" => ("mmx_psrl", 64),
-        "PSRAW" => ("mmx_psra", 16),
-        "PSRAD" => ("mmx_psra", 32),
-        "PSLLW" => ("mmx_psll", 16),
-        "PSLLD" => ("mmx_psll", 32),
-        "PSLLQ" => ("mmx_psll", 64),
-        _ => return None,
-    })
-}
-
-fn mmx_binary(mnemonic: &str) -> Option<(&'static str, u32)> {
-    Some(match mnemonic {
-        "PADDB" => ("mmx_padd", 8),
-        "PADDW" => ("mmx_padd", 16),
-        "PADDD" => ("mmx_padd", 32),
-        "PADDQ" => ("mmx_padd", 64),
-        "PSUBB" => ("mmx_psub", 8),
-        "PSUBW" => ("mmx_psub", 16),
-        "PSUBD" => ("mmx_psub", 32),
-        "PSUBQ" => ("mmx_psub", 64),
-        "PADDSB" => ("mmx_padds", 8),
-        "PADDSW" => ("mmx_padds", 16),
-        "PSUBSB" => ("mmx_psubs", 8),
-        "PSUBSW" => ("mmx_psubs", 16),
-        "PADDUSB" => ("mmx_paddus", 8),
-        "PADDUSW" => ("mmx_paddus", 16),
-        "PSUBUSB" => ("mmx_psubus", 8),
-        "PSUBUSW" => ("mmx_psubus", 16),
-        "PMULLW" => ("mmx_pmullw", 0),
-        "PMULHW" => ("mmx_pmulhw", 0),
-        "PMADDWD" => ("mmx_pmaddwd", 0),
-        "PCMPEQB" => ("mmx_pcmpeq", 8),
-        "PCMPEQW" => ("mmx_pcmpeq", 16),
-        "PCMPEQD" => ("mmx_pcmpeq", 32),
-        "PCMPGTB" => ("mmx_pcmpgt", 8),
-        "PCMPGTW" => ("mmx_pcmpgt", 16),
-        "PCMPGTD" => ("mmx_pcmpgt", 32),
-        "PACKSSWB" => ("mmx_packsswb", 0),
-        "PACKSSDW" => ("mmx_packssdw", 0),
-        "PACKUSWB" => ("mmx_packuswb", 0),
-        "PMINUB" => ("mmx_pminub", 0),
-        "PMAXUB" => ("mmx_pmaxub", 0),
-        "PUNPCKLBW" => ("mmx_punpckl", 8),
-        "PUNPCKLWD" => ("mmx_punpckl", 16),
-        "PUNPCKLDQ" => ("mmx_punpckl", 32),
-        "PUNPCKHBW" => ("mmx_punpckh", 8),
-        "PUNPCKHWD" => ("mmx_punpckh", 16),
-        "PUNPCKHDQ" => ("mmx_punpckh", 32),
-        "PAND" => ("mmx_pand", 0),
-        "PANDN" => ("mmx_pandn", 0),
-        "POR" => ("mmx_por", 0),
-        "PXOR" => ("mmx_pxor", 0),
-        _ => return None,
-    })
-}
-
-fn xmm_binary(mnemonic: &str) -> Option<(&'static str, Option<u32>)> {
-    Some(match mnemonic {
-        "PADDB" => ("xmm_padd", Some(8)),
-        "PADDW" => ("xmm_padd", Some(16)),
-        "PADDD" => ("xmm_padd", Some(32)),
-        "PADDQ" => ("xmm_padd", Some(64)),
-        "PSUBB" => ("xmm_psub", Some(8)),
-        "PSUBW" => ("xmm_psub", Some(16)),
-        "PSUBD" => ("xmm_psub", Some(32)),
-        "PSUBQ" => ("xmm_psub", Some(64)),
-        "PADDSB" => ("xmm_padds", Some(8)),
-        "PADDSW" => ("xmm_padds", Some(16)),
-        "PSUBSB" => ("xmm_psubs", Some(8)),
-        "PSUBSW" => ("xmm_psubs", Some(16)),
-        "PADDUSB" => ("xmm_paddus", Some(8)),
-        "PADDUSW" => ("xmm_paddus", Some(16)),
-        "PSUBUSB" => ("xmm_psubus", Some(8)),
-        "PSUBUSW" => ("xmm_psubus", Some(16)),
-        "PMULLW" => ("xmm_pmullw", None),
-        "PMULHW" => ("xmm_pmulhw", None),
-        "PMADDWD" => ("xmm_pmaddwd", None),
-        "PCMPEQB" => ("xmm_pcmpeq", Some(8)),
-        "PCMPEQW" => ("xmm_pcmpeq", Some(16)),
-        "PCMPEQD" => ("xmm_pcmpeq", Some(32)),
-        "PCMPGTB" => ("xmm_pcmpgt", Some(8)),
-        "PCMPGTW" => ("xmm_pcmpgt", Some(16)),
-        "PCMPGTD" => ("xmm_pcmpgt", Some(32)),
-        "PMINUB" => ("xmm_pminub", None),
-        "PMAXUB" => ("xmm_pmaxub", None),
-        "PAND" => ("xmm_pand", None),
-        "PANDN" => ("xmm_pandn", None),
-        "POR" => ("xmm_por", None),
-        "PXOR" => ("xmm_pxor", None),
-        _ => return None,
-    })
-}
-
-fn xmm_shift(mnemonic: &str) -> Option<(&'static str, u32)> {
-    Some(match mnemonic {
-        "PSRLW" => ("xmm_psrl", 16),
-        "PSRLD" => ("xmm_psrl", 32),
-        "PSRLQ" => ("xmm_psrl", 64),
-        "PSRAW" => ("xmm_psra", 16),
-        "PSRAD" => ("xmm_psra", 32),
-        "PSLLW" => ("xmm_psll", 16),
-        "PSLLD" => ("xmm_psll", 32),
-        "PSLLQ" => ("xmm_psll", 64),
-        _ => return None,
-    })
-}
-
-fn xmm_pack(mnemonic: &str) -> Option<(u32, u32)> {
-    Some(match mnemonic {
-        "PACKSSWB" => (16, 1),
-        "PACKSSDW" => (32, 1),
-        "PACKUSWB" => (16, 0),
-        _ => return None,
-    })
-}
-
-fn xmm_unpack(mnemonic: &str) -> Option<(u32, u32)> {
-    Some(match mnemonic {
-        "PUNPCKLBW" => (8, 0),
-        "PUNPCKLWD" => (16, 0),
-        "PUNPCKLDQ" => (32, 0),
-        "PUNPCKHBW" => (8, 1),
-        "PUNPCKHWD" => (16, 1),
-        "PUNPCKHDQ" => (32, 1),
-        _ => return None,
-    })
-}
-
-struct ValueNames<'b, 'a>(&'b Emitter<'a>);
-
-impl rk_x87::External for ValueNames<'_, '_> {
-    fn value(&self, id: ValueId) -> String {
-        self.0.expr(id).unwrap_or_else(|_| format!("v{id}"))
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Location {
-    Gpr(usize),
-    Flag(Field),
-    Xmm(usize, usize),
-    Eip,
-    Fs,
-    Df,
-}
-
-fn x87_reads_flags(line: &str) -> bool {
-    ["c->eflags_cf", "c->eflags_pf", "c->eflags_af", "c->eflags_zf", "c->eflags_sf", "c->eflags_of"]
-        .iter()
-        .any(|field| line.contains(field))
-}
-
-fn cc_mask(fields: Fields) -> u8 {
-    let mut mask = 0u8;
-    for (field, bit) in [
-        (Field::Cf, 0),
-        (Field::Pf, 1),
-        (Field::Af, 2),
-        (Field::Zf, 3),
-        (Field::Sf, 4),
-        (Field::Of, 5),
-    ] {
-        if fields.contains(field) {
-            mask |= 1u8 << bit;
-        }
-    }
-    mask
-}
-
-fn location(key: StateKey) -> Option<Location> {
-    if let Some((field, _)) = field_lane(key) {
-        if (field as usize) < 8 {
-            return Some(Location::Gpr(field as usize));
-        }
-        return Some(Location::Flag(field));
-    }
-    if let Some((reg, offset)) = rk_ir::xmm_offset(key) {
-        return Some(Location::Xmm(reg, (offset / 4) as usize));
-    }
-    let StateKey::Register(offset) = key else { return None };
-    let (name, _) = Registers::get().covering(offset as u64)?;
-    match name {
-        "EIP" | "IP" => Some(Location::Eip),
-        "FS_OFFSET" => Some(Location::Fs),
-        "DF" => Some(Location::Df),
-        _ => None,
-    }
-}
-
-fn private_loads(private: Option<&PrivateEmit>, key: StateKey) -> bool {
-    let Some(private) = private else { return true };
-    match field_lane(key) {
-        Some((field, _)) => private.inputs.contains(field) || private.input_argument == Some(field),
-        None => true,
-    }
-}
-
-fn select_mask(masks: &BTreeSet<Fields>, wanted: Fields) -> Option<Fields> {
-    masks
-        .iter()
-        .copied()
-        .filter(|mask| wanted & !*mask == Fields::NONE)
-        .min_by_key(|mask| (mask.0.count_ones(), *mask))
-}
-
-fn ends_block(op: Op) -> bool {
-    matches!(
-        op,
-        Op::Branch { .. }
-            | Op::CBranch { .. }
-            | Op::BranchInd
-            | Op::Return
-            | Op::Tail { .. }
-            | Op::ImportTail { .. }
-            | Op::Trap(_)
-            | Op::Breakpoint
-            | Op::CallOther(_)
-    )
-}
-
-fn ctype(size: u8) -> &'static str {
-    match size {
-        1 => "uint8_t",
-        2 => "uint16_t",
-        4 => "uint32_t",
-        _ => "uint64_t",
-    }
-}
-
-fn c_mask(size: u8) -> String {
-    if size >= 8 {
-        "0xffffffffffffffffull".to_string()
-    } else {
-        format!("0x{:x}u", rk_core::mask(size as u32))
-    }
-}
-
-fn signed_type(size: u8) -> &'static str {
-    match size {
-        1 => "int8_t",
-        2 => "int16_t",
-        4 => "int32_t",
-        _ => "int64_t",
-    }
-}

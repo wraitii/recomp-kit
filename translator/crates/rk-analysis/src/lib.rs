@@ -1,3 +1,11 @@
+//! Offline producer of `recomp-analysis-facts-v2`, run by `tools/build.py
+//! --produce-analysis-facts`. It reruns discovery, lifting and contract analysis (`guest`) and
+//! refines indirect call and jump bounds to a fixed point from tables (`guest::tables`), SSA site
+//! shapes (`guest::summary`) and stack cleanup proofs (`guest::stack`). It then joins them with the
+//! `[analysis]` method and effect catalogs and runtime observation TSVs. The facts record their
+//! input digests and assumptions and are validated before being written; the translator only
+//! consumes them.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -1140,12 +1148,10 @@ fn build_artifacts(
             "private_leaf_contracts": settings.private_leaf_contracts,
             "private_input_arguments": settings.private_input_arguments,
             "private_input_registers": settings.private_input_registers,
-            "allocators": settings.allocators,
             "alternate_entries": settings.alternate_entries,
             "configured_entries": settings.configured_entries,
             "call_effect_sites": settings.call_effects.sites.keys().collect::<Vec<_>>(),
             "call_effect_imports": settings.call_effects.imports.keys().collect::<Vec<_>>(),
-            "x87_imports_preserve_pc_rc": settings.x87_imports_preserve_pc_rc,
             "msvc_x87_convention": settings.msvc_x87_convention,
             "x87_cw_clone": settings.x87_cw_clone,
         },

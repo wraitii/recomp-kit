@@ -5,7 +5,7 @@ use rk_core::contract::Fields;
 use rk_core::settings::Module;
 use rk_core::Addr;
 
-use crate::{Region, SymbolRow};
+use crate::SymbolRow;
 
 const TABLE_TAIL: &str = include_str!("../templates/table_tail.c");
 const ENTRY_DISPATCH: &str = include_str!("../templates/entry_dispatch.c");
@@ -58,7 +58,6 @@ pub fn main_table(
     entry_names: &[Addr],
     symbols: &[SymbolRow],
     call_returns: &[Addr],
-    regions: &[Region],
     private_masks: &BTreeMap<Addr, BTreeSet<Fields>>,
 ) -> String {
     let mut s = String::with_capacity(entry_names.len() * 120);
@@ -89,29 +88,8 @@ pub fn main_table(
         "}};\nstatic const uint32_t recomp_call_return_count = {};\n",
         call_returns.len()
     );
-    let mut rows: Vec<&Region> = regions.iter().collect();
-    rows.sort_by_key(|r| r.start);
-    let names: BTreeSet<&str> = rows.iter().map(|r| r.symbol.as_str()).collect();
-    for name in names {
-        let _ = writeln!(s, "void {name}(X86 *c, uint32_t target);");
-    }
     s.push_str("typedef struct {\n    uint32_t start;\n    uint32_t end;\n    void (*fn)(X86 *, uint32_t);\n} RecompRegion;\n");
-    s.push_str("static const RecompRegion recomp_regions[] = {\n");
-    if rows.is_empty() {
-        s.push_str("    {0x00000000u, 0x00000000u, 0},\n");
-    }
-    for r in &rows {
-        let _ = writeln!(
-            s,
-            "    {{0x{:08x}u, 0x{:08x}u, {}}},",
-            r.start, r.end, r.symbol
-        );
-    }
-    let _ = writeln!(
-        s,
-        "}};\nstatic const uint32_t recomp_region_count = {};\n",
-        rows.len()
-    );
+    s.push_str("static const RecompRegion recomp_regions[] = {\n    {0x00000000u, 0x00000000u, 0},\n};\nstatic const uint32_t recomp_region_count = 0;\n\n");
     s.push_str("static const char *const profile_names[] = {\n");
     for row in symbols {
         let _ = writeln!(s, "    {},", json_string(&row.name));

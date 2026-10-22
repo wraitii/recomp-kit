@@ -1,3 +1,9 @@
+//! Byte-lane SSA over `CgFunction`. Registers and flags are tracked per byte and memory as a single
+//! token, and each observable effect gets a boundary carrying the state at that point. Calls use
+//! `CallFacts` under the optimizing policy and conservative effects otherwise. `prepare`
+//! canonicalizes, forwards stores to loads, coalesces whole-register phis and removes dead values;
+//! `liveness` and `flags` derive state publications and lazy flag plans.
+
 use std::collections::BTreeMap;
 
 use rk_core::contract::{Field, Fields};
@@ -12,7 +18,6 @@ mod flags;
 mod forward;
 mod liveness;
 mod prepare;
-mod verify;
 
 pub use build::{
     build, BuildOptions, CallEffect, CallFacts, ConservativeCallFacts, StackEffect, DEFAULT_VALUE_BUDGET,
@@ -22,8 +27,7 @@ pub use dump::dump;
 pub use flags::{FlagDescriptor, FlagPlan, FlagPublication, FlagSource};
 pub use forward::forward;
 pub use liveness::{live_values, simplify};
-pub use prepare::{prepare, publications, PrepareOptions};
-pub use verify::verify;
+pub use prepare::{prepare, prepare_with_publications, publications, PrepareOptions};
 
 pub type ValueId = u32;
 pub type BlockId = u32;

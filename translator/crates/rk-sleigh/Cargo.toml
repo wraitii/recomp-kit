@@ -8,7 +8,6 @@ publish.workspace = true
 rk-core.workspace = true
 libsla.workspace = true
 sleigh-config.workspace = true
-serde.workspace = true
 
 [lints]
 workspace = true

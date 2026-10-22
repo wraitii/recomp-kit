@@ -231,8 +231,8 @@ fn coalesce_roots(s: &mut Ssa) {
     rewrite_aliases(s, &alias);
 }
 
-pub(crate) fn coalesce(s: &mut Ssa) {
-    if std::env::var_os("RK_NO_ROOTS").is_none() {
+pub(crate) fn coalesce(s: &mut Ssa, roots: bool) {
+    if roots {
         coalesce_roots(s);
     }
     let channels = channels(s);

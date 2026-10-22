@@ -1,3 +1,10 @@
+//! Driver that `tools/build.py` runs once per image. It reads the `recomp-translate-input-v1` JSON,
+//! loads the image and code map, discovers uncovered code, lifts every function, validates analysis
+//! facts against the lifted code (`facts`), runs whole-program analysis, then plans and emits every
+//! function in two parallel passes: the second re-emits callers of private-contract targets once
+//! `rk_global::specialize` has merged their requests. A function that fails planning or emission
+//! becomes a named trap body. See `docs/translator.md`.
+
 mod facts;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,8 +20,8 @@ use rk_core::program::Program;
 use rk_core::settings::Settings;
 use rk_core::timing::Phases;
 use rk_core::{parse_hex, Addr, Diagnostic, Hex};
-use rk_output::{Body, Requires, Translation};
-use rk_sleigh::Lifter;
+use rk_emit::{Body, Requires};
+use rk_output::Translation;
 
 #[derive(Parser)]
 #[command(about = "Translate a game image from its code map to C")]
@@ -87,39 +94,6 @@ fn parse_addr8(text: &str) -> Option<Addr> {
     (text.len() == 8 && text.bytes().all(|b| b.is_ascii_hexdigit()))
         .then(|| Addr::from_str_radix(text, 16).ok())
         .flatten()
-}
-
-struct SleighLengths {
-    cache: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU8]>>,
-}
-
-thread_local! {
-    static SLEIGH_LIFTER: std::cell::RefCell<Option<Lifter>> = const { std::cell::RefCell::new(None) };
-}
-
-impl rk_discover::DecodeCheck for SleighLengths {
-    fn length(&self, image: &rk_core::program::Image, at: Addr) -> Option<u8> {
-        let cache = self.cache.get_or_init(|| {
-            (0..image.size)
-                .map(|_| std::sync::atomic::AtomicU8::new(0))
-                .collect()
-        });
-        let slot = cache.get(at.saturating_sub(image.base) as usize)?;
-        let cached = slot.load(std::sync::atomic::Ordering::Relaxed);
-        if cached != 0 {
-            return (cached != u8::MAX).then_some(cached);
-        }
-        let available = image.end().saturating_sub(at).min(15) as usize;
-        let bytes = image.bytes(at, available)?;
-        let out = SLEIGH_LIFTER.with(|lifter| {
-            let mut lifter = lifter.borrow_mut();
-            let lifter =
-                lifter.get_or_insert_with(|| Lifter::new().expect("SLEIGH initialization"));
-            lifter.length(at, bytes).ok()
-        });
-        slot.store(out.unwrap_or(u8::MAX), std::sync::atomic::Ordering::Relaxed);
-        out
-    }
 }
 
 type BodyRow = (
@@ -230,6 +204,26 @@ impl IrSummary {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Switches {
+    private: bool,
+    descriptors: bool,
+    coalesce_roots: bool,
+    x87_dynamic: bool,
+}
+
+impl Switches {
+    fn from_env() -> Self {
+        let unset = |name| std::env::var_os(name).is_none();
+        Self {
+            private: unset("RK_NO_PRIVATE"),
+            descriptors: unset("RK_NO_DESCRIPTORS"),
+            coalesce_roots: unset("RK_NO_ROOTS"),
+            x87_dynamic: !unset("RK_X87_DYNAMIC"),
+        }
+    }
+}
+
 struct BodyContext<'a> {
     program: &'a Program,
     facts: rk_global::ContractCallFacts<'a>,
@@ -242,7 +236,7 @@ struct BodyContext<'a> {
     private_targets: &'a BTreeSet<Addr>,
     private_masks: BTreeMap<Addr, BTreeSet<Fields>>,
     private_input_arguments: BTreeMap<Addr, String>,
-    known_modes: BTreeSet<Addr>,
+    switches: Switches,
 }
 
 impl<'a> BodyContext<'a> {
@@ -256,7 +250,6 @@ impl<'a> BodyContext<'a> {
             checked_returns: self.checked,
             private_masks: &self.private_masks,
             private_input_arguments: &self.private_input_arguments,
-            known_modes: &self.known_modes,
             known_entries: self.known_entries,
             setjmp_targets: self.setjmp_targets,
             private,
@@ -275,6 +268,8 @@ fn plan_one(ctx: &BodyContext<'_>, ir: &FunctionIr) -> rk_core::Result<rk_plan::
             x87_options: ctx.x87_options.clone(),
             fault_state: ctx.fault_state,
             private_targets: ctx.private_targets,
+            descriptors: ctx.switches.descriptors,
+            coalesce_roots: ctx.switches.coalesce_roots,
         },
     )
 }
@@ -392,6 +387,7 @@ fn build_bodies(
     global: &rk_global::GlobalFacts,
     settings: &Settings,
     x87_mode: X87Mode,
+    switches: Switches,
     only: &[Addr],
 ) -> Result<(
     Vec<Body>,
@@ -412,12 +408,12 @@ fn build_bodies(
         .copied()
         .filter(|&addr| program.is_setjmp_thunk(addr))
         .collect();
-    let private_targets: BTreeSet<Addr> = if std::env::var_os("RK_NO_PRIVATE").is_some() {
-        BTreeSet::new()
-    } else {
+    let private_targets: BTreeSet<Addr> = if switches.private {
         global.private.targets.keys().copied().collect()
+    } else {
+        BTreeSet::new()
     };
-    let make_ctx = |private_masks, private_input_arguments, known_modes| BodyContext {
+    let make_ctx = |private_masks, private_input_arguments| BodyContext {
         program,
         facts: global.call_facts(),
         checked: &global.private.checked_returns,
@@ -434,9 +430,9 @@ fn build_bodies(
         private_targets: &private_targets,
         private_masks,
         private_input_arguments,
-        known_modes,
+        switches,
     };
-    let ctx = make_ctx(BTreeMap::new(), BTreeMap::new(), BTreeSet::new());
+    let ctx = make_ctx(BTreeMap::new(), BTreeMap::new());
     let selected: BTreeSet<Addr> = only.iter().copied().collect();
     let wanted = |addr: Addr| selected.is_empty() || selected.contains(&addr);
     let sources: Vec<(Addr, Option<FunctionIr>)> = match owned {
@@ -506,11 +502,7 @@ fn build_bodies(
         .iter()
         .map(|(&addr, &field)| (addr, field.name().to_string()))
         .collect();
-    let ctx2 = make_ctx(
-        specialized.masks.clone(),
-        private_arguments,
-        global.private.known_modes.clone(),
-    );
+    let ctx2 = make_ctx(specialized.masks.clone(), private_arguments);
     let phase2: Vec<(Vec<BodyRow>, Vec<Body>)> = retained
         .into_par_iter()
         .map(|item| -> Result<(Vec<BodyRow>, Vec<Body>)> {
@@ -673,6 +665,7 @@ fn dump_ssa(
     analysis: &rk_frontend::Analysis,
     only: &[Addr],
     prepared: bool,
+    switches: Switches,
     out: &mut impl std::io::Write,
 ) -> Result<()> {
     let mut seen = BTreeSet::new();
@@ -689,7 +682,8 @@ fn dump_ssa(
         }
         let cg = rk_ir::lower(ir, &program.image, &rk_ir::NoX87)?;
         if prepared {
-            match rk_ssa::prepare(&cg, &rk_ssa::PrepareOptions::default()) {
+            let options = rk_ssa::PrepareOptions { coalesce_roots: switches.coalesce_roots, ..Default::default() };
+            match rk_ssa::prepare(&cg, &options) {
                 Ok(ssa) => rk_ssa::dump(&ssa, out)?,
                 Err(error) => writeln!(out, "== prepared {owner:08x}: {error}")?,
             }
@@ -947,6 +941,7 @@ fn write_discovery_report(
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let switches = Switches::from_env();
     if let Some(jobs) = args.jobs {
         rayon::ThreadPoolBuilder::new()
             .num_threads(jobs.max(1))
@@ -957,10 +952,7 @@ fn main() -> Result<()> {
     phases.mark("settings");
     let mut program = rk_image::load(&settings)?;
     phases.mark("load");
-    let lengths = SleighLengths {
-        cache: Default::default(),
-    };
-    let discovered = rk_discover::discover_with(&settings, &program, Some(&lengths))?;
+    let discovered = rk_discover::discover(&settings, &program)?;
     if let Some(path) = &args.discovery_report {
         write_discovery_report(path, &settings, &program, &discovered)?;
     }
@@ -998,11 +990,8 @@ fn main() -> Result<()> {
             owned,
             &global,
             &settings,
-            if std::env::var_os("RK_X87_DYNAMIC").is_some() {
-                X87Mode::Dynamic
-            } else {
-                args.x87_mode
-            },
+            if switches.x87_dynamic { X87Mode::Dynamic } else { args.x87_mode },
+            switches,
             only,
         )?
     } else {
@@ -1022,7 +1011,6 @@ fn main() -> Result<()> {
         bodies,
         preludes: rk_emit::preludes(),
         call_returns,
-        regions: Vec::new(),
         call_facts: facts.runtime_call_facts,
         cw_effects: facts.cw_effects,
         checked_returns: global.private.checked_returns.clone(),
@@ -1043,10 +1031,10 @@ fn main() -> Result<()> {
             dump_fir(&program, &analysis, &args.only, &mut out)?;
         }
         if args.wants(Stage::Ssa) {
-            dump_ssa(&program, &analysis, &args.only, false, &mut out)?;
+            dump_ssa(&program, &analysis, &args.only, false, switches, &mut out)?;
         }
         if args.wants(Stage::Prepared) {
-            dump_ssa(&program, &analysis, &args.only, true, &mut out)?;
+            dump_ssa(&program, &analysis, &args.only, true, switches, &mut out)?;
         }
         if args.wants(Stage::Global) {
             dump_global(&program, &global, &args.only, &mut out)?;

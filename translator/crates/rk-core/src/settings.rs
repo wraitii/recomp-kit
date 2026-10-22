@@ -44,8 +44,8 @@ pub struct Translate {
     pub indirect_targets: Option<String>,
     pub discovery_evidence: Option<String>,
     pub call_effects: Vec<CallEffect>,
-    pub x87_entry_contracts: Vec<X87EntryContract>,
-    pub allocators: Vec<Allocator>,
+    pub x87_entry_contracts: Vec<de::IgnoredAny>,
+    pub allocators: Vec<de::IgnoredAny>,
     pub checked_returns: Vec<Addr>,
     pub state_contract_callers: Vec<Addr>,
     pub alternate_entries: Vec<Addr>,
@@ -201,19 +201,6 @@ impl X87Effect {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct X87EntryContract {
-    pub function: Addr,
-    pub mask: u16,
-    pub value: u16,
-    #[serde(default)]
-    pub verify: bool,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct Allocator {
-    pub function: Addr,
-}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Global {
@@ -267,12 +254,7 @@ pub struct Settings {
     pub indirect_targets: Option<PathBuf>,
     pub discovery_evidence: Option<PathBuf>,
     pub native_header: Option<PathBuf>,
-    pub x87_facts: Option<PathBuf>,
-    pub x87_mode_metadata: Option<PathBuf>,
-    pub allocators: BTreeSet<Addr>,
     pub call_effects: CallEffects,
-    pub x87_imports_preserve_pc_rc: bool,
-    pub x87_entry_contracts: Vec<X87EntryContract>,
     pub call_contracts: bool,
     pub stack_memory: bool,
     pub private_leaf_contracts: bool,
@@ -297,11 +279,17 @@ impl Settings {
                 path.display()
             )));
         }
-        if module.is_none()
-            && (input.translate.x87_facts.is_some() || input.translate.x87_mode_metadata.is_some())
-        {
+        let t = &input.translate;
+        let unsupported = [
+            ("x87_facts", module.is_none() && t.x87_facts.is_some()),
+            ("x87_mode_metadata", module.is_none() && t.x87_mode_metadata.is_some()),
+            ("x87_entry_contracts", !t.x87_entry_contracts.is_empty()),
+            ("x87_imports_preserve_pc_rc", t.x87_imports_preserve_pc_rc),
+            ("allocators", !t.allocators.is_empty()),
+        ];
+        if let Some((name, _)) = unsupported.iter().find(|(_, set)| *set) {
             return Err(Error::input(format!(
-                "{}: the Rust translator does not yet consume translate.x87_facts or translate.x87_mode_metadata",
+                "{}: the Rust translator does not support translate.{name}",
                 path.display()
             )));
         }
@@ -426,20 +414,7 @@ impl Settings {
             indirect_targets: resolve(&t.indirect_targets),
             discovery_evidence: resolve(&t.discovery_evidence),
             native_header: resolve(&t.native.header),
-            x87_facts: resolve(&t.x87_facts),
-            x87_mode_metadata: resolve(&t.x87_mode_metadata),
-            allocators: if main {
-                t.allocators.iter().map(|a| a.function).collect()
-            } else {
-                BTreeSet::new()
-            },
             call_effects: CallEffects { sites, imports },
-            x87_imports_preserve_pc_rc: t.x87_imports_preserve_pc_rc,
-            x87_entry_contracts: if main {
-                t.x87_entry_contracts.clone()
-            } else {
-                Vec::new()
-            },
             call_contracts: t.call_contracts,
             stack_memory: t.stack_memory,
             private_leaf_contracts: t.private_leaf_contracts && main,

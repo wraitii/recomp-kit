@@ -6,7 +6,6 @@ use rk_ir::{properties, Op};
 use rk_ssa::{BlockId, Ssa, ValueId, DISPATCH_BLOCK};
 
 use crate::carry::{self, assert_covers, reset_op};
-use crate::printer::{External, Printer};
 use crate::scalar::{carry_values, parts, CarryShape, Scalar, Shape};
 use crate::types::{carry, env, Assign, Choice, Event, Expr};
 
@@ -42,16 +41,9 @@ pub struct ModeCondition {
     pub value: u16,
 }
 
-impl ModeCondition {
-    pub fn holds(self, cw: u16) -> bool {
-        cw & self.mask == self.value
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct ModeInput {
     pub known_modes: BTreeSet<Addr>,
-    pub sites: BTreeMap<Addr, ModeCondition>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -68,7 +60,6 @@ pub struct CloneProgram {
 pub struct Plan {
     pub used: bool,
     pub declarations: Vec<Expr>,
-    pub environment: Vec<Expr>,
     pub programs: Vec<CloneProgram>,
 }
 
@@ -79,73 +70,6 @@ impl Plan {
 
     pub fn clone(&self, index: usize) -> &CloneProgram {
         &self.programs[index]
-    }
-
-    pub fn block_lines(
-        &self,
-        clone: usize,
-        block: BlockId,
-        external: &dyn External,
-    ) -> Vec<String> {
-        let printer = Printer { external };
-        printer.events(
-            self.programs[clone]
-                .blocks
-                .get(&block)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-        )
-    }
-
-    pub fn event_lines(
-        &self,
-        clone: usize,
-        value: ValueId,
-        external: &dyn External,
-    ) -> Vec<String> {
-        let printer = Printer { external };
-        printer.events(
-            self.programs[clone]
-                .events
-                .get(&value)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-        )
-    }
-
-    pub fn end_lines(&self, clone: usize, block: BlockId, external: &dyn External) -> Vec<String> {
-        let printer = Printer { external };
-        printer.events(
-            self.programs[clone]
-                .ends
-                .get(&block)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-        )
-    }
-
-    pub fn default_lines(
-        &self,
-        clone: usize,
-        value: ValueId,
-        external: &dyn External,
-    ) -> Vec<String> {
-        let printer = Printer { external };
-        printer.events(
-            self.programs[clone]
-                .defaults
-                .get(&value)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-        )
-    }
-
-    pub fn declaration_lines(&self, external: &dyn External) -> Vec<String> {
-        let printer = Printer { external };
-        self.declarations
-            .iter()
-            .map(|value| printer.declaration(value))
-            .collect()
     }
 }
 
@@ -610,7 +534,6 @@ pub fn prepare(s: &Ssa, modes: &ModeInput, options: &Options) -> Result<Plan, Re
     Ok(Plan {
         used: true,
         declarations,
-        environment: vec![env("cw"), env("sw"), env("top")],
         programs,
     })
 }

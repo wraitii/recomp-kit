@@ -8,7 +8,6 @@ publish.workspace = true
 rk-core.workspace = true
 rk-image.workspace = true
 rk-discover.workspace = true
-rk-sleigh.workspace = true
 rk-frontend.workspace = true
 rk-output.workspace = true
 rk-ir.workspace = true
@@ -20,7 +19,6 @@ rk-x87.workspace = true
 anyhow.workspace = true
 clap = { workspace = true }
 rayon.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 
 [lints]

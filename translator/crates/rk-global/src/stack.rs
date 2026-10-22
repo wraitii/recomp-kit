@@ -294,7 +294,11 @@ fn summarize(
         }
         let insn = fir.insns.get(index as usize).ok_or("invalid CFG index")?;
         let successors = fir.succ.get(index as usize).ok_or("missing successors")?;
-        if insn.internal_flow || insn.x87 || !insn.userops.is_empty() {
+        if insn.x87 || insn.ops.iter().any(|op| {
+            op.opcode == OpCode::CallOther
+                || (matches!(op.opcode, OpCode::Branch | OpCode::CBranch)
+                    && op.inputs.first().is_some_and(|input| input.space == Space::Const))
+        }) {
             return Err("unmodeled instruction effects");
         }
         if fir.noreturn.contains_key(&index) {

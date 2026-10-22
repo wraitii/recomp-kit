@@ -21,6 +21,7 @@ translated locally into `build/recomp/gen/` and are never edited in place.
 | Mod lifecycle and hooks | [loader.cpp](../mods/loader.cpp), [hooks.cpp](../mods/hooks.cpp) | `mods_load_all`, `build_api`, `mods_hook_dispatch`, `mods_call_next` |
 | Code map and program model | [code_map.py](../tools/recomp/code_map.py), [program.py](../tools/recomp/program.py) | `pack`, `read_map`, `Program` |
 | Translation driver, chunks, tables | [driver.py](../tools/recomp/driver.py), [output.py](../tools/recomp/output.py), [settings.py](../tools/recomp/settings.py) | `main`, `_emit`, `emit_body_chunks`, `write_table` |
+| Rust translator | [translator.md](translator.md), [recomp-translate](../translator/crates/recomp-translate/src/main.rs) | `main`, `build_bodies`, `rk_output::write` |
 | Instruction semantics, SSA emission | [IR](ir.md), [ir/emit_c.py](../tools/recomp/ir/emit_c.py), [x86.h](../runtime/x86.h) | `prepare`, `emit_prepared`, `production.prepare_ssa`; register/flag/x87 helpers |
 | Decoded fallback bodies | [decoded.py](../tools/recomp/decoded.py) | `Translator.translate`, `emit_mmx` |
 | Object shape and dispatch inference | [Type inference](type-inference.md), [typeinf/nominal.py](../tools/recomp/typeinf/nominal.py), [typeinf/run.py](../tools/recomp/typeinf/run.py) | `Structure`, `Aliases`, `preserved_registers`, `Frame` |

@@ -7,8 +7,6 @@ publish.workspace = true
 [dependencies]
 rk-core.workspace = true
 rk-ir.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 
 [lints]
 workspace = true

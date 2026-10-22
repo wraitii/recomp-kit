@@ -13,7 +13,6 @@ rk-frontend.workspace = true
 rk-ir.workspace = true
 rk-ssa.workspace = true
 rk-global.workspace = true
-rk-sleigh.workspace = true
 rk-x87.workspace = true
 rayon.workspace = true
 clap.workspace = true

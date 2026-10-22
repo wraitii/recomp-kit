@@ -1,10 +1,19 @@
+//! Per-function planning between SSA and C. For each boundary it decides which guest state lanes to
+//! publish (skipping those already resident), which values stay live and where lazy flag
+//! descriptors settle. It also chooses what hook-guarded calls republish and which output fields
+//! each direct private-contract call needs. It then attaches the x87 plan. `PlannedFunction` holds
+//! every decision that `rk-emit` prints.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use rk_core::contract::Fields;
 use rk_core::ir::Policy;
 use rk_core::{Addr, Diagnostic, LookupSet, Result};
 use rk_ir::{CgFunction, StateKey};
-use rk_ssa::{live_values, prepare, publications, CallFacts, FlagPublication, PrepareOptions, Ssa, ValueId};
+use rk_ssa::{
+    live_values, prepare_with_publications, publications, CallFacts, FlagPublication,
+    PrepareOptions, Ssa, ValueId,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct ContractRequests {
@@ -18,21 +27,8 @@ pub struct PlanOptions<'a> {
     pub x87_options: rk_x87::Options,
     pub fault_state: rk_core::settings::FaultState,
     pub private_targets: &'a BTreeSet<Addr>,
-}
-
-impl<'a> PlanOptions<'a> {
-    pub fn new(call_facts: &'a dyn CallFacts) -> Self {
-        static MODES: std::sync::OnceLock<rk_x87::ModeInput> = std::sync::OnceLock::new();
-        static TARGETS: std::sync::OnceLock<BTreeSet<Addr>> = std::sync::OnceLock::new();
-        Self {
-            call_facts,
-            policy: Policy::Optimizing,
-            x87_modes: MODES.get_or_init(rk_x87::ModeInput::default),
-            x87_options: rk_x87::Options::default(),
-            fault_state: rk_core::settings::FaultState::Relaxed,
-            private_targets: TARGETS.get_or_init(BTreeSet::new),
-        }
-    }
+    pub descriptors: bool,
+    pub coalesce_roots: bool,
 }
 
 pub struct PlannedFunction {
@@ -54,8 +50,9 @@ pub fn plan_function(cg: &CgFunction, opts: &PlanOptions<'_>) -> Result<PlannedF
     let mut prepare_options = PrepareOptions::new(opts.call_facts);
     prepare_options.policy = opts.policy;
     prepare_options.fault_state = opts.fault_state;
-    let ssa = prepare(cg, &prepare_options)?;
-    let base = publications(&ssa, opts.call_facts);
+    prepare_options.coalesce_roots = opts.coalesce_roots;
+    let (ssa, base) = prepare_with_publications(cg, &prepare_options)?;
+    let base = base.unwrap_or_else(|| publications(&ssa, opts.call_facts));
     let (publish, guard) = reduce_publications(&ssa, &base, opts.call_facts);
     let flag_plan = ssa.flag_plan();
     let mut flag_publish = BTreeMap::new();
@@ -63,7 +60,7 @@ pub fn plan_function(cg: &CgFunction, opts: &PlanOptions<'_>) -> Result<PlannedF
     let mut live_publish = publish.clone();
     for (value, keys) in &publish {
         let mut publication = flag_plan.publication(&ssa, *value, keys);
-        if std::env::var_os("RK_NO_DESCRIPTORS").is_some() {
+        if !opts.descriptors {
             publication.eager |= publication.descriptor.map_or(Fields::NONE, |d| d.mask);
             publication.descriptor = None;
         }
