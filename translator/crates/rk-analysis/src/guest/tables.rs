@@ -163,6 +163,7 @@ pub fn bounds(
     let mut open: BTreeMap<String, usize> = BTreeMap::new();
     let mut open_examples: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut invalid_targets = BTreeMap::new();
+    let mut cleanup_refinements = BTreeMap::new();
     for summary in summaries.values() {
         for (reason, count) in &summary.shape_rejections {
             *shape_rejections.entry(reason.clone()).or_default() += count;
@@ -214,6 +215,7 @@ pub fn bounds(
                 .map(|row| row.targets.clone())
                 .unwrap_or_default();
             let mut blocked_requirement = false;
+            let initial_candidates = candidates.len();
             for requirement in &requirements {
                 let Some(row) = observed.get(&requirement.site) else {
                     continue;
@@ -238,6 +240,15 @@ pub fn bounds(
             if blocked_requirement {
                 open!("shim or unsupported receiver requirement", shape.site);
                 continue;
+            }
+            if candidates.len() < initial_candidates {
+                cleanup_refinements.insert(
+                    format!("{:08x}", shape.site),
+                    serde_json::json!({
+                        "tables_before": initial_candidates,
+                        "tables_after": candidates.len(),
+                    }),
+                );
             }
             let mut targets = BTreeSet::new();
             let mut invalid = None;
@@ -315,6 +326,7 @@ pub fn bounds(
         "open": open,
         "open_examples": open_examples,
         "invalid_targets": invalid_targets,
+        "cleanup_refinements": cleanup_refinements,
     });
     Bounds { sites, report }
 }

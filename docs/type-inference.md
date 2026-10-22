@@ -92,8 +92,12 @@ Every candidate slot must name a successfully lifted function, and every observe
 guest target must be included; shim or unsupported observations block the site.
 `assume_compatible_cleanup` additionally permits interface-prefix compatibility
 narrowing. Cleanup summaries check ESP balance through direct calls and normal/tail
-returns; unknown cleanup never rejects a candidate. They do not prove stack alias
-or escape safety. Dominating earlier calls contribute slot and cleanup requirements
+returns; unknown cleanup never rejects a candidate. Optional `assume_balanced_returns`
+also uses a single byte-checked RET immediate shared by all reachable returns in a
+closed single-entry function without exception flow or tail exits. This assumes ESP
+is restored to the incoming return-address slot; it does not prove frame balance.
+Verified and assumed summary counts are reported separately. Neither proves stack
+alias or escape safety. Dominating earlier calls contribute slot and cleanup requirements
 only when receiver and vptr SSA values both match. Refinement intersects proven bounds
 across passes over the frozen universe, retaining prior bounds for unresolved sites;
 empty intersections or exclusions of observed targets are rejected and reported.
@@ -106,7 +110,7 @@ Discovery must converge before the producer emits bounds, and the stable functio
 universe digest is reported. Refinement freezes the discovered program and raw table
 census; later contract passes may improve site shapes but cannot add tables.
 Ghost Recon enables `guest_bounds`, `assume_constant_vptr_stores`,
-`assume_compatible_cleanup` and `reuse_discovery_seeds`.
+`assume_compatible_cleanup` and `assume_balanced_returns`; discovery seed reuse is off.
 
 The report separates discovery mode and seed provenance, raw census and install
 counts, summary/blocked-function and shape-rejection counts, open-site reasons with

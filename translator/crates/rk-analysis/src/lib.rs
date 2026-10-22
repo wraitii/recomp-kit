@@ -52,6 +52,8 @@ struct AnalysisConfig {
     #[serde(default)]
     assume_compatible_cleanup: bool,
     #[serde(default)]
+    assume_balanced_returns: bool,
+    #[serde(default)]
     reuse_discovery_seeds: bool,
 }
 
@@ -1033,8 +1035,9 @@ fn build_artifacts(
         evidence.extend(row.site_evidence.iter().cloned());
     }
     let guest_evidence = (!guest.sites.is_empty()).then(|| format!(
-        "Structural guest vtable bounds from constant table installations; observed targets constrain compatible tables and are not exhaustive. Compatible-cleanup assumption: {}.",
-        analysis.assume_compatible_cleanup
+        "Structural guest vtable bounds from constant table installations; observed targets constrain compatible tables and are not exhaustive. Compatible-cleanup assumption: {}; balanced-returns assumption: {}.",
+        analysis.assume_compatible_cleanup,
+        analysis.assume_compatible_cleanup && analysis.assume_balanced_returns
     ));
     if let Some(text) = &guest_evidence {
         evidence.insert(text.clone());

@@ -24,6 +24,7 @@ pub struct Options {
     pub bounds: bool,
     pub assume_constant_vptr_stores: bool,
     pub assume_compatible_cleanup: bool,
+    pub assume_balanced_returns: bool,
     pub reuse_discovery_seeds: bool,
 }
 
@@ -60,6 +61,7 @@ impl Options {
             bounds: config.guest_bounds,
             assume_constant_vptr_stores: config.assume_constant_vptr_stores,
             assume_compatible_cleanup: config.assume_compatible_cleanup,
+            assume_balanced_returns: config.assume_balanced_returns,
             reuse_discovery_seeds: config.reuse_discovery_seeds,
         }
     }
@@ -123,7 +125,13 @@ pub fn produce(
     eprintln!("analysis guest: raw table census");
     let raw = tables::raw_census(program, options.assume_constant_vptr_stores);
     eprintln!("analysis guest: stack cleanup summaries");
-    let cleanups = stack::analyze(program, analysis);
+    let mut cleanups = stack::analyze(program, analysis);
+    let verified_cleanups = cleanups.len();
+    if options.assume_compatible_cleanup && options.assume_balanced_returns {
+        for (addr, cleanup) in stack::return_immediates(program, analysis) {
+            cleanups.entry(addr).or_insert(cleanup);
+        }
+    }
     let mut indirect = BTreeMap::new();
     let mut indirect_jumps = BTreeMap::new();
     let mut pass = 0usize;
@@ -269,6 +277,13 @@ pub fn produce(
                 text: "Narrowing by observed targets additionally assumes that known RET cleanup immediates agree across a table prefix. Unknown cleanup imposes no incompatibility and never rejects a candidate. Cleanup is candidate evidence, not a frame-balance proof.".into(),
                 requires: vec!["guest-vtable-structure".into()],
             });
+            if options.assume_balanced_returns {
+                assumptions.push(Assumption {
+                    id: "guest-balanced-returns".into(),
+                    text: "Additional cleanup compatibility evidence assumes that guest functions restore ESP to their incoming return-address slot before every normal RET. Only closed single-entry functions without exception flow, unknown exits or tail exits and with one byte-checked RET immediate across all reachable returns contribute. This is not a frame-balance or stack-alias proof; unknown cleanup remains compatible.".into(),
+                    requires: vec!["guest-cleanup-compatibility".into()],
+                });
+            }
         }
     }
     let report = serde_json::json!({
@@ -282,7 +297,9 @@ pub fn produce(
         "compatible_cleanup_assumption": options.assume_compatible_cleanup,
         "reuse_discovery_seeds": options.reuse_discovery_seeds,
         "raw_table_candidates": raw.len(),
-        "verified_stack_cleanups": cleanups.len(),
+        "verified_stack_cleanups": verified_cleanups,
+        "assumed_balanced_cleanups": cleanups.len() - verified_cleanups,
+        "balanced_returns_assumption": options.assume_compatible_cleanup && options.assume_balanced_returns,
         "seconds": started.elapsed().as_secs_f64(),
     });
     Ok(Output {

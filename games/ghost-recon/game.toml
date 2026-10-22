@@ -70,7 +70,8 @@ assert_effect_coverage = true
 guest_bounds = true
 assume_constant_vptr_stores = true
 assume_compatible_cleanup = true
-reuse_discovery_seeds = true
+assume_balanced_returns = true
+reuse_discovery_seeds = false
 
 [render]
 d3d8_wgpu = true

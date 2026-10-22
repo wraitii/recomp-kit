@@ -70,6 +70,39 @@ pub fn analyze(program: &Program, analysis: &rk_frontend::Analysis) -> BTreeMap<
     verified
 }
 
+pub fn return_immediates(program: &Program, analysis: &rk_frontend::Analysis) -> BTreeMap<Addr, i32> {
+    analysis
+        .ir
+        .iter()
+        .filter_map(|(&addr, result)| {
+            let fir = result.as_ref().ok()?;
+            if !closed(fir) {
+                return None;
+            }
+            let mut returns = BTreeSet::new();
+            for index in reachable(fir) {
+                let insn = fir.insns.get(index as usize)?;
+                let successors = fir.succ.get(index as usize)?;
+                if fir.exits.get(&index).is_some_and(|targets| !targets.is_empty()) {
+                    return None;
+                }
+                if insn.mnemonic.eq_ignore_ascii_case("RET") {
+                    if !successors.is_empty() {
+                        return None;
+                    }
+                    returns.insert(ret_cleanup(program, insn)?);
+                } else if successors.is_empty() && !fir.noreturn.contains_key(&index) {
+                    return None;
+                }
+                if successors.iter().any(|&next| next as usize >= fir.insns.len()) {
+                    return None;
+                }
+            }
+            (returns.len() == 1).then(|| (addr, *returns.first().unwrap()))
+        })
+        .collect()
+}
+
 fn dependencies_of(
     program: &Program,
     decoder: &Decoder,
@@ -120,13 +153,7 @@ fn verify(
     fir: &FunctionIr,
     verified: &BTreeMap<Addr, i32>,
 ) -> std::result::Result<Option<i32>, ()> {
-    if !fir.entries.is_empty()
-        || !fir.dynamic.is_empty()
-        || !fir.seh.is_empty()
-        || !fir.seh_handlers.is_empty()
-        || !fir.seh_unwind_only.is_empty()
-        || !fir.import_tails.is_empty()
-    {
+    if !closed(fir) {
         return Err(());
     }
     let entry = fir.index_of(fir.addr).ok_or(())?;
@@ -228,6 +255,15 @@ fn verify(
         return Err(());
     }
     Ok(exits.first().copied())
+}
+
+fn closed(fir: &FunctionIr) -> bool {
+    fir.entries.is_empty()
+        && fir.dynamic.is_empty()
+        && fir.seh.is_empty()
+        && fir.seh_handlers.is_empty()
+        && fir.seh_unwind_only.is_empty()
+        && fir.import_tails.is_empty()
 }
 
 fn observe_pcode(insn: &Insn, state: &mut StackState, esp: Varnode, ebp: Varnode) {
