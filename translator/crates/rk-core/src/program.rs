@@ -14,6 +14,28 @@ pub struct Image {
     pub relocations: Vec<Relocation>,
 }
 
+#[derive(Clone, Debug)]
+pub struct Section {
+    pub virtual_address: u32,
+    pub virtual_size: u32,
+    pub raw_size: u32,
+    pub raw_pointer: u32,
+    pub characteristics: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct PeDetails {
+    pub preferred_base: Addr,
+    pub entry_point: Addr,
+    pub size: u32,
+    pub delta: u32,
+    pub original: Vec<u8>,
+    pub sections: Vec<Section>,
+    pub data_ranges: Vec<(Addr, Addr, &'static str)>,
+    pub exports: Vec<Addr>,
+    pub tls_callbacks: Option<Addr>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Import {
     pub dll: String,
@@ -148,6 +170,8 @@ impl From<InteriorKind> for EntryKind {
 #[derive(Clone, Debug)]
 pub struct Program {
     pub image: Image,
+    pub sha256: String,
+    pub pe: PeDetails,
     pub metadata: BTreeMap<String, String>,
     pub functions: BTreeMap<Addr, Function>,
     pub tables: BTreeMap<(Addr, Addr), Vec<Addr>>,

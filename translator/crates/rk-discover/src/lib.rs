@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
 
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
-use rk_core::program::{Function, Image, InteriorKind, Program, Span};
+use rk_core::program::{Function, Image, InteriorKind, PeDetails, Program, Span};
 use rk_core::facts::{AnalysisFacts, TransferKind};
 use rk_core::settings::Settings;
 use rayon::prelude::*;
@@ -231,7 +231,6 @@ pub fn discover(settings: &Settings, program: &Program) -> Result<Discovered> {
             report: DiscoveryReport::empty(),
         });
     }
-    let details = rk_image::details::load(&settings.exe, program.image.base)?;
     let check = SleighLengths::default();
     let mut suppressions = Vec::new();
     let mut rejections = Vec::new();
@@ -240,7 +239,7 @@ pub fn discover(settings: &Settings, program: &Program) -> Result<Discovered> {
     let mut recovery = None;
     let mut converged = false;
     for pass in 1..=MAX_DISCOVERY_PASSES {
-        let mut current = Recovery::new(program, details.clone(), &check, suppressions.clone());
+        let mut current = Recovery::new(program, program.pe.clone(), &check, suppressions.clone());
         current.pass = pass;
         current.function_rejections = rejections;
         run_discovery(&mut current, settings)?;
@@ -301,7 +300,7 @@ pub fn merge(program: &mut Program, discovered: &Discovered) -> Result<()> {
 
 struct Recovery<'a> {
     image: &'a Image,
-    details: rk_image::details::PeDetails,
+    details: PeDetails,
     check: &'a SleighLengths,
     delta: u32,
     instructions: BTreeMap<Addr, Insn>,
@@ -344,7 +343,7 @@ struct Recovery<'a> {
 impl<'a> Recovery<'a> {
     fn new(
         program: &'a Program,
-        details: rk_image::details::PeDetails,
+        details: PeDetails,
         check: &'a SleighLengths,
         mut suppressed: Vec<(Addr, Addr)>,
     ) -> Self {

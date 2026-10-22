@@ -126,7 +126,6 @@ struct Symbols<'a> {
 }
 
 pub fn symbols_json(settings: &Settings, program: &Program, rows: &[SymbolRow]) -> Result<String> {
-    let exe = std::fs::read(&settings.exe).map_err(|e| Error::io(&settings.exe, e))?;
     let by_addr: BTreeMap<Addr, &SymbolRow> = rows.iter().map(|r| (r.addr, r)).collect();
     let mut events = IndexMap::new();
     for (name, &addr) in &settings.curated.events {
@@ -139,7 +138,7 @@ pub fn symbols_json(settings: &Settings, program: &Program, rows: &[SymbolRow]) 
         events.insert(name.as_str(), Hex(addr).to_string());
     }
     let symbols = Symbols {
-        exe_sha256: rk_image::sha256_hex(&exe),
+        exe_sha256: program.sha256.clone(),
         image_base: Hex(program.image.base).to_string(),
         functions: rows,
         globals: settings

@@ -2,7 +2,7 @@
 //! relocations when needed) and the Ghidra `recomp-code-map-v3` directory (`code_map`), whose
 //! executable hash and image base must match the settings. `index_entries` classifies every entry
 //! as function, table target, interior, thunk target, relocated pointer or configured entry;
-//! `details` re-reads unrelocated PE metadata for discovery.
+//! `details` derives unrelocated PE metadata from the same parse.
 
 pub mod code_map;
 pub mod details;
@@ -21,9 +21,14 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 pub fn load(settings: &Settings) -> Result<Program> {
     let exe = std::fs::read(&settings.exe).map_err(|e| Error::io(&settings.exe, e))?;
-    let image = pe::load(&settings.exe, Some(settings.base))?;
-    let map = code_map::read_map(&settings.code_map)?;
     let actual = sha256_hex(&exe);
+    let invalid = |message: &str| Error::input(format!("{}: {message}", settings.exe.display()));
+    let headers = pe::Headers::parse(&exe).ok_or_else(|| invalid("malformed PE image"))?;
+    let pe = details::parse_headers(&headers, settings.base);
+    let image = pe::parse_headers(headers, Some(settings.base))
+        .ok_or_else(|| invalid("malformed PE image"))?
+        .map_err(|message| invalid(&message))?;
+    let map = code_map::read_map(&settings.code_map)?;
     if actual != settings.sha256 || map.metadata.get("executable_sha256") != Some(&actual) {
         return Err(Error::input("code-map, game.toml and executable SHA-256 do not match"));
     }
@@ -32,6 +37,7 @@ pub fn load(settings: &Settings) -> Result<Program> {
     {
         return Err(Error::input("code-map, game.toml and executable image bases do not match"));
     }
+    let pe = pe.ok_or_else(|| invalid("malformed PE image"))?.map_err(|message| invalid(&message))?;
     let provisional = map.metadata.get("provenance").map(String::as_str) == Some("provisional-sweep");
     let functions: BTreeMap<Addr, Function> = map
         .functions
@@ -53,6 +59,8 @@ pub fn load(settings: &Settings) -> Result<Program> {
     spans.sort_unstable();
     let mut program = Program {
         image,
+        sha256: actual,
+        pe,
         metadata: map.metadata,
         functions,
         tables: map.tables,

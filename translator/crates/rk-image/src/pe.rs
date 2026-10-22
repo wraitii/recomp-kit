@@ -1,21 +1,11 @@
 use std::collections::BTreeMap;
-use std::path::Path;
 
-use rk_core::program::{Image, Import, Relocation};
-use rk_core::{Addr, Error, Result};
+use rk_core::program::{Image, Import, Relocation, Section};
+use rk_core::Addr;
 
 const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const DIR_IMPORT: usize = 1;
 const DIR_BASERELOC: usize = 5;
-
-#[derive(Clone, Debug)]
-pub struct Section {
-    pub virtual_address: u32,
-    pub virtual_size: u32,
-    pub raw_size: u32,
-    pub raw_pointer: u32,
-    pub characteristics: u32,
-}
 
 pub(crate) fn u16_at(data: &[u8], off: usize) -> Option<u16> {
     Some(u16::from_le_bytes(data.get(off..off + 2)?.try_into().ok()?))
@@ -116,14 +106,10 @@ impl<'a> Headers<'a> {
     }
 }
 
-pub fn load(path: &Path, base: Option<Addr>) -> Result<Image> {
-    let file = std::fs::read(path).map_err(|e| Error::io(path, e))?;
-    parse(&file, base).ok_or_else(|| Error::input(format!("{}: malformed PE image", path.display())))?
-        .map_err(|message| Error::input(format!("{}: {message}", path.display())))
-}
-
-fn parse(file: &[u8], base: Option<Addr>) -> Option<std::result::Result<Image, String>> {
-    let mut headers = Headers::parse(file)?;
+pub(crate) fn parse_headers(
+    mut headers: Headers<'_>,
+    base: Option<Addr>,
+) -> Option<std::result::Result<Image, String>> {
     let preferred_base = headers.preferred_base;
     let size = headers.size;
     let base = base.unwrap_or(preferred_base);
