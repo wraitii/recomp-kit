@@ -88,6 +88,10 @@ impl Lifter {
         self.register_names.get(&(offset, size)).map(String::as_str)
     }
 
+    pub fn registers(&self) -> impl Iterator<Item = (&str, u64, u32)> {
+        self.register_names.iter().map(|(&(offset, size), name)| (name.as_str(), offset, size))
+    }
+
     pub fn lengths(&self, addr: Addr, data: &[u8]) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         let mut pos = 0;

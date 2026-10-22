@@ -19,14 +19,15 @@ impl Registers {
 
     fn scan() -> Result<Self, String> {
         let lifter = Lifter::new().map_err(|e| e.to_string())?;
+        let mut named: Vec<(&str, u64, u32)> = lifter
+            .registers()
+            .filter(|&(_, offset, size)| offset < 0x2000 && [1, 2, 4, 8, 10, 16].contains(&size))
+            .collect();
+        named.sort_by_key(|&(_, offset, size)| (size, offset));
         let mut map = BTreeMap::new();
-        for size in [1u32, 2, 4, 8, 10, 16] {
-            for offset in 0..0x2000u64 {
-                if let Some(name) = lifter.register_name(offset, size) {
-                    map.entry(name.to_string())
-                        .or_insert_with(|| Varnode::new(Space::Register, offset, size));
-                }
-            }
+        for (name, offset, size) in named {
+            map.entry(name.to_string())
+                .or_insert_with(|| Varnode::new(Space::Register, offset, size));
         }
         let end = map.values().filter(|v| v.space == Space::Register).map(|v| v.offset + v.size as u64).max().unwrap_or(0);
         let covering = (0..end)
