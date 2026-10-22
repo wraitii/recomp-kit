@@ -9,7 +9,6 @@ rk-core.workspace = true
 rk-decode.workspace = true
 rk-sleigh.workspace = true
 rayon.workspace = true
-serde.workspace = true
 
 [lints]
 workspace = true

@@ -195,21 +195,7 @@ pub struct Discovered {
     pub report: DiscoveryReport,
 }
 
-impl Discovered {
-    pub fn is_empty(&self) -> bool {
-        self.functions.is_empty()
-    }
-
-    pub fn instruction_count(&self) -> usize {
-        self.report.instructions
-    }
-}
-
-pub fn discover(settings: &Settings, program: &Program) -> Result<Discovered> {
-    discover_with(settings, program, None)
-}
-
-pub fn discover_with(
+pub fn discover(
     settings: &Settings,
     program: &Program,
     check: Option<&dyn DecodeCheck>,

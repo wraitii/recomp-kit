@@ -63,10 +63,7 @@ impl CallFacts for ContractCallFacts<'_> {
 
 impl From<&X87ModeFacts> for rk_x87::ModeInput {
     fn from(facts: &X87ModeFacts) -> Self {
-        Self {
-            known_modes: facts.known_modes.clone(),
-            sites: facts.sites.clone(),
-        }
+        Self { known_modes: facts.known_modes.clone() }
     }
 }
 

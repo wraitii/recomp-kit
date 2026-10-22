@@ -27,7 +27,6 @@ pub struct EmitContext<'a> {
     pub checked_returns: &'a BTreeSet<Addr>,
     pub private_masks: &'a BTreeMap<Addr, BTreeSet<Fields>>,
     pub private_input_arguments: &'a BTreeMap<Addr, String>,
-    pub known_modes: &'a BTreeSet<Addr>,
     pub known_entries: &'a BTreeSet<Addr>,
     pub setjmp_targets: &'a BTreeSet<Addr>,
     pub private: Option<&'a PrivateEmit>,

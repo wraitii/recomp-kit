@@ -42,16 +42,9 @@ pub struct ModeCondition {
     pub value: u16,
 }
 
-impl ModeCondition {
-    pub fn holds(self, cw: u16) -> bool {
-        cw & self.mask == self.value
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct ModeInput {
     pub known_modes: BTreeSet<Addr>,
-    pub sites: BTreeMap<Addr, ModeCondition>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -68,7 +61,6 @@ pub struct CloneProgram {
 pub struct Plan {
     pub used: bool,
     pub declarations: Vec<Expr>,
-    pub environment: Vec<Expr>,
     pub programs: Vec<CloneProgram>,
 }
 
@@ -610,7 +602,6 @@ pub fn prepare(s: &Ssa, modes: &ModeInput, options: &Options) -> Result<Plan, Re
     Ok(Plan {
         used: true,
         declarations,
-        environment: vec![env("cw"), env("sw"), env("top")],
         programs,
     })
 }

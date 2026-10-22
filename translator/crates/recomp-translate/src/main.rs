@@ -249,7 +249,6 @@ struct BodyContext<'a> {
     private_targets: &'a BTreeSet<Addr>,
     private_masks: BTreeMap<Addr, BTreeSet<Fields>>,
     private_input_arguments: BTreeMap<Addr, String>,
-    known_modes: BTreeSet<Addr>,
 }
 
 impl<'a> BodyContext<'a> {
@@ -263,7 +262,6 @@ impl<'a> BodyContext<'a> {
             checked_returns: self.checked,
             private_masks: &self.private_masks,
             private_input_arguments: &self.private_input_arguments,
-            known_modes: &self.known_modes,
             known_entries: self.known_entries,
             setjmp_targets: self.setjmp_targets,
             private,
@@ -424,7 +422,7 @@ fn build_bodies(
     } else {
         global.private.targets.keys().copied().collect()
     };
-    let make_ctx = |private_masks, private_input_arguments, known_modes| BodyContext {
+    let make_ctx = |private_masks, private_input_arguments| BodyContext {
         program,
         facts: global.call_facts(),
         checked: &global.private.checked_returns,
@@ -441,9 +439,8 @@ fn build_bodies(
         private_targets: &private_targets,
         private_masks,
         private_input_arguments,
-        known_modes,
     };
-    let ctx = make_ctx(BTreeMap::new(), BTreeMap::new(), BTreeSet::new());
+    let ctx = make_ctx(BTreeMap::new(), BTreeMap::new());
     let selected: BTreeSet<Addr> = only.iter().copied().collect();
     let wanted = |addr: Addr| selected.is_empty() || selected.contains(&addr);
     let sources: Vec<(Addr, Option<FunctionIr>)> = match owned {
@@ -513,11 +510,7 @@ fn build_bodies(
         .iter()
         .map(|(&addr, &field)| (addr, field.name().to_string()))
         .collect();
-    let ctx2 = make_ctx(
-        specialized.masks.clone(),
-        private_arguments,
-        global.private.known_modes.clone(),
-    );
+    let ctx2 = make_ctx(specialized.masks.clone(), private_arguments);
     let phase2: Vec<(Vec<BodyRow>, Vec<Body>)> = retained
         .into_par_iter()
         .map(|item| -> Result<(Vec<BodyRow>, Vec<Body>)> {
@@ -961,7 +954,7 @@ fn main() -> Result<()> {
     let lengths = SleighLengths {
         cache: Default::default(),
     };
-    let discovered = rk_discover::discover_with(&settings, &program, Some(&lengths))?;
+    let discovered = rk_discover::discover(&settings, &program, Some(&lengths))?;
     if let Some(path) = &args.discovery_report {
         write_discovery_report(path, &settings, &program, &discovered)?;
     }
@@ -1023,7 +1016,6 @@ fn main() -> Result<()> {
         bodies,
         preludes: rk_emit::preludes(),
         call_returns,
-        regions: Vec::new(),
         call_facts: facts.runtime_call_facts,
         cw_effects: facts.cw_effects,
         checked_returns: global.private.checked_returns.clone(),

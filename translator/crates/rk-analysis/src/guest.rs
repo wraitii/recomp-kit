@@ -101,7 +101,7 @@ pub fn discover_program(settings: &Settings, program: &Program) -> Result<(Progr
     let lengths = Lengths {
         cache: OnceLock::new(),
     };
-    let discovered = rk_discover::discover_with(settings, program, Some(&lengths))?;
+    let discovered = rk_discover::discover(settings, program, Some(&lengths))?;
     let converged = discovered.report.converged;
     let mut program = program.clone();
     rk_discover::merge(&mut program, &discovered)?;

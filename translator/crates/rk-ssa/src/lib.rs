@@ -18,7 +18,6 @@ mod flags;
 mod forward;
 mod liveness;
 mod prepare;
-mod verify;
 
 pub use build::{
     build, BuildOptions, CallEffect, CallFacts, ConservativeCallFacts, DEFAULT_VALUE_BUDGET,
@@ -29,7 +28,6 @@ pub use flags::{FlagDescriptor, FlagPlan, FlagPublication, FlagSource};
 pub use forward::forward;
 pub use liveness::{live_values, simplify};
 pub use prepare::{prepare, publications, PrepareOptions};
-pub use verify::verify;
 
 pub type ValueId = u32;
 pub type BlockId = u32;

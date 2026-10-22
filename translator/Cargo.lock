@@ -464,7 +464,6 @@ dependencies = [
  "rk-sleigh",
  "rk-ssa",
  "rk-x87",
- "serde",
  "serde_json",
 ]
 
@@ -540,7 +539,6 @@ dependencies = [
  "rk-core",
  "rk-decode",
  "rk-sleigh",
- "serde",
 ]
 
 [[package]]
@@ -569,7 +567,6 @@ version = "0.1.0"
 dependencies = [
  "rk-core",
  "rk-sleigh",
- "serde",
 ]
 
 [[package]]
@@ -600,7 +597,6 @@ version = "0.1.0"
 dependencies = [
  "libsla",
  "rk-core",
- "serde",
  "sleigh-config",
 ]
 
@@ -610,8 +606,6 @@ version = "0.1.0"
 dependencies = [
  "rk-core",
  "rk-ir",
- "serde",
- "serde_json",
 ]
 
 [[package]]

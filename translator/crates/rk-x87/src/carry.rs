@@ -4,18 +4,8 @@ use rk_core::Reason;
 use rk_ir::{properties, Op};
 use rk_ssa::{BlockId, Ssa, ValueId, DISPATCH_BLOCK};
 
-use crate::scalar::{merge_shapes, parts, CarryShape, Scalar, Shape};
+use crate::scalar::{merge_shapes, parts, CarryShape, Scalar, Shape, INACTIVE};
 use crate::types::Expr;
-
-const INACTIVE: Shape = Shape::Known(CarryShape {
-    active: false,
-    slots: Vec::new(),
-    base: 0,
-    low: 0,
-    high: 0,
-    top_unknown: false,
-    status_dirty: false,
-});
 
 pub fn reset_op(op: Op) -> bool {
     matches!(
@@ -94,7 +84,7 @@ pub fn analyze(s: &Ssa, factory: &dyn Fn() -> Scalar) -> Result<BTreeMap<BlockId
         .enumerate()
         .map(|(index, _)| (index as BlockId, Shape::Unknown))
         .collect();
-    entry.insert(primary, INACTIVE);
+    entry.insert(primary, Shape::Known(INACTIVE));
     let mut resets: BTreeSet<BlockId> = roots.iter().copied().skip(1).collect();
     if s.blocks
         .get(primary as usize)
@@ -149,7 +139,7 @@ pub fn analyze(s: &Ssa, factory: &dyn Fn() -> Scalar) -> Result<BTreeMap<BlockId
             let mut shapes = Vec::new();
             for &pred in &block_ref.preds {
                 if pred == DISPATCH_BLOCK {
-                    shapes.push(INACTIVE);
+                    shapes.push(Shape::Known(INACTIVE));
                 } else if let Some(shape) = exit.get(&pred) {
                     shapes.push(shape.clone());
                 }

@@ -487,10 +487,6 @@ pub fn is_xmm(op: &Operand) -> bool {
     matches!(op.kind, OperandKind::Xmm(_))
 }
 
-pub fn names_an_xmm(ins: &DecodedInsn) -> bool {
-    ins.operands.iter().any(is_xmm)
-}
-
 pub fn branch_target(ins: &DecodedInsn) -> Option<Addr> {
     match ins.operands.first()?.kind {
         OperandKind::Imm(value) => Some(value as Addr),

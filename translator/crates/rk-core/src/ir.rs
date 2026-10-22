@@ -140,11 +140,7 @@ pub struct Insn {
     pub operands: String,
     pub text: String,
     pub ops: Vec<PcodeOp>,
-    pub internal_flow: bool,
     pub x87: bool,
-    pub x87_delta: i8,
-    #[serde(default)]
-    pub userops: Vec<u64>,
 }
 
 impl Insn {

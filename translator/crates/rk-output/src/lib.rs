@@ -107,20 +107,12 @@ pub struct Body {
     pub private_mask: Option<Fields>,
 }
 
-#[derive(Clone, Debug)]
-pub struct Region {
-    pub start: Addr,
-    pub end: Addr,
-    pub symbol: String,
-}
-
 pub struct Translation<'a> {
     pub settings: &'a Settings,
     pub program: &'a Program,
     pub bodies: Vec<Body>,
     pub preludes: Preludes,
     pub call_returns: Vec<Addr>,
-    pub regions: Vec<Region>,
     pub call_facts: BTreeMap<Addr, Vec<Addr>>,
     pub cw_effects: BTreeMap<Addr, (u16, u16, u16)>,
     pub checked_returns: BTreeSet<Addr>,
@@ -164,7 +156,6 @@ pub fn write(out: &Path, t: &Translation) -> Result<Written> {
             &entry_names,
             &symbols,
             &t.call_returns,
-            &t.regions,
             &t.private_masks,
         ),
     };

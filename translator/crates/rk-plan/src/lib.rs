@@ -26,21 +26,6 @@ pub struct PlanOptions<'a> {
     pub private_targets: &'a BTreeSet<Addr>,
 }
 
-impl<'a> PlanOptions<'a> {
-    pub fn new(call_facts: &'a dyn CallFacts) -> Self {
-        static MODES: std::sync::OnceLock<rk_x87::ModeInput> = std::sync::OnceLock::new();
-        static TARGETS: std::sync::OnceLock<BTreeSet<Addr>> = std::sync::OnceLock::new();
-        Self {
-            call_facts,
-            policy: Policy::Optimizing,
-            x87_modes: MODES.get_or_init(rk_x87::ModeInput::default),
-            x87_options: rk_x87::Options::default(),
-            fault_state: rk_core::settings::FaultState::Relaxed,
-            private_targets: TARGETS.get_or_init(BTreeSet::new),
-        }
-    }
-}
-
 pub struct PlannedFunction {
     pub ssa: Ssa,
     pub publish: BTreeMap<ValueId, Vec<StateKey>>,

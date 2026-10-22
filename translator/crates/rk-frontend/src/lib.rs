@@ -632,19 +632,6 @@ pub fn analyze(program: &Program) -> Analysis {
     Analysis { ir, seh_helpers: helpers }
 }
 
-pub fn analyze_function(program: &Program, addr: Addr, helpers: &BTreeSet<Addr>) -> Result<FunctionIr> {
-    let mut lifter = Lifter::new()?;
-    let decoder = Decoder::new()?;
-    let relocated: BTreeMap<Addr, Addr> = program
-        .image
-        .relocations
-        .iter()
-        .map(|relocation| (relocation.site, relocation.target))
-        .collect();
-    let raw = build_raw(program, addr, &mut lifter, &decoder, &relocated)?;
-    finalize(program, addr, raw, helpers)
-}
-
 fn seh_helpers(program: &Program, raw: &[(Addr, Result<RawFunction>)]) -> BTreeSet<Addr> {
     let mut helpers: BTreeSet<Addr> = raw
         .iter()
@@ -781,10 +768,7 @@ fn build_raw(
                 .join(","),
             text: ins.text.clone(),
             ops: lifted.ops,
-            internal_flow: lifted.internal_flow,
             x87: lifted.x87,
-            x87_delta: lifted.x87_delta,
-            userops: lifted.userops,
         });
     }
     let end = (addr + function.spans.iter().map(|s| s.size).sum::<u32>())

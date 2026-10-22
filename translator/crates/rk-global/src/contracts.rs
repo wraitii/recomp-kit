@@ -41,7 +41,6 @@ const GPR_LANES: u64 = (1u64 << 32) - 1;
 const FLAG_LANES: u64 = ALL & !GPR_LANES;
 const MAX_INSTRUCTIONS: usize = 16384;
 const MAX_ROUNDS: usize = 4096;
-const PRESERVATION: bool = true;
 const AF_WRITERS: &[&str] = &[
     "ADD", "ADC", "SUB", "SBB", "CMP", "INC", "DEC", "AND", "OR", "XOR", "TEST",
 ];
@@ -749,7 +748,7 @@ fn prepare(
     let raw = stack_info(program, fir);
     let calls: Vec<CallSite> = call_rows.into_values().collect();
     let entry = cg.index_of(fir.addr).unwrap();
-    let preserve = PRESERVATION && raw.0 && !has_tails && tails.is_empty() && !raw.2.is_empty();
+    let preserve = raw.0 && !has_tails && tails.is_empty() && !raw.2.is_empty();
     Ok(Prepared {
         entry,
         order,

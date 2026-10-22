@@ -27,10 +27,7 @@ const DIAGNOSTIC_REGISTERS: [&str; 5] = [
 pub struct Lifted {
     pub length: u8,
     pub ops: Vec<PcodeOp>,
-    pub internal_flow: bool,
     pub x87: bool,
-    pub x87_delta: i8,
-    pub userops: Vec<u64>,
 }
 
 pub struct Lifter {
@@ -141,13 +138,10 @@ impl Lifter {
 
     pub fn lift(&mut self, addr: Addr, data: &[u8]) -> Result<Lifted> {
         if data == [0x9b] {
-            return Ok(Lifted { length: 1, ops: Vec::new(), internal_flow: false, x87: false, x87_delta: 0, userops: Vec::new() });
+            return Ok(Lifted { length: 1, ops: Vec::new(), x87: false });
         }
         let mut ops = Vec::new();
-        let mut userops = Vec::new();
-        let mut internal_flow = false;
         let mut x87 = false;
-        let mut delta = 0i8;
         let mut pos = 0usize;
         while pos < data.len() {
             let at = addr + pos as u32;
@@ -166,7 +160,7 @@ impl Lifter {
                     },
                 ));
             }
-            let sub = self.convert_all(decoded.instructions, &mut userops)?;
+            let sub = self.convert_all(decoded.instructions)?;
             let sub_flow = sub.iter().any(|op| {
                 matches!(op.opcode, OpCode::Branch | OpCode::CBranch)
                     && op.inputs.first().is_some_and(|v| {
@@ -187,9 +181,7 @@ impl Lifter {
                         Reason::Unsupported { detail: "x87 instruction with internal control flow".into() },
                     ));
                 }
-                let (normalized, d) = normalize_x87(self.rename_uniques(sub), |size| self.fresh_unique(size));
-                sub = normalized;
-                delta += d;
+                sub = normalize_x87(self.rename_uniques(sub), |size| self.fresh_unique(size)).0;
                 x87 = true;
             }
             if sub_flow && !ops.is_empty() {
@@ -198,14 +190,13 @@ impl Lifter {
                     Reason::Unsupported { detail: "internal control flow after a folded prefix".into() },
                 ));
             }
-            internal_flow |= sub_flow;
             ops.extend(sub);
             pos += size;
         }
         let length = u8::try_from(data.len()).map_err(|_| {
             Diagnostic::error(addr, Reason::LiftFailed { detail: "instruction longer than 255 bytes".into() })
         })?;
-        Ok(Lifted { length, ops, internal_flow, x87, x87_delta: delta, userops })
+        Ok(Lifted { length, ops, x87 })
     }
 
     fn translate_one(&self, addr: Addr, data: &[u8]) -> std::result::Result<libsla::PcodeDisassembly, libsla::Error> {
@@ -214,21 +205,17 @@ impl Lifter {
             .disassemble_pcode(&loader, Address::new(self.code_space.clone(), addr as u64))
     }
 
-    fn convert_all(
-        &self,
-        raw: Vec<PcodeInstruction>,
-        userops: &mut Vec<u64>,
-    ) -> Result<Vec<PcodeOp>> {
+    fn convert_all(&self, raw: Vec<PcodeInstruction>) -> Result<Vec<PcodeOp>> {
         let mut out = Vec::with_capacity(raw.len());
         for op in raw {
-            if let Some(converted) = self.convert(op, userops)? {
+            if let Some(converted) = self.convert(op)? {
                 out.push(converted);
             }
         }
         Ok(out)
     }
 
-    fn convert(&self, op: PcodeInstruction, userops: &mut Vec<u64>) -> Result<Option<PcodeOp>> {
+    fn convert(&self, op: PcodeInstruction) -> Result<Option<PcodeOp>> {
         let output = op.output.as_ref().map(|v| self.varnode(v)).transpose()?;
         if let Some(v) = &output {
             if v.space == Space::Register && self.diagnostic.contains(&(v.offset, v.size)) {
@@ -250,7 +237,6 @@ impl Lifter {
             SleighOp::Pseudo(libsla::PseudoOp::CallOther) => {
                 if let Some(id) = inputs.first() {
                     userop = Some(id.offset);
-                    userops.push(id.offset);
                 }
             }
             _ => {}
