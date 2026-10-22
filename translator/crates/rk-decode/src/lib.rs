@@ -1,7 +1,6 @@
 //! Capstone-backed structural decoder for one instruction whose bytes are already known; a `WAIT`
 //! followed by an `FN*` instruction is fused into one. Produces the canonical mnemonics, typed
-//! operands and listing text that the frontend, x87 recipes and slow-path emission read. Also holds
-//! the MSVC SEH and EH3 byte-pattern recognizers.
+//! operands and listing text that the frontend, x87 recipes and slow-path emission read.
 
 use capstone::arch::x86::{ArchMode, X86OperandType};
 use capstone::prelude::*;
@@ -96,40 +95,6 @@ const X87_INT: [&str; 20] = [
     "FSAVE",
 ];
 const STRUCTURED: [&str; 6] = ["FNSTENV", "FSTENV", "FLDENV", "FNSAVE", "FSAVE", "FRSTOR"];
-
-const MSVC_SEH_PROLOG_HEX: &str = "68????????64a100000000508b442410896c24108d6c24102be05356578b45f88965e8508b45fcc745fcffffffff8945f88d45f064a300000000c3";
-const MSVC_SEH_EPILOG_HEX: &str = "8b4df064890d00000000595f5e5bc951c3";
-const MSVC_EH3_FRAME_HEX: &str = "558bec6aff6800000000680000000064a1000000005064892500000000";
-pub const MSVC_SEH_PROLOG_LEN: u32 = 59;
-pub const MSVC_EH3_FRAME_LEN: u32 = 29;
-const MSVC_EH3_HANDLER_HEX: &str = "558bec83ec0853565755fc8b5d0c8b4508f74004060000000f85";
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn seh_pattern(hex: &str, wildcards: &[usize]) -> Vec<Option<u8>> {
-    let bytes = hex.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    let mut i = 0;
-    let mut at = 0;
-    while i + 1 < bytes.len() {
-        let hi = hex_nibble(bytes[i]).unwrap_or(0);
-        let lo = hex_nibble(bytes[i + 1]).unwrap_or(0);
-        out.push(if wildcards.contains(&at) {
-            None
-        } else {
-            Some((hi << 4) | lo)
-        });
-        i += 2;
-        at += 1;
-    }
-    out
-}
 
 pub struct Decoder {
     md: Capstone,
@@ -492,119 +457,4 @@ pub fn branch_target(ins: &DecodedInsn) -> Option<Addr> {
         OperandKind::Imm(value) => Some(value as Addr),
         _ => None,
     }
-}
-
-pub fn code_matches(image: &rk_core::program::Image, va: Addr, pattern: &[Option<u8>]) -> bool {
-    if !image.is_exec(va) || pattern.is_empty() || !image.is_exec(va + pattern.len() as u32 - 1) {
-        return false;
-    }
-    let Some(code) = image.bytes(va, pattern.len()) else {
-        return false;
-    };
-    code.iter()
-        .zip(pattern)
-        .all(|(b, p)| p.is_none_or(|p| p == *b))
-}
-
-pub fn msvc_seh_prolog(image: &rk_core::program::Image, va: Addr) -> Option<Addr> {
-    code_matches(image, va, &seh_pattern(MSVC_SEH_PROLOG_HEX, &[1, 2, 3, 4]))
-        .then(|| image.rd32(va + 1))
-        .flatten()
-        .filter(|handler| image.is_exec(*handler))
-}
-
-pub fn msvc_seh_epilog(image: &rk_core::program::Image, va: Addr) -> bool {
-    code_matches(image, va, &seh_pattern(MSVC_SEH_EPILOG_HEX, &[]))
-}
-
-pub fn msvc_unwind_only(image: &rk_core::program::Image, handler: Option<Addr>) -> bool {
-    let Some(handler) = handler else {
-        return false;
-    };
-    let mut pattern = vec![
-        Some(0xb8),
-        None,
-        None,
-        None,
-        None,
-        Some(0xe9),
-        None,
-        None,
-        None,
-        None,
-    ];
-    if !code_matches(image, handler, &pattern) {
-        return false;
-    }
-    pattern.clear();
-    let Some(info) = image.rd32(handler + 1) else {
-        return false;
-    };
-    matches!(image.rd32(info), Some(0x19930520..=0x19930522)) && image.rd32(info + 12) == Some(0)
-}
-
-pub fn msvc_eh3_finally_only(
-    image: &rk_core::program::Image,
-    va: Addr,
-    levels: Option<&std::collections::BTreeSet<u32>>,
-) -> bool {
-    let Some(levels) = levels else {
-        return false;
-    };
-    if !code_matches(
-        image,
-        va,
-        &seh_pattern(MSVC_EH3_FRAME_HEX, &[6, 7, 8, 9, 11, 12, 13, 14]),
-    ) {
-        return false;
-    }
-    let Some(handler) = image.rd32(va + 11) else {
-        return false;
-    };
-    let handler_pattern = seh_pattern(MSVC_EH3_HANDLER_HEX, &[]);
-    if !code_matches(image, handler, &handler_pattern) {
-        return false;
-    }
-    let Some(scope) = image.rd32(va + 6) else {
-        return false;
-    };
-    let mut seen = std::collections::BTreeSet::new();
-    let mut todo: Vec<u32> = levels.iter().copied().collect();
-    while let Some(level) = todo.pop() {
-        if level == 0xffff_ffff || !seen.insert(level) {
-            continue;
-        }
-        if level >= 0x100 || image.rd32(scope + 12 * level + 4) != Some(0) {
-            return false;
-        }
-        if let Some(parent) = image.rd32(scope + 12 * level) {
-            todo.push(parent);
-        }
-    }
-    true
-}
-
-pub fn seh_constructor_helper(image: &rk_core::program::Image, va: Addr) -> Option<Addr> {
-    let prefix = "52515384d27c03ff50f431d28d4c2410648b1a8919896908c74104";
-    let suffix = "89410c64890a5b595ac3";
-    let prefix = seh_pattern(prefix, &[]);
-    let suffix = seh_pattern(suffix, &[]);
-    let size = prefix.len() + 4 + suffix.len();
-    if !image.is_exec(va) || !image.is_exec(va + size as u32 - 1) {
-        return None;
-    }
-    let code = image.bytes(va, size)?;
-    if !code[..prefix.len()]
-        .iter()
-        .zip(&prefix)
-        .all(|(b, p)| p.is_none_or(|p| p == *b))
-        || !code[prefix.len() + 4..]
-            .iter()
-            .zip(&suffix)
-            .all(|(b, p)| p.is_none_or(|p| p == *b))
-    {
-        return None;
-    }
-    let candidate = image.rd32(va + prefix.len() as u32)?;
-    image.is_exec(candidate).then_some(candidate)
 }
