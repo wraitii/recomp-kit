@@ -45,6 +45,13 @@ impl<'a> PrepareOptions<'a> {
 }
 
 pub fn prepare(cg: &rk_ir::CgFunction, opts: &PrepareOptions) -> rk_core::Result<Ssa> {
+    prepare_with_publications(cg, opts).map(|(ssa, _)| ssa)
+}
+
+pub fn prepare_with_publications(
+    cg: &rk_ir::CgFunction,
+    opts: &PrepareOptions,
+) -> rk_core::Result<(Ssa, Option<BTreeMap<ValueId, Vec<StateKey>>>)> {
     let build_options = BuildOptions {
         policy: opts.policy,
         call_facts: opts.call_facts,
@@ -57,14 +64,14 @@ pub fn prepare(cg: &rk_ir::CgFunction, opts: &PrepareOptions) -> rk_core::Result
     forward(&mut ssa, opts.stack_reload);
     crate::coalesce::coalesce(&mut ssa, opts.coalesce_roots);
     canonicalize(&mut ssa, opts.signed_sub);
-    let publications = opts.lazy_publications.then(|| {
-        let mut plan = publications(&ssa, opts.call_facts);
-        for boundary in &ssa.boundaries {
-            if matches!(ssa.value(boundary.at).op, Op::Call { .. } | Op::CallInd) {
-                plan.insert(boundary.at, ssa.keys.to_vec());
-            }
-        }
-        plan
+    let plans = opts.lazy_publications.then(|| {
+        let base = publications(&ssa, opts.call_facts);
+        let simplify = ssa
+            .boundaries
+            .iter()
+            .map(|boundary| (boundary.at, ssa.keys.to_vec()))
+            .collect();
+        (base, simplify)
     });
     let flag_roots: Vec<ValueId> = ssa
         .flags
@@ -79,8 +86,8 @@ pub fn prepare(cg: &rk_ir::CgFunction, opts: &PrepareOptions) -> rk_core::Result
         })
         .flatten()
         .collect();
-    simplify(&mut ssa, publications.as_ref(), &flag_roots, &[]);
-    Ok(ssa)
+    simplify(&mut ssa, plans.as_ref().map(|(_, simplify)| simplify), &flag_roots, &[]);
+    Ok((ssa, plans.map(|(base, _)| base)))
 }
 
 pub fn publications(s: &Ssa, call_facts: &dyn CallFacts) -> BTreeMap<ValueId, Vec<StateKey>> {

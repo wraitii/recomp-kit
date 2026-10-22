@@ -10,7 +10,10 @@ use rk_core::contract::Fields;
 use rk_core::ir::Policy;
 use rk_core::{Addr, Diagnostic, LookupSet, Result};
 use rk_ir::{CgFunction, StateKey};
-use rk_ssa::{live_values, prepare, publications, CallFacts, FlagPublication, PrepareOptions, Ssa, ValueId};
+use rk_ssa::{
+    live_values, prepare_with_publications, publications, CallFacts, FlagPublication,
+    PrepareOptions, Ssa, ValueId,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct ContractRequests {
@@ -48,8 +51,8 @@ pub fn plan_function(cg: &CgFunction, opts: &PlanOptions<'_>) -> Result<PlannedF
     prepare_options.policy = opts.policy;
     prepare_options.fault_state = opts.fault_state;
     prepare_options.coalesce_roots = opts.coalesce_roots;
-    let ssa = prepare(cg, &prepare_options)?;
-    let base = publications(&ssa, opts.call_facts);
+    let (ssa, base) = prepare_with_publications(cg, &prepare_options)?;
+    let base = base.unwrap_or_else(|| publications(&ssa, opts.call_facts));
     let (publish, guard) = reduce_publications(&ssa, &base, opts.call_facts);
     let flag_plan = ssa.flag_plan();
     let mut flag_publish = BTreeMap::new();

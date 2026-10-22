@@ -27,7 +27,7 @@ pub use dump::dump;
 pub use flags::{FlagDescriptor, FlagPlan, FlagPublication, FlagSource};
 pub use forward::forward;
 pub use liveness::{live_values, simplify};
-pub use prepare::{prepare, publications, PrepareOptions};
+pub use prepare::{prepare, prepare_with_publications, publications, PrepareOptions};
 
 pub type ValueId = u32;
 pub type BlockId = u32;
