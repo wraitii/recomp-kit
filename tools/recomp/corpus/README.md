@@ -130,5 +130,5 @@ game's `[translate]` settings); a row the SSA emitter cannot lower fails the run
 reviewed direct callees are bound explicitly and use the same variant. Audited x87
 instructions use byte-backed effects lowered by the scalar x87 tracker.
 
-The `[translate] fault_state` and `msvc_x87_convention` keys select the SSA policy; the report records it. See [the IR contracts](../../../docs/ir.md#scalar-x87).
+The `[translate] fault_state` and `msvc_x87_convention` keys select the SSA policy; the report records it. See [historical IR contracts](../Deprecated.md#scalar-x87).
 

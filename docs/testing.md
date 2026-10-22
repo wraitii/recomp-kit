@@ -66,7 +66,7 @@ inputs that read empty x87 slots. Unicorn does not reliably report the x87 stack
 fault bit, so the harness also checks operand tags before each instruction.
 Ordinary/specialized comparisons still include every tracked flag. Accepted
 binary32 exponent-range and extended-precision differences remain visible in
-original-byte comparisons; see [IR tradeoffs](ir.md).
+original-byte comparisons; see [historical IR tradeoffs](../tools/recomp/Deprecated.md#scalar-x87).
 
 `--mode paired` compares the production specialization-enabled and forced
 ordinary variants within a run; `pair` contains those discrepancies and `oracle`

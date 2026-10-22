@@ -1,13 +1,9 @@
 # Rust translator
 
-`translator/` is a Cargo workspace that translates a game image from its code map
-into C. It replaces the Python engine described in [the IR](ir.md), which is
-still the default. `tools/build.py --engine rust` (or `[translate] engine =
-"rust"`) selects it. The concepts in that document (code map authority,
-publication, lazy flags, call contracts, scalar x87, private contracts) carry
-over. Module names do not, and the generated-code contract is the one in
-[architecture](architecture.md). Each crate's `//!` doc states its own
-responsibility.
+`translator/` is the default engine. Its Cargo workspace translates a game image
+from its code map into C. `tools/build.py` selects it unless `[translate] engine`
+or `--engine` overrides the default. The generated-code contract is documented in
+[architecture](architecture.md). Each crate's `//!` doc states its responsibility.
 
 ## Pipeline
 
@@ -95,16 +91,116 @@ switches:
 
 ## Analysis facts
 
-`tools/build.py --produce-analysis-facts PATH` builds `rk-analysis` and runs it
-on `recomp/analysis-input.json`, which is the translation input plus the
-game's `[analysis]` table. That table names the method and effect catalogs,
-observation TSVs (`--analysis-observation` adds more), effect families,
-per-site overrides and the assumptions the analysis may make. The producer
-reruns discovery and lifting, bounds indirect calls and jumps from tables,
-SSA site shapes and stack-cleanup proofs, and joins them with the catalogs and
-observations. It writes fresh facts that record their input digests, evidence
-and assumptions, and it validates them with the same `rk_core::facts` parser
-the translator uses. `--analysis-report` writes the selection report;
-`--analysis-compare OLD` compares against older facts in that report without
-merging them. The Python engine reads the same file through
-`tools/recomp/ir/analysis_facts.py`.
+`[translate] analysis_facts` names a committed, executable-hash-bound JSON file.
+Translation reads it as-is. Generate a candidate explicitly from the kit root,
+compare it with Git, and retain custom edits when adopting it:
+
+```sh
+python tools/build.py --game ghost-recon --produce-analysis-facts /tmp/facts.json \
+    --analysis-observation /absolute/path/observe.tsv \
+    --analysis-report /tmp/facts-report.json \
+    --analysis-compare games/ghost-recon/metadata/analysis-facts.json
+```
+
+The build wrapper builds `rk-analysis` and runs it on `recomp/analysis-input.json`,
+which adds the game's `[analysis]` table to the translation input. That table
+names method and effect catalogs (both present or both absent), observation TSVs,
+effect families, per-site overrides and assumptions. The producer reruns discovery
+and lifting, bounds calls and jumps from tables, SSA shapes and stack-cleanup
+proofs, and joins them with catalogs and observations. It validates the output
+with the same `rk_core::facts` parser used by translation. `--analysis-report`
+writes selection details; `--analysis-compare OLD` compares against older facts
+without merging them. Committed targets and effects are never inference inputs.
+
+With `[analysis] guest_bounds`, the producer freezes a byte-derived table census
+before refining SSA and contracts. `assume_constant_vptr_stores` restricts it to
+tables installed by decoded `MOV mem32, immediate32`; this assumes every runtime
+vtable at a bounded site has such an installation. Otherwise all decoded immediate
+and absolute-address references are candidates. Table contents are assumed immutable.
+Every candidate slot must name a successfully lifted function, and every observed
+guest target must be included; shim or unsupported observations block the site.
+`assume_compatible_cleanup` additionally permits interface-prefix compatibility
+narrowing. Cleanup summaries check ESP balance through direct calls and normal/tail
+returns; unknown cleanup never rejects a candidate. Optional `assume_balanced_returns`
+also uses a single byte-checked RET immediate shared by all reachable returns in a
+closed single-entry function without exception flow or tail exits. This assumes ESP
+is restored to the incoming return-address slot; it does not prove frame balance.
+Verified and assumed summary counts are reported separately. Neither proves stack
+alias or escape safety. Dominating earlier calls contribute slot and cleanup requirements
+only when receiver and vptr SSA values both match. Refinement intersects proven bounds
+across passes over the frozen universe, retaining prior bounds for unresolved sites;
+empty intersections or exclusions of observed targets are rejected and reported.
+
+`[translate] stack_memory` enables additional original-code summaries for offline
+inference; it defaults to false. Ghost Recon enables it with the explicit premise
+that no concurrent guest execution interferes with these calls. This setting does
+not disable threads or change scheduling. The summaries model unmodified guest
+code; hooks replacing that behavior must respect its contracts or use the runtime's
+existing fallback paths.
+
+The analyzer tracks symbolic entry-ESP offsets, saved register values, stack-slot
+contents and the incoming return address. Joins retain only identical values.
+Every normal return must restore ESP and retain the original return-address slot;
+all returns must agree on cleanup. Writes must have a proved stack address and
+must not overlap that slot. Potentially aliased pointer/global writes, unknown
+callees, recursive dependencies, native replacements, exception flow and unsupported
+effects leave the function unknown. Direct calls and tail calls compose only
+already-established summaries; indirect bounds cannot bootstrap function proofs.
+Named rejection counts and frame-checked cleanup counts are reported separately.
+
+At a bounded call, every returning candidate must have a summary with matching
+cleanup. Mapped noreturn candidates remain dispatch targets but contribute no
+normal-continuation effects; this trusts the existing code map's noreturn facts,
+not a newly inferred type or an immutable-global claim. Read footprints do not
+establish argument counts, object sizes or compatibility. Unknown remains compatible.
+Inference may retain a load across a call only when its range is proved disjoint
+from every candidate write. CALL's explicit return-address store remains in the
+memory chain and undergoes the same alias check; different address roots alone
+never establish disjointness. The additional continuation facts are confined to
+offline inference; runtime body preparation keeps its existing call effects.
+
+`reuse_discovery_seeds` permits configured `analysis_facts` targets to become
+byte-validated discovery seeds only. `indirect_targets` and `discovery_evidence` are
+cleared, the normalized unique `(site, kind, target)` seed rows are digested, and the
+seed universe remains distinct from proof. Clean runs clear `analysis_facts` too.
+Discovery must converge before the producer emits bounds, and the stable function
+universe digest is reported. Refinement freezes the discovered program and raw table
+census; later contract passes may improve site shapes but cannot add tables.
+Ghost Recon enables `guest_bounds`, `assume_constant_vptr_stores`,
+`assume_compatible_cleanup` and `assume_balanced_returns`; discovery seed reuse is off.
+
+The report separates discovery mode and seed provenance, raw census and install
+counts, summary/blocked-function and shape-rejection counts, open-site reasons with
+examples, per-pass contract/CW coverage, convergence, and target-set comparison as
+same, narrower, wider, incomparable, missing or added independently of effects.
+
+`[analysis] families` selects broad patterns such as `d3d8.dll!*::*`.
+`assert_effect_coverage = true` permits assuming that an observed method's audited
+state effects cover all executions of its site. False emits no such effects.
+`[[analysis.overrides]]` can select `family`, `interface`, `method`, and/or an eight-digit
+hex `site`, and set `enabled` or a named catalog `effect` with `evidence`. Selectors
+combine; site, method, interface, then more-specific family rules take precedence,
+with the later rule breaking ties. The winning rule uses `assert_effect_coverage`
+when `enabled` is omitted and the catalog when `effect` is omitted.
+CLI observation paths replace configured `observations`; config paths are relative to
+the game directory. Mixed, unidentified, or conflicting observations remain unresolved.
+Disabling a policy affects the next explicit generation, not existing committed facts.
+
+V2 retains V1 shared `targets`, `effects`, `sites`, `imports` and `evidence`, and adds
+symbolic `methods` (site key `m`), assumption provenance and input digests. `regs` accepts
+`abi`, `unknown`, or explicit `reads`/`kills`/`writes`/`preserves` lists containing GPR and
+arithmetic-flag names. CW effects use `preserved`/`known`/`value` masks. Method identities
+are not exhaustive target bounds. Only exhaustive guest target sets feed dispatch
+bounds; sites are instruction addresses, `k` defaults to `call`, and `jump` means a tail
+JMP. Explicit unknown effects stay conservative. Rust recomputes function preservation
+and CW summaries. V1 remains supported; legacy `indirect_targets` and `call_effects`
+cannot be combined with `analysis_facts`.
+
+The shared D3D8 slot catalog is generated by `tools/gen_com_interfaces.py` with
+`--reference third_party/wine-d3d8/d3d8.h --bindings dx/d3d8_bindings.json --dll d3d8.dll
+--catalog-output dx/metadata/com-methods.json` (`--check` checks freshness). Audited
+shim effects live in `dx/metadata/method-effects.json`; the current D3D8 handlers
+preserve guest arithmetic flags and GPRs other than EAX/ESP. Reads remain conservative.
+CreateDevice preserves only the CW bits outside `0x0f3f`: its preserve flag and early
+returns prevent a stronger unconditional result. Callback-capable or unaudited methods
+need conservative effects until their complete behavior is established.

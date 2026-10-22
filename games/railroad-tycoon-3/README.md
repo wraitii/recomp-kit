@@ -230,7 +230,7 @@ indirect calls and startup-to-frame propagation remain conservative.
 The FEMMS regeneration changes 62 functions. Random-input original-byte checks
 reach no comparable returns in those functions; instruction checks cover tag
 clearing and control-word preservation. TOP follows AMD's documented reset,
-where Unicorn's Athlon model differs; see [the IR guide](../../docs/ir.md).
+where Unicorn's Athlon model differs; see [historical IR notes](../../tools/recomp/Deprecated.md#scalar-x87).
 
 Private continuation layouts retain modified registers absent from the caller's
 SSA and values observed by later calls, even when no additional publication is

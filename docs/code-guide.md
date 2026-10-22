@@ -19,12 +19,10 @@ translated locally into `build/recomp/gen/` and are never edited in place.
 | Original graphics API behavior | [DirectX adapters](../dx/README.md) | `Surface_Lock`, `Surface_Unlock`, `Surface_Blt`, `Surface_Flip`, `d3d_upload_texture` |
 | Imports, startup, memory | [Guest runtime](../runtime/README.md) | `loader_load`, `patch_iat`, `imports_dispatch`, `heap_realloc` |
 | Mod lifecycle and hooks | [loader.cpp](../mods/loader.cpp), [hooks.cpp](../mods/hooks.cpp) | `mods_load_all`, `build_api`, `mods_hook_dispatch`, `mods_call_next` |
-| Code map and program model | [code_map.py](../tools/recomp/code_map.py), [program.py](../tools/recomp/program.py) | `pack`, `read_map`, `Program` |
-| Translation driver, chunks, tables | [driver.py](../tools/recomp/driver.py), [output.py](../tools/recomp/output.py), [settings.py](../tools/recomp/settings.py) | `main`, `_emit`, `emit_body_chunks`, `write_table` |
-| Rust translator | [translator.md](translator.md), [recomp-translate](../translator/crates/recomp-translate/src/main.rs) | `main`, `build_bodies`, `rk_output::write` |
-| Instruction semantics, SSA emission | [IR](ir.md), [ir/emit_c.py](../tools/recomp/ir/emit_c.py), [x86.h](../runtime/x86.h) | `prepare`, `emit_prepared`, `production.prepare_ssa`; register/flag/x87 helpers |
-| Decoded fallback bodies | [decoded.py](../tools/recomp/decoded.py) | `Translator.translate`, `emit_mmx` |
-| Object shape and dispatch inference | [Type inference](type-inference.md), [typeinf/nominal.py](../tools/recomp/typeinf/nominal.py), [typeinf/run.py](../tools/recomp/typeinf/run.py) | `Structure`, `Aliases`, `preserved_registers`, `Frame` |
+| Code map and program model | [code_map.py](../tools/recomp/code_map.py), [rk-image](../translator/crates/rk-image/src/lib.rs) | `pack`, `read_map`, `Program` |
+| Translation driver, chunks, tables | [Translator](translator.md), [recomp-translate](../translator/crates/recomp-translate/src/main.rs), [rk-output](../translator/crates/rk-output/src/lib.rs) | `main`, `build_bodies`, `rk_output::write` |
+| Instruction semantics, SSA emission | [rk-ssa](../translator/crates/rk-ssa/src/lib.rs), [rk-emit](../translator/crates/rk-emit/src/lib.rs), [x86.h](../runtime/x86.h) | `prepare`, `emit`; register/flag/x87 helpers |
+| Offline dispatch bounds | [Analysis facts](translator.md#analysis-facts), [rk-analysis](../translator/crates/rk-analysis/src/guest.rs) | `produce`, stack summaries, table census |
 | Translator checks | [diff/run.py](../tools/recomp/diff/run.py), [corpus](../tools/recomp/corpus/README.md) | Unicorn comparison; eager/SSA/native corpus |
 | Native replacement validation | [replay.cpp](../mods/native/replay.cpp), [page_track.cpp](../mods/native/page_track.cpp) | `load`, `run`, `translated`, `begin`, `end` |
 

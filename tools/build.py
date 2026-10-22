@@ -707,7 +707,7 @@ def parse_args(argv, system=None):
                         help="Regenerate translated C: all images, or only the named auxiliary modules "
                              "(comma-separated; 'main' names the game image)")
     parser.add_argument("--engine", choices=("python", "rust"), default=None,
-                        help="Translator to regenerate with (default: [translate] engine, else python)")
+                        help="Translator to regenerate with (default: [translate] engine, else rust)")
     parser.add_argument("--no-emission-cache", action="store_true",
                         help="Disable prepared-body reuse and selected-function regeneration")
     parser.add_argument("--regen-function", action="append", default=[], metavar="HEX_ADDR",
@@ -836,7 +836,7 @@ def main():
                        args.corpus_trial_ms, args.corpus_trials, asan=args.corpus_asan)
         return
     cfg = game_config.load(args.game_dir, args.build_root)
-    cfg["translate_engine"] = args.engine or cfg["translate"].get("engine", "python")
+    cfg["translate_engine"] = args.engine or cfg["translate"].get("engine", "rust")
     if args.produce_analysis_facts:
         with buildlock.BuildLock(args.build_root.parent, "tools/build.py --produce-analysis-facts"):
             run_analysis(args, cfg, args.build_root)

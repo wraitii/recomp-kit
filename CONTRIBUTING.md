@@ -167,8 +167,9 @@ RECOMP_OBSERVE=/tmp/edges.tsv /path/to/Game.app/Contents/MacOS/Game
 Quit normally to write the report. Each row contains `site target kind count desc`:
 the guest addresses of the transfer and target, how it resolved, its hit count
 and an import description where available. Use the report to investigate dispatch
-and feed observed targets into [type inference](docs/type-inference.md) with
-`--observe /tmp/edges.tsv`.
+and feed observed targets into [analysis facts](docs/translator.md#analysis-facts) with
+`tools/build.py --game <id> --produce-analysis-facts /tmp/facts.json
+--analysis-observation /tmp/edges.tsv`.
 
 Observation adds overhead when enabled. Leave `RECOMP_OBSERVE` unset for performance
 measurements. To compile it out entirely, build with `--no-observe`

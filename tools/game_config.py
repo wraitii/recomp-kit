@@ -462,7 +462,7 @@ def load(game_dir, build_root=None):
     if len({name.upper() for name in passthrough}) != len(passthrough):
         raise ValueError("%s: [environment] passthrough contains duplicate names" % source)
     translate = cfg.setdefault("translate", {})
-    if translate.get("engine", "python") not in ("python", "rust"):
+    if translate.get("engine", "rust") not in ("python", "rust"):
         raise ValueError('%s: [translate] engine must be "python" or "rust"' % source)
     # "relaxed" keeps CPU and x87 state in host locals between observation
     # points, so an interior fault may see stale scratch state (DIVERGENCE

@@ -113,7 +113,7 @@ the toolkit or bring another game to it, start with [Contributing](CONTRIBUTING.
 - [Build from source](CONTRIBUTING.md#prerequisites), including the desktop app.
 - [Port a new game](CONTRIBUTING.md#add-a-game).
 - Explore the [architecture](docs/architecture.md), [code guide](docs/code-guide.md)
-  and translator ([Python](docs/ir.md), [Rust](docs/translator.md)).
+  and [translator](docs/translator.md).
 
 Source build targets also include Intel Macs, Windows, Linux, iOS and Android;
 these are untested.
