@@ -398,9 +398,14 @@ def run_analysis(args, cfg, build_root):
 
 
 def rust_translator(build_root):
-    """Build the Rust translator into the build root and return its executable."""
+    """Return the bundled translator or build it into the build root."""
+    bundled = ROOT.parent / "dependencies/bin/recomp-translate"
+    if (ROOT.parent / "dependencies/manifest.json").is_file():
+        if not bundled.is_file():
+            raise ValueError("Bundled Rust translator is missing; reinstall Recomp Toolkit")
+        return bundled
     target = Path(build_root) / "recomp/cargo"
-    subprocess.run(["cargo", "build", "--release", "--quiet", "-p", "recomp-translate",
+    subprocess.run(["cargo", "build", "--release", "--quiet", "--locked", "-p", "recomp-translate",
                     "--manifest-path", str(ROOT / "translator/Cargo.toml"), "--target-dir", str(target)],
                    check=True)
     return target / "release" / ("recomp-translate.exe" if os.name == "nt" else "recomp-translate")

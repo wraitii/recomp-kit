@@ -917,9 +917,15 @@ def prerequisites(needs_rust, needs_innoextract=False):
              ("cmake", "CMake", "https://cmake.org/download/"),
              ("ninja", "Ninja", "https://ninja-build.org/"),
              ("git", "Git", "https://git-scm.com/downloads")]
-    if needs_rust and not bundled_dependencies:
+    if not bundled_dependencies:
         tools += [("cargo", "Cargo", "https://rustup.rs/"),
                   ("rustc", "Rust compiler", "https://rustup.rs/")]
+    if bundled_dependencies:
+        translator = KIT.parent / "dependencies/bin/recomp-translate"
+        checks.append({"label": "Game translator", "ok": translator.is_file(),
+                       "detail": "Installed" if translator.is_file() else "Bundled translator is missing",
+                       "help": "Reinstall Recomp Toolkit to restore its bundled translator.",
+                       "command": "", "url": ""})
     if needs_innoextract:
         tools += [("innoextract", "GOG installer extraction", "https://constexpr.org/innoextract/")]
     if os.name != "nt" and not bundled_dependencies:
@@ -949,7 +955,7 @@ def prerequisites(needs_rust, needs_innoextract=False):
             install_command = "xcode-select --install"
             url = "https://developer.apple.com/documentation/xcode/installing-the-command-line-tools/"
         elif command in ("cargo", "rustc"):
-            help = "Open the Rust setup guide and follow the instructions for your computer. Rust builds this game’s graphics support. Restart the library when setup finishes, then choose Check again."
+            help = "Open the Rust setup guide and follow the instructions for your computer. Rust builds the game translator and graphics support. Restart the library when setup finishes, then choose Check again."
         elif command == "innoextract":
             help = "Install innoextract using the setup guide to unpack your GOG installer. Restart the library afterwards. You can also go back and choose an installed game folder or ZIP, which needs no extra extraction tool."
         elif command in ("clang", "clang++"):
@@ -971,12 +977,12 @@ def prerequisites(needs_rust, needs_innoextract=False):
                        "url": "https://developer.apple.com/documentation/xcode/installing-the-command-line-tools/",
                        "help": "Open Terminal (Applications → Utilities), paste this command and press Enter. Choose Install in the window that appears, then check again when it finishes.",
                        "command": "xcode-select --install"})
-    modules = ("capstone", "pefile", "numpy", "pypcode", "PIL", "resvg_py")
+    modules = ("pefile", "PIL", "resvg_py")
     missing = [module for module in modules if importlib.util.find_spec(module) is None]
     checks.append({"label": "Game conversion tools", "ok": not missing,
                    "detail": ", ".join(missing) if missing else "Installed", "url": "",
                    "help": f"Open {'Command Prompt' if os.name == 'nt' else 'Terminal'}, paste the command below and press Enter. This installs the tools that read and convert your game. When it finishes, choose Check again.",
-                   "command": shell_command([sys.executable, "-m", "pip", "install", "-r", str(KIT / "tools/requirements.txt")])})
+                   "command": shell_command([sys.executable, "-m", "pip", "install", "-r", str(KIT / "tools/requirements-library.txt")])})
     for check in checks:
         if "methods" not in check:
             check["methods"] = [{"label": "Manual", "help": check["help"], "command": check["command"]}]

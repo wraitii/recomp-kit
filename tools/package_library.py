@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tomllib
 from sign_macos import sign_bundle
+from build import rust_translator
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -20,6 +21,7 @@ def package(bundle, build_root, python_root):
     subprocess.run([sys.executable, str(ROOT / "tools/build.py"), "--game", "stub", "--stub",
                     "--target", "app", "--build-root", str(dependency_build)], check=True,
                    env=dict(os.environ, MACOSX_DEPLOYMENT_TARGET="14.0"))
+    translator = rust_translator(dependency_build)
     resources = bundle / "Contents/Resources"
     if resources.exists():
         for child in resources.iterdir():
@@ -44,8 +46,7 @@ def package(bundle, build_root, python_root):
     subprocess.run([str(python / "bin/python3"), "-m", "pip", "install", "--only-binary=:all:",
                     "cmake==4.1.2", "ninja==1.13.0"], check=True)
     subprocess.run([str(python / "bin/python3"), "-m", "pip", "install", "--only-binary=:all:",
-                    *[line for line in (ROOT / "tools/requirements.txt").read_text().splitlines()
-                      if line.strip() and not line.startswith("unicorn")]], check=True)
+                    "-r", str(ROOT / "tools/requirements-library.txt")], check=True)
     packages = next((python / "lib").glob("python*/site-packages"))
     for name, source in (("cmake", packages / "cmake/data/bin/cmake"),
                          ("ninja", packages / "ninja/data/bin/ninja")):
@@ -67,6 +68,8 @@ def package(bundle, build_root, python_root):
         (python / "bin" / name).unlink(missing_ok=True)
     dependencies = resources / "dependencies"
     dependencies.mkdir()
+    (dependencies / "bin").mkdir()
+    shutil.copy2(translator, dependencies / "bin/recomp-translate")
     cmake_build = dependency_build / "cmake/macos-stub"
     subprocess.run([str(python / "bin/cmake"), "--install", str(cmake_build / "_deps/sdl3-build"),
                     "--prefix", str(dependencies / "sdl")], check=True)
@@ -80,7 +83,8 @@ def package(bundle, build_root, python_root):
     sources.mkdir()
     shutil.copy2(cmake_build / "ffmpeg-prefix/src/ffmpeg-7.1.1.tar.xz", sources)
     registry = Path(os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))) / "registry/src"
-    for lock in (ROOT / "desktop/library/Cargo.lock", ROOT / "graphics/d3d8-wgpu/Cargo.lock"):
+    for lock in (ROOT / "desktop/library/Cargo.lock", ROOT / "graphics/d3d8-wgpu/Cargo.lock",
+                 ROOT / "translator/Cargo.lock"):
         for entry in tomllib.loads(lock.read_text())["package"]:
             name = f"{entry['name']}-{entry['version']}"
             for crate in registry.glob(f"*/{name}"):

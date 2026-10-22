@@ -67,9 +67,10 @@ Building the desktop shell requires Rust and Cargo in addition to the tools abov
 ```
 
 On arm64 macOS, add `--package-toolkit --toolkit-python-root /path/to/python`
-with a standalone Python installation to bundle the source kit, conversion tools,
-CMake, Ninja and native dependencies. The [desktop workflow](.github/workflows/toolkit.yml)
-contains the packaging recipe.
+with a standalone Python installation to bundle the source kit, compiled Rust
+translator, Python orchestration tools, CMake, Ninja and native dependencies.
+The packaged app needs Apple command line tools but no Rust toolchain.
+The [desktop workflow](.github/workflows/toolkit.yml) contains the packaging recipe.
 
 Successful main builds update the `latest-nightly` prerelease after Developer ID
 signing and notarization in the [distribution workflow](.github/workflows/distribute.yml).
