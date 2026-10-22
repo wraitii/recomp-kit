@@ -160,7 +160,10 @@ pub fn produce(
             site_effects: effects,
             fact_summary: &facts,
         })?;
-        let contracts = global.call_facts();
+        let contracts = global.inference_call_facts();
+        for (&addr, summary) in &global.stack.functions {
+            cleanups.insert(addr, summary.effect.cleanup);
+        }
         eprintln!(
             "analysis guest: pass {pass} summaries ({} functions, {} contracts)",
             analysis.ir.len(),
@@ -222,6 +225,12 @@ pub fn produce(
             "retained_target_entries": all_sites.values().map(BTreeSet::len).sum::<usize>(),
             "rejected_refinements": rejected_refinements,
             "contracts": global.report.contracts,
+            "frame_checked_cleanups": global.report.stack_functions,
+            "stack_sites": global.report.stack_sites,
+            "stack_readonly_sites": global.report.stack_readonly_sites,
+            "stack_mapped_noreturn_sites": global.report.stack_mapped_noreturn_sites,
+            "stack_rejected": global.report.stack_rejected,
+            "stack_rejected_sites": global.report.stack_rejected_sites,
             "indirect_contracts": global.report.indirect_contracts,
             "preserved_register_fields": global.contracts.values().map(|contract|
                 ((contract.preserves | !contract.writes) & rk_core::contract::Fields::GPRS).iter().count()
@@ -264,6 +273,13 @@ pub fn produce(
             text: "Bounded double-load sites are assumed to dispatch through immutable guest C++ vtables named by decoded image operands, with a nonnegative pointer-sized slot. Dominating earlier calls with identical receiver and vptr SSA values contribute requirements. All compatible table targets are retained; host observations block guest bounds. Observations are not exhaustive target sets.".into(),
             requires: Vec::new(),
         });
+        if settings.stack_memory {
+            assumptions.push(Assumption {
+                id: "original-code-stack-memory".into(),
+                text: "Stack and continuation-memory summaries model original guest code without concurrent guest memory interference. Mapped noreturn functions contribute no normal-continuation effects but remain dispatch targets. Calls, their return-address stores, tail calls, saved registers and stack slots are tracked explicitly; unknown writes, opaque/native bodies and unresolved callees block a summary. The game asserts single-threaded execution for this inference. Hooks must respect original contracts or use runtime fallback; no threads are suppressed.".into(),
+                requires: vec!["guest-vtable-structure".into()],
+            });
+        }
         if options.assume_constant_vptr_stores {
             assumptions.push(Assumption {
                 id: "constant-vptr-stores".into(),

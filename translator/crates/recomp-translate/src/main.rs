@@ -803,6 +803,12 @@ fn report(input: &ReportInputs<'_>) -> Result<String> {
         "call_returns": call_returns,
         "seh_helpers": analysis.seh_helpers.len(),
         "global": {
+            "stack_functions": global.stack_functions,
+            "stack_sites": global.stack_sites,
+            "stack_readonly_sites": global.stack_readonly_sites,
+            "stack_mapped_noreturn_sites": global.stack_mapped_noreturn_sites,
+            "stack_rejected": global.stack_rejected,
+            "stack_rejected_sites": global.stack_rejected_sites,
             "contracts": global.contracts,
             "contract_excluded": global.contract_excluded,
             "indirect_contracts": global.indirect_contracts,

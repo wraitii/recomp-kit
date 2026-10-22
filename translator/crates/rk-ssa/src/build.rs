@@ -32,6 +32,16 @@ impl CallEffect {
 
 pub trait CallFacts: Sync {
     fn call(&self, site: Addr, target: Option<Addr>) -> CallEffect;
+
+    fn stack(&self, _site: Addr, _target: Option<Addr>) -> Option<&StackEffect> {
+        None
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StackEffect {
+    pub cleanup: i32,
+    pub writes: Vec<(i32, u32)>,
 }
 
 pub struct ConservativeCallFacts;
@@ -956,6 +966,19 @@ impl<'a> Builder<'a> {
         state: &mut [Option<ValueId>],
         block: BlockId,
     ) -> Result<(), Diagnostic> {
+        let target = match self.values[site as usize].op {
+            Op::Call { target } => Some(target),
+            _ => None,
+        };
+        let cleanup = (self.opts.policy != Policy::Conservative)
+            .then(|| self.opts.call_facts.stack(self.current_addr, target))
+            .flatten().map(|effect| effect.cleanup);
+        let esp = Registers::get().require("ESP");
+        let next_esp = if let Some(cleanup) = cleanup {
+            let old = self.read(&esp, state, &mut Lookup::default(), block)?;
+            let delta = self.value(Op::Const(4u32.wrapping_add(cleanup as u32) as u64), 4, &[]);
+            Some(self.value(Op::P(OpCode::IntAdd), 4, &[old, delta]))
+        } else { None };
         for index in 0..self.keys.len() {
             let key = self.keys[index];
             if key == StateKey::Memory {
@@ -971,6 +994,9 @@ impl<'a> Builder<'a> {
             } else {
                 self.value(Op::StateReload(key), key_size(key), &[site])
             });
+        }
+        if let Some(value) = next_esp {
+            self.write(&esp, value, state, &mut Lookup::default())?;
         }
         Ok(())
     }

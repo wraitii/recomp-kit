@@ -32,6 +32,7 @@ pub struct Translate {
     pub fault_state: FaultState,
     pub msvc_x87_convention: bool,
     pub call_contracts: bool,
+    pub stack_memory: bool,
     pub x87_cw_clone: bool,
     pub private_leaf_contracts: bool,
     pub private_input_arguments: bool,
@@ -273,6 +274,7 @@ pub struct Settings {
     pub x87_imports_preserve_pc_rc: bool,
     pub x87_entry_contracts: Vec<X87EntryContract>,
     pub call_contracts: bool,
+    pub stack_memory: bool,
     pub private_leaf_contracts: bool,
     pub private_input_arguments: bool,
     pub private_input_registers: BTreeMap<Addr, String>,
@@ -439,6 +441,7 @@ impl Settings {
                 Vec::new()
             },
             call_contracts: t.call_contracts,
+            stack_memory: t.stack_memory,
             private_leaf_contracts: t.private_leaf_contracts && main,
             private_input_arguments: t.private_input_arguments && main,
             private_input_registers,

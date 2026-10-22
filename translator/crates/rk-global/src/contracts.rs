@@ -1019,7 +1019,7 @@ fn preserved_registers(
     let stack_reload = |value: rk_ssa::ValueId| -> Option<(rk_ssa::ValueId, i32)> {
         offsets.get(value as usize).copied().flatten()
     };
-    if !rk_ssa::forward(&mut ssa, Some(&stack_reload)) {
+    if !rk_ssa::forward(&mut ssa, Some(&stack_reload), None) {
         return Fields::NONE;
     }
     let returns: Vec<rk_ssa::ValueId> = ssa

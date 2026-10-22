@@ -3,11 +3,12 @@ use rk_core::{Lookup, LookupSet};
 use rk_ir::Op;
 
 use crate::canonical::{canonicalize, rewrite_aliases};
-use crate::{Ssa, ValueId};
+use crate::{CallFacts, Ssa, ValueId};
 
 pub fn forward(
     s: &mut Ssa,
     stack_reload: Option<&dyn Fn(ValueId) -> Option<(ValueId, i32)>>,
+    call_facts: Option<&dyn CallFacts>,
 ) -> bool {
     let mut shapes: Lookup<ValueId, (ValueId, u32)> = Lookup::default();
     let mut bounds: Lookup<ValueId, (ValueId, u32, u32)> = Lookup::default();
@@ -111,6 +112,7 @@ pub fn forward(
         size_a: u32,
         b: ValueId,
         size_b: u32,
+        offset_b: u32,
         stack_reload: Option<&dyn Fn(ValueId) -> Option<(ValueId, i32)>>,
         shapes: &mut Lookup<ValueId, (ValueId, u32)>,
         bounds: &mut Lookup<ValueId, (ValueId, u32, u32)>,
@@ -121,8 +123,8 @@ pub fn forward(
         if root_a != root_b {
             return false;
         }
-        let low = low_a.wrapping_sub(high_b);
-        let high = high_a.wrapping_sub(low_b);
+        let low = low_a.wrapping_sub(high_b.wrapping_add(offset_b));
+        let high = high_a.wrapping_sub(low_b.wrapping_add(offset_b));
         size_b <= low && low <= high && high <= 0x1_0000_0000u64.wrapping_sub(size_a as u64) as u32
     }
 
@@ -177,6 +179,7 @@ pub fn forward(
                                     4,
                                     source,
                                     s.value(stored).size as u32,
+                                    0,
                                     stack_reload,
                                     &mut shapes,
                                     &mut bounds,
@@ -202,6 +205,25 @@ pub fn forward(
                                 } else {
                                     pending.push(args[0]);
                                 }
+                            }
+                            Op::Call { .. } | Op::CallInd => {
+                                let target = match s.value(effect).op {
+                                    Op::Call { target } => Some(target),
+                                    _ => None,
+                                };
+                                let summary = call_facts.and_then(|facts| facts.stack(s.value_addr[effect as usize], target));
+                                let Some(summary) = summary else { failed = true; break; };
+                                if !summary.writes.is_empty() {
+                                    let Some(base) = call_stack(s, effect) else { failed = true; break; };
+                                    if !summary.writes.iter().all(|&(offset, size)| {
+                                        disjoint(s, load_address, 4, base, size, offset as u32,
+                                            stack_reload, &mut shapes, &mut bounds, &mut active)
+                                    }) {
+                                        failed = true;
+                                        break;
+                                    }
+                                }
+                                pending.push(s.args(effect)[0]);
                             }
                             _ => {
                                 failed = true;
@@ -244,4 +266,18 @@ pub fn forward(
     rewrite_aliases(s, &alias);
     canonicalize(s, true);
     true
+}
+
+fn call_stack(s: &Ssa, call: ValueId) -> Option<ValueId> {
+    let state = s.boundary(call)?;
+    let lanes = rk_ir::lanes(rk_core::contract::Field::Esp);
+    let mut source = None;
+    for (lane, key) in lanes.iter().enumerate() {
+        let id = state.iter().find(|(candidate, _)| candidate == key)?.1;
+        if s.value(id).op != Op::Byte(lane as u8) { return None; }
+        let root = *s.args(id).first()?;
+        if s.value(root).size != 4 || source.is_some_and(|prior| prior != root) { return None; }
+        source = Some(root);
+    }
+    source
 }

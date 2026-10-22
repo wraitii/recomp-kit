@@ -102,6 +102,34 @@ only when receiver and vptr SSA values both match. Refinement intersects proven 
 across passes over the frozen universe, retaining prior bounds for unresolved sites;
 empty intersections or exclusions of observed targets are rejected and reported.
 
+`[translate] stack_memory` enables additional original-code summaries for offline
+inference; it defaults to false. Ghost Recon enables it with the explicit premise
+that no concurrent guest execution interferes with these calls. This setting does
+not disable threads or change scheduling. The summaries model unmodified guest
+code; hooks replacing that behavior must respect its contracts or use the runtime's
+existing fallback paths.
+
+The analyzer tracks symbolic entry-ESP offsets, saved register values, stack-slot
+contents and the incoming return address. Joins retain only identical values.
+Every normal return must restore ESP and retain the original return-address slot;
+all returns must agree on cleanup. Writes must have a proved stack address and
+must not overlap that slot. Potentially aliased pointer/global writes, unknown
+callees, recursive dependencies, native replacements, exception flow and unsupported
+effects leave the function unknown. Direct calls and tail calls compose only
+already-established summaries; indirect bounds cannot bootstrap function proofs.
+Named rejection counts and frame-checked cleanup counts are reported separately.
+
+At a bounded call, every returning candidate must have a summary with matching
+cleanup. Mapped noreturn candidates remain dispatch targets but contribute no
+normal-continuation effects; this trusts the existing code map's noreturn facts,
+not a newly inferred type or an immutable-global claim. Read footprints do not
+establish argument counts, object sizes or compatibility. Unknown remains compatible.
+Inference may retain a load across a call only when its range is proved disjoint
+from every candidate write. CALL's explicit return-address store remains in the
+memory chain and undergoes the same alias check; different address roots alone
+never establish disjointness. The additional continuation facts are confined to
+offline inference; runtime body preparation keeps its existing call effects.
+
 `reuse_discovery_seeds` permits configured `analysis_facts` targets to become
 byte-validated discovery seeds only. `indirect_targets` and `discovery_evidence` are
 cleared, the normalized unique `(site, kind, target)` seed rows are digested, and the

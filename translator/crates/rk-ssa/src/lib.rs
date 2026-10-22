@@ -15,7 +15,7 @@ mod prepare;
 mod verify;
 
 pub use build::{
-    build, BuildOptions, CallEffect, CallFacts, ConservativeCallFacts, DEFAULT_VALUE_BUDGET,
+    build, BuildOptions, CallEffect, CallFacts, ConservativeCallFacts, StackEffect, DEFAULT_VALUE_BUDGET,
 };
 pub use canonical::canonicalize;
 pub use dump::dump;

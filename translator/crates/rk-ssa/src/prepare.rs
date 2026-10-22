@@ -61,7 +61,7 @@ pub fn prepare(cg: &rk_ir::CgFunction, opts: &PrepareOptions) -> rk_core::Result
     let mut ssa = crate::build::build_with_faults(cg, &build_options, opts.fault_state)
         .map_err(rk_core::Error::Diagnostic)?;
     canonicalize(&mut ssa, opts.signed_sub);
-    forward(&mut ssa, opts.stack_reload);
+    forward(&mut ssa, opts.stack_reload, Some(opts.call_facts));
     crate::coalesce::coalesce(&mut ssa);
     canonicalize(&mut ssa, opts.signed_sub);
     let publications = opts.lazy_publications.then(|| {

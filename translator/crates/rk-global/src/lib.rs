@@ -3,6 +3,7 @@ mod cfg;
 mod contracts;
 mod modes;
 mod private;
+pub mod stack;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -87,6 +88,12 @@ pub struct PrivateFacts {
 
 #[derive(Clone, Debug, Default)]
 pub struct GlobalReport {
+    pub stack_functions: usize,
+    pub stack_sites: usize,
+    pub stack_readonly_sites: usize,
+    pub stack_mapped_noreturn_sites: usize,
+    pub stack_rejected: BTreeMap<String, usize>,
+    pub stack_rejected_sites: BTreeMap<String, usize>,
     pub functions: usize,
     pub contract_excluded: BTreeMap<String, usize>,
     pub contracts: usize,
@@ -110,6 +117,7 @@ pub struct GlobalReport {
 
 #[derive(Clone, Debug, Default)]
 pub struct GlobalFacts {
+    pub stack: stack::Analysis,
     pub contracts: BTreeMap<Addr, Contract>,
     pub indirect_contracts: BTreeMap<Addr, Contract>,
     pub site_effects: BTreeMap<Addr, ConfiguredEffect>,
@@ -124,6 +132,11 @@ impl GlobalFacts {
         let native = input.settings.native_replaced()?;
         let mut mode_opaque = opaque_helpers.clone();
         mode_opaque.extend(native.iter().copied());
+        let stack = if input.settings.stack_memory {
+            stack::analyze(input.program, input.analysis, &mode_opaque, input.indirect)
+        } else {
+            stack::Analysis::default()
+        };
         let modes = modes::analyze(
             input.analysis,
             input.indirect,
@@ -155,6 +168,12 @@ impl GlobalFacts {
             opaque: &opaque,
         });
         let mut report = GlobalReport {
+            stack_functions: stack.functions.len(),
+            stack_sites: stack.sites.len(),
+            stack_readonly_sites: stack.sites.values().filter(|summary| summary.effect.writes.is_empty()).count(),
+            stack_mapped_noreturn_sites: stack.sites.values().filter(|summary| summary.mapped_noreturn).count(),
+            stack_rejected: stack.rejected.clone(),
+            stack_rejected_sites: stack.rejected_sites.clone(),
             functions: input.program.functions.len(),
             contracts: contracts.contracts.len(),
             indirect_contracts: contracts.indirect.len(),
@@ -186,6 +205,7 @@ impl GlobalFacts {
             *report.contract_excluded.entry(name).or_default() += 1;
         }
         Ok(Self {
+            stack,
             contracts: contracts.contracts,
             indirect_contracts: contracts.indirect,
             site_effects: input.site_effects.clone(),
@@ -210,6 +230,10 @@ impl GlobalFacts {
             indirect: &self.indirect_contracts,
             effects: &self.site_effects,
         }
+    }
+
+    pub fn inference_call_facts(&self) -> stack::CallFacts<'_> {
+        stack::CallFacts { registers: self.call_facts(), stack: &self.stack }
     }
 
     pub fn summary(&self) -> String {
