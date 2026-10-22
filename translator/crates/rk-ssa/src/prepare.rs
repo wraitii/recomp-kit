@@ -19,20 +19,12 @@ pub struct PrepareOptions<'a> {
     pub signed_sub: bool,
     pub lazy_publications: bool,
     pub fault_state: FaultState,
+    pub coalesce_roots: bool,
 }
 
 impl Default for PrepareOptions<'static> {
     fn default() -> Self {
-        Self {
-            policy: Policy::Optimizing,
-            call_facts: &ConservativeCallFacts,
-            allow_slow: true,
-            value_budget: DEFAULT_VALUE_BUDGET,
-            stack_reload: None,
-            signed_sub: true,
-            lazy_publications: true,
-            fault_state: FaultState::Relaxed,
-        }
+        Self::new(&ConservativeCallFacts)
     }
 }
 
@@ -47,6 +39,7 @@ impl<'a> PrepareOptions<'a> {
             signed_sub: true,
             lazy_publications: true,
             fault_state: FaultState::Relaxed,
+            coalesce_roots: true,
         }
     }
 }
@@ -62,7 +55,7 @@ pub fn prepare(cg: &rk_ir::CgFunction, opts: &PrepareOptions) -> rk_core::Result
         .map_err(rk_core::Error::Diagnostic)?;
     canonicalize(&mut ssa, opts.signed_sub);
     forward(&mut ssa, opts.stack_reload);
-    crate::coalesce::coalesce(&mut ssa);
+    crate::coalesce::coalesce(&mut ssa, opts.coalesce_roots);
     canonicalize(&mut ssa, opts.signed_sub);
     let publications = opts.lazy_publications.then(|| {
         let mut plan = publications(&ssa, opts.call_facts);

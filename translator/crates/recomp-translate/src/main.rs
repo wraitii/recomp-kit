@@ -237,6 +237,26 @@ impl IrSummary {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Switches {
+    private: bool,
+    descriptors: bool,
+    coalesce_roots: bool,
+    x87_dynamic: bool,
+}
+
+impl Switches {
+    fn from_env() -> Self {
+        let unset = |name| std::env::var_os(name).is_none();
+        Self {
+            private: unset("RK_NO_PRIVATE"),
+            descriptors: unset("RK_NO_DESCRIPTORS"),
+            coalesce_roots: unset("RK_NO_ROOTS"),
+            x87_dynamic: !unset("RK_X87_DYNAMIC"),
+        }
+    }
+}
+
 struct BodyContext<'a> {
     program: &'a Program,
     facts: rk_global::ContractCallFacts<'a>,
@@ -249,6 +269,7 @@ struct BodyContext<'a> {
     private_targets: &'a BTreeSet<Addr>,
     private_masks: BTreeMap<Addr, BTreeSet<Fields>>,
     private_input_arguments: BTreeMap<Addr, String>,
+    switches: Switches,
 }
 
 impl<'a> BodyContext<'a> {
@@ -280,6 +301,8 @@ fn plan_one(ctx: &BodyContext<'_>, ir: &FunctionIr) -> rk_core::Result<rk_plan::
             x87_options: ctx.x87_options.clone(),
             fault_state: ctx.fault_state,
             private_targets: ctx.private_targets,
+            descriptors: ctx.switches.descriptors,
+            coalesce_roots: ctx.switches.coalesce_roots,
         },
     )
 }
@@ -397,6 +420,7 @@ fn build_bodies(
     global: &rk_global::GlobalFacts,
     settings: &Settings,
     x87_mode: X87Mode,
+    switches: Switches,
     only: &[Addr],
 ) -> Result<(
     Vec<Body>,
@@ -417,10 +441,10 @@ fn build_bodies(
         .copied()
         .filter(|&addr| program.is_setjmp_thunk(addr))
         .collect();
-    let private_targets: BTreeSet<Addr> = if std::env::var_os("RK_NO_PRIVATE").is_some() {
-        BTreeSet::new()
-    } else {
+    let private_targets: BTreeSet<Addr> = if switches.private {
         global.private.targets.keys().copied().collect()
+    } else {
+        BTreeSet::new()
     };
     let make_ctx = |private_masks, private_input_arguments| BodyContext {
         program,
@@ -439,6 +463,7 @@ fn build_bodies(
         private_targets: &private_targets,
         private_masks,
         private_input_arguments,
+        switches,
     };
     let ctx = make_ctx(BTreeMap::new(), BTreeMap::new());
     let selected: BTreeSet<Addr> = only.iter().copied().collect();
@@ -673,6 +698,7 @@ fn dump_ssa(
     analysis: &rk_frontend::Analysis,
     only: &[Addr],
     prepared: bool,
+    switches: Switches,
     out: &mut impl std::io::Write,
 ) -> Result<()> {
     let mut seen = BTreeSet::new();
@@ -689,7 +715,8 @@ fn dump_ssa(
         }
         let cg = rk_ir::lower(ir, &program.image, &rk_ir::NoX87)?;
         if prepared {
-            match rk_ssa::prepare(&cg, &rk_ssa::PrepareOptions::default()) {
+            let options = rk_ssa::PrepareOptions { coalesce_roots: switches.coalesce_roots, ..Default::default() };
+            match rk_ssa::prepare(&cg, &options) {
                 Ok(ssa) => rk_ssa::dump(&ssa, out)?,
                 Err(error) => writeln!(out, "== prepared {owner:08x}: {error}")?,
             }
@@ -941,6 +968,7 @@ fn write_discovery_report(
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let switches = Switches::from_env();
     if let Some(jobs) = args.jobs {
         rayon::ThreadPoolBuilder::new()
             .num_threads(jobs.max(1))
@@ -992,11 +1020,8 @@ fn main() -> Result<()> {
             owned,
             &global,
             &settings,
-            if std::env::var_os("RK_X87_DYNAMIC").is_some() {
-                X87Mode::Dynamic
-            } else {
-                args.x87_mode
-            },
+            if switches.x87_dynamic { X87Mode::Dynamic } else { args.x87_mode },
+            switches,
             only,
         )?
     } else {
@@ -1036,10 +1061,10 @@ fn main() -> Result<()> {
             dump_fir(&program, &analysis, &args.only, &mut out)?;
         }
         if args.wants(Stage::Ssa) {
-            dump_ssa(&program, &analysis, &args.only, false, &mut out)?;
+            dump_ssa(&program, &analysis, &args.only, false, switches, &mut out)?;
         }
         if args.wants(Stage::Prepared) {
-            dump_ssa(&program, &analysis, &args.only, true, &mut out)?;
+            dump_ssa(&program, &analysis, &args.only, true, switches, &mut out)?;
         }
         if args.wants(Stage::Global) {
             dump_global(&program, &global, &args.only, &mut out)?;

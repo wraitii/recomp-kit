@@ -24,6 +24,8 @@ pub struct PlanOptions<'a> {
     pub x87_options: rk_x87::Options,
     pub fault_state: rk_core::settings::FaultState,
     pub private_targets: &'a BTreeSet<Addr>,
+    pub descriptors: bool,
+    pub coalesce_roots: bool,
 }
 
 pub struct PlannedFunction {
@@ -45,6 +47,7 @@ pub fn plan_function(cg: &CgFunction, opts: &PlanOptions<'_>) -> Result<PlannedF
     let mut prepare_options = PrepareOptions::new(opts.call_facts);
     prepare_options.policy = opts.policy;
     prepare_options.fault_state = opts.fault_state;
+    prepare_options.coalesce_roots = opts.coalesce_roots;
     let ssa = prepare(cg, &prepare_options)?;
     let base = publications(&ssa, opts.call_facts);
     let (publish, guard) = reduce_publications(&ssa, &base, opts.call_facts);
@@ -54,7 +57,7 @@ pub fn plan_function(cg: &CgFunction, opts: &PlanOptions<'_>) -> Result<PlannedF
     let mut live_publish = publish.clone();
     for (value, keys) in &publish {
         let mut publication = flag_plan.publication(&ssa, *value, keys);
-        if std::env::var_os("RK_NO_DESCRIPTORS").is_some() {
+        if !opts.descriptors {
             publication.eager |= publication.descriptor.map_or(Fields::NONE, |d| d.mask);
             publication.descriptor = None;
         }
