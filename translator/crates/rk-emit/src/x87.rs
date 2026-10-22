@@ -1,10 +1,10 @@
+use rk_core::Result;
 use rk_ir::x87::X87Condition;
-use rk_ssa::ValueId;
-
-use crate::types::{Assign, Event, Expr, Type};
+use rk_ssa::{BlockId, ValueId};
+use rk_x87::{Event, Expr, Plan, Type};
 
 pub trait External {
-    fn value(&self, id: ValueId) -> String;
+    fn value(&self, id: ValueId) -> Result<String>;
 }
 
 fn carry_name(position: i32, part: &str) -> String {
@@ -43,8 +43,8 @@ pub struct Printer<'a> {
 }
 
 impl Printer<'_> {
-    pub fn expr(&self, value: &Expr) -> String {
-        match value {
+    pub fn expr(&self, value: &Expr) -> Result<String> {
+        Ok(match value {
             Expr::Literal(ty, data) => {
                 if *ty == Type::Tag && *data == 3 {
                     "FTAG_EMPTY".into()
@@ -60,15 +60,15 @@ impl Printer<'_> {
             Expr::Environment(part) => format!("x87_{part}_"),
             Expr::Resident(part) => format!("c->fpu_{part}"),
             Expr::Cw(value) => format!("0x{value:x}u"),
-            Expr::External(id) => self.external.value(*id),
+            Expr::External(id) => self.external.value(*id)?,
             Expr::Cpu => "c".into(),
             Expr::Ln2 => "M_LN2".into(),
             Expr::FlagCondition(value) => condition(*value).into(),
             Expr::Eax => "c->r[0]".into(),
-            Expr::AxMerge(value) => format!("(c->r[0] & 0xffff0000u) | {}", self.expr(value)),
+            Expr::AxMerge(value) => format!("(c->r[0] & 0xffff0000u) | {}", self.expr(value)?),
             Expr::St(index) => format!("ST(c, {index})"),
             Expr::Slot(part, physical) => {
-                let physical = self.expr(physical);
+                let physical = self.expr(physical)?;
                 match *part {
                     "tag" => format!("ftag_of(c, {physical})"),
                     "value" => format!("c->st[{physical}]"),
@@ -77,44 +77,44 @@ impl Printer<'_> {
                     _ => "0".into(),
                 }
             }
-            Expr::Physical(top, offset) => format!("({} + {offset}u) & 7u", self.expr(top)),
+            Expr::Physical(top, offset) => format!("({} + {offset}u) & 7u", self.expr(top)?),
             Expr::Rotate(top, delta) => {
-                format!("({} {} 1u) & 7u", self.expr(top), if *delta < 0 { "-" } else { "+" })
+                format!("({} {} 1u) & 7u", self.expr(top)?, if *delta < 0 { "-" } else { "+" })
             }
-            Expr::Binary(op, lhs, rhs) => format!("{} {op} {}", self.expr(lhs), self.expr(rhs)),
-            Expr::Group(value) => format!("({})", self.expr(value)),
-            Expr::Cast(ty, value) => format!("({}){}", ty.c_name(), self.expr(value)),
-            Expr::Negate(value) => format!("-({})", self.expr(value)),
+            Expr::Binary(op, lhs, rhs) => format!("{} {op} {}", self.expr(lhs)?, self.expr(rhs)?),
+            Expr::Group(value) => format!("({})", self.expr(value)?),
+            Expr::Cast(ty, value) => format!("({}){}", ty.c_name(), self.expr(value)?),
+            Expr::Negate(value) => format!("-({})", self.expr(value)?),
             Expr::ClearMask(mask) => format!("(uint16_t)~0x{mask:04x}u"),
             Expr::NanFold(value) => {
-                let value = self.expr(value);
+                let value = self.expr(value)?;
                 format!("(RECOMP_UNLIKELY({value} != {value}) ? x87_indefinite() : {value})")
             }
             Expr::NanTest(value) => {
-                let value = self.expr(value);
+                let value = self.expr(value)?;
                 format!("(uint16_t)({value} != {value})")
             }
             Expr::FloatStore(cw, value) => {
-                let cw = self.expr(cw);
-                let value = self.expr(value);
+                let cw = self.expr(cw)?;
+                let value = self.expr(value)?;
                 format!(
                     "(RECOMP_UNLIKELY(({cw} & 0x300u) != 0u || {value} != {value}) ? fto_float_cw({cw}, {value}) : (float)({value}))"
                 )
             }
             Expr::PcRound(cw, value) => {
-                let cw = self.expr(cw);
-                let value = self.expr(value);
+                let cw = self.expr(cw)?;
+                let value = self.expr(value)?;
                 format!("(({cw} & 0x300u) == 0u ? (double)(float)({value}) : ({value}))")
             }
             Expr::FloatArithmetic(op, cw, lhs, rhs, sw) => {
-                let cw = self.expr(cw);
-                let lhs = self.expr(lhs);
-                let rhs = self.expr(rhs);
+                let cw = self.expr(cw)?;
+                let lhs = self.expr(lhs)?;
+                let rhs = self.expr(rhs)?;
                 let raw = format!("{lhs} {op} {rhs}");
                 let narrow = format!("(double)((float)({lhs}) {op} (float)({rhs}))");
                 let (narrow, general) = match sw {
                     Some(sw) => {
-                        let sw = self.expr(sw);
+                        let sw = self.expr(sw)?;
                         (
                             format!("fx87_exact_sw(&{sw}, {narrow})"),
                             format!("fx87_sw(&{sw}, {cw}, {raw})"),
@@ -126,11 +126,11 @@ impl Printer<'_> {
             }
             Expr::StatusWord(sw, top) => format!(
                 "(uint16_t)(({} & (uint16_t)~0x3800u) | (({}) << 11))",
-                self.expr(sw),
-                self.expr(top)
+                self.expr(sw)?,
+                self.expr(top)?
             ),
             Expr::Load { bits, integer, address } => {
-                let address = self.expr(address);
+                let address = self.expr(address)?;
                 if *bits <= 64 {
                     let call = format!(
                         "recomp_rd{}{bits}_(arena_, (uint32_t){address})",
@@ -148,16 +148,16 @@ impl Printer<'_> {
                 }
             }
             Expr::LoadWord(address) => {
-                format!("recomp_rd16_(arena_, (uint32_t){})", self.expr(address))
+                format!("recomp_rd16_(arena_, (uint32_t){})", self.expr(address)?)
             }
             Expr::IntegerConvert { bits, args } => {
                 let mut args = args.iter().map(|arg| self.expr(arg));
-                let status = args.next().unwrap_or_default();
-                let rest = args.collect::<Vec<_>>().join(", ");
+                let status = args.next().transpose()?.unwrap_or_default();
+                let rest = args.collect::<Result<Vec<_>>>()?.join(", ");
                 format!("fist_i{bits}_sw(&{status}, {rest})")
             }
             Expr::Helper(name, args) => {
-                let args = args.iter().map(|arg| self.expr(arg)).collect::<Vec<_>>();
+                let args = args.iter().map(|arg| self.expr(arg)).collect::<Result<Vec<_>>>()?;
                 let joined = args.join(", ");
                 let status = args.first().map_or(String::new(), |arg| format!("&{arg}"));
                 let rest = args.iter().skip(1).cloned().collect::<Vec<_>>().join(", ");
@@ -176,32 +176,32 @@ impl Printer<'_> {
                     _ => format!("{name}({joined})"),
                 }
             }
-        }
+        })
     }
 
-    pub fn declaration(&self, value: &Expr) -> String {
-        format!("{} {};", value.ty().c_name(), self.expr(value))
+    pub fn declaration(&self, value: &Expr) -> Result<String> {
+        Ok(format!("{} {};", value.ty().c_name(), self.expr(value)?))
     }
 
-    pub fn events(&self, events: &[Event]) -> Vec<String> {
+    pub fn events(&self, events: &[Event]) -> Result<Vec<String>> {
         let mut lines: Vec<String> = Vec::new();
         for event in events {
             match event {
                 Event::Reset => {}
                 Event::Assign(assign) => {
-                    let target = self.expr(&assign.target);
-                    let value = self.expr(&assign.value);
+                    let target = self.expr(&assign.target)?;
+                    let value = self.expr(&assign.value)?;
                     lines.push(format!("{target} {} {value};", assign.op));
                 }
                 Event::Evaluate(value) => {
-                    let text = self.expr(value);
+                    let text = self.expr(value)?;
                     if !text.is_empty() {
                         lines.push(format!("{text};"));
                     }
                 }
                 Event::Store { bits, address, value, floating, bcd } => {
-                    let address = self.expr(address);
-                    let value = self.expr(value);
+                    let address = self.expr(address)?;
+                    let value = self.expr(value)?;
                     if *bits <= 64 && !*bcd {
                         let call = format!(
                             "recomp_wr{}{bits}_",
@@ -222,15 +222,15 @@ impl Printer<'_> {
                 Event::PublishTags(tags) => {
                     let masks = tags
                         .iter()
-                        .map(|(physical, _)| format!("(3u << (2u * ({})))", self.expr(physical)))
-                        .collect::<Vec<_>>()
+                        .map(|(physical, _)| Ok(format!("(3u << (2u * ({})))", self.expr(physical)?)))
+                        .collect::<Result<Vec<_>>>()?
                         .join(" | ");
                     let values = tags
                         .iter()
                         .map(|(physical, tag)| {
-                            format!("(({}) << (2u * ({})))", self.expr(tag), self.expr(physical))
+                            Ok(format!("(({}) << (2u * ({})))", self.expr(tag)?, self.expr(physical)?))
                         })
-                        .collect::<Vec<_>>()
+                        .collect::<Result<Vec<_>>>()?
                         .join(" | ");
                     lines.push(format!(
                         "c->fpu_tag = (uint16_t)((c->fpu_tag & ~({masks})) | {values});"
@@ -251,8 +251,8 @@ impl Printer<'_> {
                 }
                 Event::Declare(_) => {}
                 Event::Conditional(condition, body) => {
-                    let body = self.events(body).join(" ");
-                    lines.push(format!("if ({}) {{ {body} }}", self.expr(condition)));
+                    let body = self.events(body)?.join(" ");
+                    lines.push(format!("if ({}) {{ {body} }}", self.expr(condition)?));
                 }
                 Event::EmptyTags(reset_top) => {
                     if *reset_top {
@@ -262,12 +262,68 @@ impl Printer<'_> {
                 }
             }
         }
-        lines
+        Ok(lines)
     }
 }
 
-impl Assign {
-    pub fn new(target: Expr, value: Expr) -> Self {
-        Self { target, value, op: "=" }
+pub trait PlanLines {
+    fn block_lines(&self, clone: usize, block: BlockId, external: &dyn External) -> Result<Vec<String>>;
+    fn event_lines(&self, clone: usize, value: ValueId, external: &dyn External) -> Result<Vec<String>>;
+    fn end_lines(&self, clone: usize, block: BlockId, external: &dyn External) -> Result<Vec<String>>;
+    fn default_lines(&self, clone: usize, value: ValueId, external: &dyn External) -> Result<Vec<String>>;
+    fn declaration_lines(&self, external: &dyn External) -> Result<Vec<String>>;
+}
+
+impl PlanLines for Plan {
+    fn block_lines(&self, clone: usize, block: BlockId, external: &dyn External) -> Result<Vec<String>> {
+        let printer = Printer { external };
+        printer.events(
+            self.programs[clone]
+                .blocks
+                .get(&block)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        )
+    }
+
+    fn event_lines(&self, clone: usize, value: ValueId, external: &dyn External) -> Result<Vec<String>> {
+        let printer = Printer { external };
+        printer.events(
+            self.programs[clone]
+                .events
+                .get(&value)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        )
+    }
+
+    fn end_lines(&self, clone: usize, block: BlockId, external: &dyn External) -> Result<Vec<String>> {
+        let printer = Printer { external };
+        printer.events(
+            self.programs[clone]
+                .ends
+                .get(&block)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        )
+    }
+
+    fn default_lines(&self, clone: usize, value: ValueId, external: &dyn External) -> Result<Vec<String>> {
+        let printer = Printer { external };
+        printer.events(
+            self.programs[clone]
+                .defaults
+                .get(&value)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        )
+    }
+
+    fn declaration_lines(&self, external: &dyn External) -> Result<Vec<String>> {
+        let printer = Printer { external };
+        self.declarations
+            .iter()
+            .map(|value| printer.declaration(value))
+            .collect()
     }
 }

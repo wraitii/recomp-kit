@@ -524,7 +524,6 @@ version = "0.1.0"
 dependencies = [
  "rk-core",
  "rk-ir",
- "rk-output",
  "rk-plan",
  "rk-ssa",
  "rk-x87",
@@ -575,6 +574,7 @@ dependencies = [
  "indexmap",
  "rayon",
  "rk-core",
+ "rk-emit",
  "rk-image",
  "serde",
  "serde_json",

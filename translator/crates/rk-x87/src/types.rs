@@ -241,6 +241,12 @@ pub struct Assign {
     pub op: &'static str,
 }
 
+impl Assign {
+    pub fn new(target: Expr, value: Expr) -> Self {
+        Self { target, value, op: "=" }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Activation {
     pub index: u32,

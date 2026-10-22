@@ -20,7 +20,8 @@ use rk_core::program::Program;
 use rk_core::settings::Settings;
 use rk_core::timing::Phases;
 use rk_core::{parse_hex, Addr, Diagnostic, Hex};
-use rk_output::{Body, Requires, Translation};
+use rk_emit::{Body, Requires};
+use rk_output::Translation;
 
 #[derive(Parser)]
 #[command(about = "Translate a game image from its code map to C")]

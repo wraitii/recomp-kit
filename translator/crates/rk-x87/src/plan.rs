@@ -6,7 +6,6 @@ use rk_ir::{properties, Op};
 use rk_ssa::{BlockId, Ssa, ValueId, DISPATCH_BLOCK};
 
 use crate::carry::{self, assert_covers, reset_op};
-use crate::printer::{External, Printer};
 use crate::scalar::{carry_values, parts, CarryShape, Scalar, Shape};
 use crate::types::{carry, env, Assign, Choice, Event, Expr};
 
@@ -71,73 +70,6 @@ impl Plan {
 
     pub fn clone(&self, index: usize) -> &CloneProgram {
         &self.programs[index]
-    }
-
-    pub fn block_lines(
-        &self,
-        clone: usize,
-        block: BlockId,
-        external: &dyn External,
-    ) -> Vec<String> {
-        let printer = Printer { external };
-        printer.events(
-            self.programs[clone]
-                .blocks
-                .get(&block)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-        )
-    }
-
-    pub fn event_lines(
-        &self,
-        clone: usize,
-        value: ValueId,
-        external: &dyn External,
-    ) -> Vec<String> {
-        let printer = Printer { external };
-        printer.events(
-            self.programs[clone]
-                .events
-                .get(&value)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-        )
-    }
-
-    pub fn end_lines(&self, clone: usize, block: BlockId, external: &dyn External) -> Vec<String> {
-        let printer = Printer { external };
-        printer.events(
-            self.programs[clone]
-                .ends
-                .get(&block)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-        )
-    }
-
-    pub fn default_lines(
-        &self,
-        clone: usize,
-        value: ValueId,
-        external: &dyn External,
-    ) -> Vec<String> {
-        let printer = Printer { external };
-        printer.events(
-            self.programs[clone]
-                .defaults
-                .get(&value)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-        )
-    }
-
-    pub fn declaration_lines(&self, external: &dyn External) -> Vec<String> {
-        let printer = Printer { external };
-        self.declarations
-            .iter()
-            .map(|value| printer.declaration(value))
-            .collect()
     }
 }
 

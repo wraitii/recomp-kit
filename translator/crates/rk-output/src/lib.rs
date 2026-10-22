@@ -1,7 +1,7 @@
 //! Writes the generated tree: address-bucketed body chunks, entry-thunk chunks, `funcs.h`,
-//! `body.h`, the dispatch `table.c`, `call_facts.c` and `symbols.json`. It also defines the
-//! emitted-body model (`Body`, `Declaration`, `Requires`, `Preludes`) that `rk-emit` fills. Callers
-//! stage into a fresh directory because stale chunks are not removed.
+//! `body.h`, the dispatch `table.c`, `call_facts.c` and `symbols.json`, using the emitted-body
+//! model from `rk-emit`. Callers stage into a fresh directory because stale chunks are not
+//! removed.
 
 mod symbols;
 mod table;
@@ -15,6 +15,7 @@ use rk_core::contract::Fields;
 use rk_core::program::Program;
 use rk_core::settings::Settings;
 use rk_core::{Addr, Error, Result};
+use rk_emit::{Body, Declaration, Preludes};
 
 pub use symbols::{symbol_rows, SymbolRow};
 
@@ -66,46 +67,6 @@ void recomp_hook_{key}(X86 *c, uint32_t index);
         } \
     } while (0)
 "#;
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Declaration {
-    Entry(Addr),
-    Checked(Addr),
-    PrivatePrepare(Addr),
-    PrivateContract {
-        addr: Addr,
-        mask: Fields,
-        input_argument: Option<String>,
-    },
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct Preludes {
-    pub memory_helpers: String,
-    pub return_helpers: String,
-    pub float_helpers: String,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct Requires {
-    pub arena: bool,
-    pub return_fast: bool,
-    pub fcom: bool,
-    pub seh_call: bool,
-    pub icaches: BTreeSet<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct Body {
-    pub addr: Addr,
-    pub insns: usize,
-    pub first: Addr,
-    pub last: Addr,
-    pub text: String,
-    pub requires: Requires,
-    pub declarations: BTreeSet<Declaration>,
-    pub private_mask: Option<Fields>,
-}
 
 pub struct Translation<'a> {
     pub settings: &'a Settings,
