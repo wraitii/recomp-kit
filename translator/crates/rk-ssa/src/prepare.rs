@@ -60,6 +60,7 @@ pub fn prepare_with_publications(
     };
     let mut ssa = crate::build::build_with_faults(cg, &build_options, opts.fault_state)
         .map_err(rk_core::Error::Diagnostic)?;
+    crate::validate(&ssa)?;
     canonicalize(&mut ssa, opts.signed_sub);
     forward(&mut ssa, opts.stack_reload, Some(opts.call_facts));
     crate::coalesce::coalesce(&mut ssa, opts.coalesce_roots);
@@ -87,6 +88,7 @@ pub fn prepare_with_publications(
         .flatten()
         .collect();
     simplify(&mut ssa, plans.as_ref().map(|(_, simplify)| simplify), &flag_roots, &[]);
+    crate::validate(&ssa)?;
     Ok((ssa, plans.map(|(base, _)| base)))
 }
 

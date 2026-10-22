@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use rk_core::contract::{Field, Fields};
-use rk_core::{Addr, Diagnostic, Lookup, Result};
+use rk_core::{Addr, Lookup};
 use rk_ir::{Op, SlowInsn, StateKey};
 
 mod build;
@@ -18,6 +18,8 @@ mod flags;
 mod forward;
 mod liveness;
 mod prepare;
+mod validate;
+pub use validate::validate;
 
 pub use build::{
     build, BuildOptions, CallEffect, CallFacts, ConservativeCallFacts, StackEffect, DEFAULT_VALUE_BUDGET,
@@ -226,15 +228,4 @@ impl Ssa {
     pub fn flag(&self, index: FlagId) -> Option<&FlagRecord> {
         self.flags.get(index as usize)
     }
-}
-
-pub fn validate(s: &Ssa) -> Result<()> {
-    for (index, value) in s.values.iter().enumerate() {
-        if value.args_start + value.args_len > s.args.len() as u32 {
-            return Err(Diagnostic::error(s.addr, rk_core::Reason::SsaBudget {
-                detail: format!("value {index} has invalid arguments"),
-            }));
-        }
-    }
-    Ok(())
 }
