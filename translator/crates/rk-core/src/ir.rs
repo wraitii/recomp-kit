@@ -10,8 +10,6 @@ pub enum Space {
     Ram,
     Register,
     Unique,
-    Stin,
-    Stout,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

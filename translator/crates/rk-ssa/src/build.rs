@@ -1054,9 +1054,6 @@ impl<'a> Builder<'a> {
             Space::Ram => Err(Diagnostic::new(0, Reason::UnsupportedDirectRam {
                 detail: "raw direct-ram varnode reached SSA".into(),
             })),
-            Space::Stin | Space::Stout => Err(Diagnostic::new(0, Reason::UnsupportedVarnode {
-                detail: "x87 stack varnode reached integer SSA".into(),
-            })),
         }
     }
 
