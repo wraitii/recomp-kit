@@ -4,6 +4,7 @@
 //! a trap body. Individual unsupported instructions become named runtime traps listed in
 //! `EmitReport`. `preludes` holds the generated C helpers.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
@@ -469,7 +470,7 @@ impl<'a> Emitter<'a> {
         self.out.push_str(&signature);
         self.out.push_str(" {\n");
         self.write_declarations();
-        self.write_x87_declarations();
+        self.write_x87_declarations()?;
         if self.ctx.ir.seh.values().any(|kinds| kinds.contains(&SehEffect::Orphan)) {
             self.out.push_str("uint64_t seh_mark_ = recomp_seh_frame_mark(c);\n");
         }
@@ -615,11 +616,11 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn write_x87_declarations(&mut self) {
-        let Some(x87) = self.plan.x87.as_ref() else { return };
-        for line in x87.declaration_lines(&ValueNames(self)) {
+    fn write_x87_declarations(&mut self) -> Result<()> {
+        for line in self.x87_lines(|x87, names| x87.declaration_lines(names))? {
             let _ = writeln!(self.out, "{line}");
         }
+        Ok(())
     }
 
     fn write_inputs(&mut self) -> Result<()> {
@@ -700,9 +701,14 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn x87_lines(&self, lines: impl FnOnce(&rk_x87::Plan) -> Vec<String>) -> Vec<String> {
-        let Some(x87) = self.plan.x87.as_ref() else { return Vec::new() };
-        lines(x87)
+    fn x87_lines(
+        &self,
+        lines: impl FnOnce(&rk_x87::Plan, &ValueNames) -> Vec<String>,
+    ) -> Result<Vec<String>> {
+        let Some(x87) = self.plan.x87.as_ref() else { return Ok(Vec::new()) };
+        let names = ValueNames { emitter: self, error: RefCell::new(None) };
+        let lines = lines(x87, &names);
+        names.error.into_inner().map_or(Ok(lines), Err)
     }
 
     fn entry_dispatch(&mut self) -> Result<()> {
@@ -768,7 +774,7 @@ impl<'a> Emitter<'a> {
                     insn.addr, insn.text
                 );
             }
-            let block_lines = self.x87_lines(|x87| x87.block_lines(self.clone, block as u32, &ValueNames(self)));
+            let block_lines = self.x87_lines(|x87, names| x87.block_lines(self.clone, block as u32, names))?;
             self.write_x87(block_lines);
             let ops = item.ops.clone();
             let mut continues = true;
@@ -783,7 +789,7 @@ impl<'a> Emitter<'a> {
                         ops.get(position + 1).map(|next| self.s.value(*next).op),
                     ) {
                         if branch == tail {
-                            let lines = self.x87_lines(|x87| x87.event_lines(self.clone, value, &ValueNames(self)));
+                            let lines = self.x87_lines(|x87, names| x87.event_lines(self.clone, value, names))?;
                             self.write_x87(lines);
                             self.publish(value)?;
                             self.materialize_defs(value)?;
@@ -814,7 +820,7 @@ impl<'a> Emitter<'a> {
                     .iter()
                     .copied()
                     .find(|next| Some(self.plan.block_addrs[*next]) == end_addr);
-                let end_lines = self.x87_lines(|x87| x87.end_lines(self.clone, block as u32, &ValueNames(self)));
+                let end_lines = self.x87_lines(|x87, names| x87.end_lines(self.clone, block as u32, names))?;
                 self.write_x87(end_lines);
                 match next {
                     Some(next) if self.can_inline(block, next) => self.inline_block(block, next)?,
@@ -845,7 +851,7 @@ impl<'a> Emitter<'a> {
         let item = *self.s.value(value);
         let addr = self.s.value_addr[value as usize];
         if !matches!(item.op, Op::X87(_)) {
-            let lines = self.x87_lines(|x87| x87.event_lines(self.clone, value, &ValueNames(self)));
+            let lines = self.x87_lines(|x87, names| x87.event_lines(self.clone, value, names))?;
             self.write_x87(lines);
         }
         match item.op {
@@ -854,7 +860,7 @@ impl<'a> Emitter<'a> {
                 if op.touches_memory() {
                     self.publish(value)?;
                 }
-                let lines = self.x87_lines(|x87| x87.event_lines(self.clone, value, &ValueNames(self)));
+                let lines = self.x87_lines(|x87, names| x87.event_lines(self.clone, value, names))?;
                 self.write_x87(lines);
                 Ok(true)
             }
@@ -1814,7 +1820,7 @@ impl<'a> Emitter<'a> {
                 dispatch.span,
                 self.block_prefix()
             );
-            let default_lines = self.x87_lines(|x87| x87.default_lines(self.clone, value, &ValueNames(self)));
+            let default_lines = self.x87_lines(|x87, names| x87.default_lines(self.clone, value, names))?;
             self.write_x87(default_lines);
             self.publish(value)?;
             let _ = writeln!(self.out, "c->eip = 0x{addr:08x}u; recomp_jump(c, t_); return;");
@@ -1827,7 +1833,7 @@ impl<'a> Emitter<'a> {
             self.edge(Some(current), *target_block)?;
         }
         self.out.push_str("default:\n");
-        let default_lines = self.x87_lines(|x87| x87.default_lines(self.clone, value, &ValueNames(self)));
+        let default_lines = self.x87_lines(|x87, names| x87.default_lines(self.clone, value, names))?;
         self.write_x87(default_lines);
         self.publish(value)?;
         let _ = writeln!(self.out, "c->eip = 0x{addr:08x}u; recomp_jump(c, (uint32_t)({target})); return;");
@@ -3039,11 +3045,17 @@ fn xmm_unpack(mnemonic: &str) -> Option<(u32, u32)> {
     })
 }
 
-struct ValueNames<'b, 'a>(&'b Emitter<'a>);
+struct ValueNames<'b, 'a> {
+    emitter: &'b Emitter<'a>,
+    error: RefCell<Option<rk_core::Error>>,
+}
 
 impl rk_x87::External for ValueNames<'_, '_> {
     fn value(&self, id: ValueId) -> String {
-        self.0.expr(id).unwrap_or_else(|_| format!("v{id}"))
+        self.emitter.expr(id).unwrap_or_else(|error| {
+            self.error.borrow_mut().get_or_insert(error);
+            String::new()
+        })
     }
 }
 
