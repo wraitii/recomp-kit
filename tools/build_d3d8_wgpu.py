@@ -27,6 +27,7 @@ def main():
         env=build_env,
         stdout=subprocess.PIPE, text=True)
     outputs = {}
+    library_paths = []
     package = None
     native_libs = None
     for line in process.stdout:
@@ -42,6 +43,13 @@ def main():
         reason = message["reason"]
         if reason == "build-script-executed":
             outputs[message["package_id"]] = Path(message["out_dir"])
+            for value in message.get("linked_paths", []):
+                kind, separator, path = value.partition("=")
+                if not separator:
+                    path = kind
+                elif kind not in ("native", "all"):
+                    continue
+                library_paths.append(Path(path).resolve().as_posix())
         elif reason == "compiler-artifact" and message["target"]["name"] == "d3d8_wgpu":
             package = message["package_id"]
         elif reason == "compiler-message":
@@ -63,6 +71,8 @@ def main():
     if native_libs is None:
         parser.exit(1, "Rust did not report the bridge's native link dependencies\n")
     args.native_libs.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        native_libs += "".join(f'\n/LIBPATH:"{path}"' for path in library_paths)
     args.native_libs.write_text(native_libs + "\n")
     output_dir = outputs[package]
     generated = (
