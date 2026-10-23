@@ -9,6 +9,7 @@ import tarfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import copy_layouts  # noqa: E402
+from copy_soundfont import copy_soundfont
 from copy_core_mods import copy_core_mods  # noqa: E402
 
 
@@ -38,10 +39,7 @@ def stage(app_binary: Path, cfg: dict, out_dir: Path, system=None, build_dir=Non
     copy(app_binary, staged / binary_name)
     for name in ("LICENSE", "NOTICE"):
         copy(ROOT / name, staged / name)
-    # The General MIDI bank for a game that ships none, with its licence.
-    bank = ROOT / "third_party/soundfonts/generaluser-gs"
-    copy(bank / "GeneralUser-GS.sf2", resources / "general-midi.sf2")
-    copy(bank / "LICENSE", resources / "general-midi-LICENSE.txt")
+    files.extend(copy_soundfont(cfg, resources))
     # The translation index lives beside the binary with the desktop Ninja
     # presets, just as finish_bundle.py reads it from build/recomp on macOS.
     symbols = app_binary.parent / "symbols.json"

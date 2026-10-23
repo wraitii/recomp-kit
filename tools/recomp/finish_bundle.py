@@ -12,10 +12,9 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 import copy_layouts  # noqa: E402
+from copy_soundfont import copy_soundfont
 from app_icons import game_icons, set_bundle_icon
 import game_config
-
-GENERAL_MIDI = ROOT / "third_party/soundfonts/generaluser-gs/GeneralUser-GS.sf2"
 
 
 def rename_identity(plist_path, name, version):
@@ -82,9 +81,7 @@ def main():
     rename_identity(contents / "Info.plist", args.name, args.version)
     cfg = game_config.load(args.game_dir, args.build_root)
     set_bundle_icon(args.bundle, game_icons(cfg["developer_exe_path"], args.build_root / "icons/game"))
-    # The General MIDI bank for a game that ships none, with its licence.
-    shutil.copy2(GENERAL_MIDI, resources / "general-midi.sf2")
-    shutil.copy2(GENERAL_MIDI.parent / "LICENSE", resources / "general-midi-LICENSE.txt")
+    copy_soundfont(cfg, resources)
     # The game's shipped on-screen control layouts, when it has any (spec section 5).
     copy_layouts.copy_layouts(args.game_dir, resources / "controls")
     # The translation index the mod loader reads, when this build has one.

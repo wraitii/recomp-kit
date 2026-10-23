@@ -587,6 +587,8 @@ def load(game_dir, build_root=None):
     tracks = cfg.setdefault("media", {}).setdefault("cd_tracks", [])
     if not isinstance(tracks, list) or not all(isinstance(v, str) for v in tracks):
         raise ValueError("%s: [media] cd_tracks must be a list of strings" % source)
+    if not isinstance(cfg.setdefault("audio", {}).setdefault("midi", True), bool):
+        raise ValueError("%s: [audio] midi must be a boolean" % source)
     cfg.setdefault("hooks", {})
     render = cfg.setdefault("render", {})
     fonts = cfg.setdefault("fonts", {}).setdefault("files", [])

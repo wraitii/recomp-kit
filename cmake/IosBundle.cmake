@@ -67,14 +67,10 @@ function(recomp_ios_bundle target)
     WORKING_DIRECTORY ${RECOMP_ROOT}
     COMMENT "Bundling ${RECOMP_APP_NAME}.app's control layouts"
     VERBATIM)
-  # The General MIDI bank for a game that ships none, with its licence.
   add_custom_command(TARGET ${target} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${RECOMP_ROOT}/third_party/soundfonts/generaluser-gs/GeneralUser-GS.sf2
-            $<TARGET_BUNDLE_CONTENT_DIR:${target}>/general-midi.sf2
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${RECOMP_ROOT}/third_party/soundfonts/generaluser-gs/LICENSE
-            $<TARGET_BUNDLE_CONTENT_DIR:${target}>/general-midi-LICENSE.txt
+    COMMAND ${Python3_EXECUTABLE} ${RECOMP_ROOT}/tools/copy_soundfont.py
+            --game-dir ${RECOMP_GAME_DIR}
+            --dest $<TARGET_BUNDLE_CONTENT_DIR:${target}>
     VERBATIM)
   if(EXISTS ${RECOMP_BUILD_ROOT}/recomp/symbols.json)
     add_custom_command(TARGET ${target} POST_BUILD

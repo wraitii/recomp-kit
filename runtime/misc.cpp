@@ -2190,6 +2190,8 @@ MidiOut &midi() {
 
 // Use the bundled General MIDI bank through the host resource layout.
 std::string midi_soundfont_path() {
+    if (!RECOMP_AUDIO_MIDI)
+        return {};
     const std::string bundled = host_resource("general-midi.sf2");
     OsStat st;
     if (!bundled.empty() && os_stat(bundled.c_str(), &st) == 0 && st.is_regular)

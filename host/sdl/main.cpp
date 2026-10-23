@@ -2091,7 +2091,8 @@ void web_guest() {
     }
     printf(RECOMP_APP_NAME ": %s, entry %08x\n", loader_exe_path().c_str(), loader_entry_point());
     fflush(stdout);
-    host_midi_startup(win32_midi_soundfont_path().c_str());
+    if (RECOMP_AUDIO_MIDI)
+        host_midi_startup(win32_midi_soundfont_path().c_str());
     boot_run();
     g_web_guest_done.store(true);
 }
@@ -2533,7 +2534,8 @@ int main(int argc, char **argv) {
     // guest thread holding the cooperative scheduler baton, which stops
     // every other guest thread until it returns, so a SoundFont parsed
     // there would freeze the game at the moment the music starts.
-    host_midi_startup(win32_midi_soundfont_path().c_str());
+    if (RECOMP_AUDIO_MIDI)
+        host_midi_startup(win32_midi_soundfont_path().c_str());
 
     // RECOMP_HOST_AUDIO_CAPTURE=<path.wav> writes the mixer's own output for
     // the whole run.

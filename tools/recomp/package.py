@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 import game_config  # noqa: E402
 import copy_layouts  # noqa: E402
+from copy_soundfont import copy_soundfont
 
 SUFFIX = {"macos": "macos-arm64", "linux": "linux-x64", "windows": "windows-x64"}
 
@@ -28,9 +29,7 @@ SUFFIX = {"macos": "macos-arm64", "linux": "linux-x64", "windows": "windows-x64"
 def stage_resources(dest, cc, game_dir, build_root):
     resources = dest / "resources"
     resources.mkdir(parents=True)
-    bank = ROOT / "third_party/soundfonts/generaluser-gs"
-    shutil.copy(bank / "GeneralUser-GS.sf2", resources / "general-midi.sf2")
-    shutil.copy(bank / "LICENSE", resources / "general-midi-LICENSE.txt")
+    copy_soundfont(game_config.load(game_dir, build_root), resources)
     symbols = build_root / "recomp/symbols.json"
     if symbols.is_file():
         shutil.copy(symbols, resources / "symbols.json")

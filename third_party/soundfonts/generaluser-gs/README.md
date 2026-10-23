@@ -23,4 +23,5 @@ A Windows game that plays MIDI through the system - `midiOut`, DirectMusic
 redistributed. A game that ships its own bank still uses that; any other game
 now plays through this one instead of in silence
 (`runtime/misc.cpp` `midi_soundfont_path`). Apps carry it as the resource
-`general-midi.sf2`; a developer build reads it from here.
+`general-midi.sf2`; a developer build reads it from here. Set `[audio] midi = false`
+in `game.toml` to omit the bank and skip synth initialization (default: `true`).
