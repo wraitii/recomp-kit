@@ -211,6 +211,21 @@ fn reduce_publications(
                 .map(|(_, value)| *value)
         })
         .collect();
+    let mut reloads: BTreeMap<ValueId, Vec<(usize, ValueId)>> = BTreeMap::new();
+    for (index, item) in s.values.iter().enumerate() {
+        let value = index as ValueId;
+        let (source, lane) = match item.op {
+            rk_ir::Op::StateReload(_) => (value, None),
+            rk_ir::Op::Byte(lane) => (s.args(value)[0], Some(lane)),
+            _ => continue,
+        };
+        let rk_ir::Op::StateReload(loaded) = s.value(source).op else { continue };
+        for (index, key) in s.keys.iter().enumerate() {
+            if lane.map_or(loaded == *key, |lane| same_word_lane(loaded, *key, lane)) {
+                reloads.entry(s.args(source)[0]).or_default().push((index, value));
+            }
+        }
+    }
     let phi_lanes = s.phi_lanes();
     let successors = successors(s);
     let mut out = vec![vec![None; n]; block_count];
@@ -219,7 +234,7 @@ fn reduce_publications(
     while let Some(block) = pending.pop_front() {
         queued[block] = false;
         let mut resident = resident_in(s, block, &out, &dispatch, &phi_lanes[block]);
-        walk_block(s, block, base, call_facts, &key_index, &mut resident, None, None);
+        walk_block(s, block, base, call_facts, &key_index, &reloads, &mut resident, None, None);
         if resident != out[block] {
             out[block] = resident;
             for &next in &successors[block] {
@@ -240,6 +255,7 @@ fn reduce_publications(
             base,
             call_facts,
             &key_index,
+            &reloads,
             &mut resident,
             Some(&mut publish),
             Some(&mut guard),
@@ -309,6 +325,7 @@ fn walk_block(
     base: &BTreeMap<ValueId, Vec<StateKey>>,
     call_facts: &dyn CallFacts,
     key_index: &rk_core::Lookup<StateKey, usize>,
+    reloads: &BTreeMap<ValueId, Vec<(usize, ValueId)>>,
     resident: &mut [Option<ValueId>],
     mut publish: Option<&mut BTreeMap<ValueId, Vec<StateKey>>>,
     mut guard: Option<&mut BTreeMap<ValueId, Vec<StateKey>>>,
@@ -319,9 +336,6 @@ fn walk_block(
         for &(key, state_value) in state {
             let Some(&index) = key_index.get(&key) else { continue };
             match s.value(state_value).op {
-                rk_ir::Op::StateReload(loaded) if loaded == key => {
-                    resident[index] = Some(state_value);
-                }
                 rk_ir::Op::StateKeep(loaded) if loaded == key => {
                     let old = s.args(state_value)[1];
                     if resident[index] == Some(old) {
@@ -331,11 +345,6 @@ fn walk_block(
                 rk_ir::Op::Byte(lane) => {
                     let source = s.args(state_value)[0];
                     match s.value(source).op {
-                        rk_ir::Op::StateReload(loaded)
-                            if same_word_lane(loaded, key, lane) =>
-                        {
-                            resident[index] = Some(state_value);
-                        }
                         rk_ir::Op::StateKeep(loaded)
                             if same_word_lane(loaded, key, lane) =>
                         {
@@ -399,6 +408,11 @@ fn walk_block(
                 if s.field(*key).is_some_and(|field| writes.contains(field)) {
                     resident[index] = None;
                 }
+            }
+        }
+        if let Some(values) = reloads.get(&value) {
+            for &(index, loaded) in values {
+                resident[index] = Some(loaded);
             }
         }
     }
