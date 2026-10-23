@@ -891,6 +891,7 @@ def main():
         "-DRECOMP_CHECK_CALL_FACTS=" + ("ON" if args.check_call_facts else "OFF"),
         "-DRECOMP_OBSERVE=" + ("OFF" if args.no_observe else "ON")]
     if args.translation_piece_mb is not None:
+        defines.append("-DRECOMP_SPLIT_TRANSLATION=ON")
         defines.append("-DRECOMP_GEN_PIECE_BUDGET=" + str(args.translation_piece_mb * 1000000))
     try:
         # The lock lives at <build root>/recomp/.lock: BuildLock joins build/recomp/.lock onto its argument.
