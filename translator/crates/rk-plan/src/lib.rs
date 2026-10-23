@@ -57,25 +57,40 @@ pub fn plan_function(cg: &CgFunction, opts: &PlanOptions<'_>) -> Result<PlannedF
     let flag_plan = ssa.flag_plan();
     let mut flag_publish = BTreeMap::new();
     let mut descriptor_roots = Vec::new();
-    let mut live_publish = publish.clone();
-    for (value, keys) in &publish {
-        let mut publication = flag_plan.publication(&ssa, *value, keys);
+    let mut guard_only = BTreeMap::new();
+    for (&value, keys) in &guard {
+        let published = publish.get(&value);
+        let keys: Vec<StateKey> = keys
+            .iter()
+            .copied()
+            .filter(|key| published.is_none_or(|published| !published.contains(key)))
+            .collect();
+        if !keys.is_empty() {
+            guard_only.insert(value, keys);
+        }
+    }
+    let mut boundaries: BTreeMap<ValueId, Vec<StateKey>> = publish.clone();
+    for (&value, keys) in &guard {
+        boundaries.entry(value).or_default().extend(keys.iter().copied());
+    }
+    let mut live_publish = BTreeMap::new();
+    for (value, keys) in &boundaries {
+        let forwarded = guard_only.get(value).map_or(&[][..], Vec::as_slice);
+        let mut publication = flag_plan.publication(&ssa, *value, keys, forwarded);
         if !opts.descriptors {
-            publication.eager |= publication.descriptor.map_or(Fields::NONE, |d| d.mask);
             publication.descriptor = None;
         }
+        let removed = publication
+            .descriptor
+            .map_or(Fields::NONE, |descriptor| descriptor.mask)
+            | publication.forwarded;
+        let mut live_keys = keys.clone();
+        live_keys.retain(|key| !ssa.field(*key).is_some_and(|field| removed.contains(field)));
         if let Some(descriptor) = &publication.descriptor {
             descriptor_roots.extend(descriptor.values());
-            if let Some(live_keys) = live_publish.get_mut(value) {
-                live_keys.retain(|key| {
-                    !ssa.field(*key).is_some_and(|field| descriptor.mask.contains(field))
-                });
-            }
         }
         flag_publish.insert(*value, publication);
-    }
-    for (&value, keys) in &guard {
-        live_publish.entry(value).or_default().extend(keys);
+        live_publish.insert(*value, live_keys);
     }
     for boundary in &ssa.boundaries {
         live_publish.entry(boundary.at).or_default();

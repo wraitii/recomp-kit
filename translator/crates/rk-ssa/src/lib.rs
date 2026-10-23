@@ -26,7 +26,7 @@ pub use build::{
 };
 pub use canonical::canonicalize;
 pub use dump::dump;
-pub use flags::{FlagDescriptor, FlagPlan, FlagPublication, FlagSource};
+pub use flags::{cc_kind, FlagDescriptor, FlagPlan, FlagPublication, FlagSource};
 pub use forward::forward;
 pub use liveness::{live_values, simplify};
 pub use prepare::{prepare, prepare_with_publications, publications, PrepareOptions};
@@ -97,6 +97,7 @@ pub struct FlagRecord {
     pub kind: FlagKind,
     pub size: u8,
     pub op: Option<ValueId>,
+    pub kind_value: Option<ValueId>,
     pub a: Option<ValueId>,
     pub b: Option<ValueId>,
     pub carry: Option<ValueId>,

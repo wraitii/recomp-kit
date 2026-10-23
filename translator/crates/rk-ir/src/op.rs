@@ -11,6 +11,17 @@ pub enum StateKey {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CcKind {
+    Add,
+    Sub,
+    Logic,
+    Inc,
+    Dec,
+    Adc,
+    Sbb,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlowInsn {
     pub addr: Addr,
     pub length: u8,
@@ -81,6 +92,7 @@ pub enum Op {
     Memory,
     StateReload(StateKey),
     StateKeep(StateKey),
+    CcKind(CcKind),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -222,7 +234,7 @@ pub fn properties(op: Op) -> Properties {
             ..Properties::new()
         },
         Op::Input(_) | Op::Const(_) | Op::Target(_) | Op::Phi | Op::Byte(_) | Op::Pack
-        | Op::Memory | Op::StateReload(_) | Op::StateKeep(_) => {
+        | Op::Memory | Op::StateReload(_) | Op::StateKeep(_) | Op::CcKind(_) => {
             Properties { pure: true, synthetic: true, ..Properties::new() }
         }
     }

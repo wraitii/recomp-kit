@@ -675,6 +675,7 @@ impl<'a> Builder<'a> {
             kind,
             size,
             op: Some(op),
+            kind_value: None,
             a: operands.first().copied(),
             b: operands.get(1).copied(),
             carry,
@@ -939,7 +940,7 @@ impl<'a> Builder<'a> {
                 ops.push(value);
             }
             Op::Input(_) | Op::Const(_) | Op::Target(_) | Op::Phi | Op::Byte(_) | Op::Pack
-            | Op::Memory | Op::StateReload(_) | Op::StateKeep(_) => {
+            | Op::Memory | Op::StateReload(_) | Op::StateKeep(_) | Op::CcKind(_) => {
                 return Err(Diagnostic::new(addr, Reason::UnsupportedVarnode {
                     detail: format!("synthetic op in lowered instruction {:?}", cg_op.op),
                 }));

@@ -1850,14 +1850,16 @@ impl<'a> Emitter<'a> {
             .filter_map(|key| self.s.field(*key))
             .filter(|field| Fields::FLAGS.contains(*field))
             .collect();
-        let descriptor = flags_action
-            .then(|| self.plan.flag_publish.get(&value))
-            .flatten()
+        let publication = self.plan.flag_publish.get(&value);
+        let descriptor = publication
             .and_then(|publication| publication.descriptor)
             .map(|descriptor| (descriptor, descriptor.mask & flag_fields))
             .filter(|(_, mask)| !mask.is_empty());
-        if !flag_fields.is_empty() {
-            let need = cc_mask(Fields::FLAGS.difference(flag_fields));
+        let forwarded = publication.map_or(Fields::NONE, |publication| publication.forwarded) & flag_fields;
+        let mask = descriptor.map_or(Fields::NONE, |(_, mask)| mask);
+        let written = mask | (flag_fields & !mask & !forwarded);
+        if !written.is_empty() {
+            let need = cc_mask(Fields::FLAGS.difference(written));
             if need == 0 {
                 self.out.push_str("x86_cc_drop(c);\n");
             } else {
@@ -1867,6 +1869,11 @@ impl<'a> Emitter<'a> {
         if let Some((_, mask)) = descriptor {
             locations.retain(|location| {
                 !matches!(location, Location::Flag(field) if mask.contains(*field))
+            });
+        }
+        if !forwarded.is_empty() {
+            locations.retain(|location| {
+                !matches!(location, Location::Flag(field) if forwarded.contains(*field))
             });
         }
         for location in locations {
@@ -1879,15 +1886,12 @@ impl<'a> Emitter<'a> {
     }
 
     fn publish_descriptor(&mut self, descriptor: &FlagDescriptor, mask: Fields) -> Result<()> {
-        let op = match descriptor.kind {
-            rk_ssa::FlagKind::Add => "X86_CC_ADD",
-            rk_ssa::FlagKind::Sub | rk_ssa::FlagKind::Cmp => "X86_CC_SUB",
-            rk_ssa::FlagKind::Logic => "X86_CC_LOGIC",
-            rk_ssa::FlagKind::Inc => "X86_CC_INC",
-            rk_ssa::FlagKind::Dec => "X86_CC_DEC",
-            rk_ssa::FlagKind::Adc => "X86_CC_ADC",
-            rk_ssa::FlagKind::Sbb => "X86_CC_SBB",
-            rk_ssa::FlagKind::Incoming | rk_ssa::FlagKind::Join => return Ok(()),
+        let op = match (descriptor.kind, descriptor.kind_value) {
+            (rk_ssa::FlagKind::Join, Some(value)) => self.expr(value)?,
+            (kind, _) => match rk_ssa::cc_kind(kind) {
+                Some(kind) => support::cc_kind_name(kind).to_string(),
+                None => return Ok(()),
+            },
         };
         let (a, b, carry) = match descriptor.kind {
             rk_ssa::FlagKind::Logic => ("0u".to_string(), "0u".to_string(), "0u".to_string()),
@@ -1896,7 +1900,7 @@ impl<'a> Emitter<'a> {
                 "0u".to_string(),
                 "0u".to_string(),
             ),
-            rk_ssa::FlagKind::Adc | rk_ssa::FlagKind::Sbb => (
+            rk_ssa::FlagKind::Adc | rk_ssa::FlagKind::Sbb | rk_ssa::FlagKind::Join => (
                 self.expr(descriptor.a.unwrap_or(0))?,
                 self.expr(descriptor.b.unwrap_or(0))?,
                 self.expr(descriptor.carry.unwrap_or(0))?,
@@ -2200,6 +2204,7 @@ impl<'a> Emitter<'a> {
         match item.op {
             Op::Const(data) => Ok(const_expr(data, item.size)),
             Op::Input(key) | Op::StateReload(key) => self.field_expr(key, item.size),
+            Op::CcKind(kind) => Ok(cc_kind_name(kind).to_string()),
             Op::Target(addr) => Ok(format!("0x{addr:08x}u")),
             Op::Memory => Ok("0u".to_string()),
             Op::Byte(index) => Ok(format!(
@@ -2258,6 +2263,7 @@ impl<'a> Emitter<'a> {
         let result = match item.op {
             Op::Const(data) => const_expr(data, item.size),
             Op::Input(key) => self.field_expr(key, item.size)?,
+            Op::CcKind(kind) => cc_kind_name(kind).to_string(),
             Op::Target(addr) => format!("0x{addr:08x}u"),
             Op::Byte(index) => format!("(({}) >> {})", a(0)?, index as u32 * 8),
             Op::Pack => match self.pack_lanes(args) {
