@@ -55,6 +55,7 @@ def memory_helpers():
                 arguments = 'uint8_t *arena, uint32_t a' + (', %s v' % ctype if write else '')
                 lines.extend(['RECOMP_HOT_INLINE %s recomp_%s_(%s) {' % ('void' if write else ctype, name, arguments),
                               '#if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)',
+                              '    (void)arena;',
                               '    %s%s(a%s);' % ('' if write else 'return ', name, ', v' if write else ''),
                               '#else'])
                 if not write:

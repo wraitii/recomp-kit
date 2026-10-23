@@ -1053,7 +1053,16 @@ def inspect_source(cfg, source):
         raise SourceError("source_unavailable", "The selected source is missing or unreadable.",
                           ["Check the source path and try again."], str(source), {"error": str(error)}) from error
     if source.is_dir():
-        result = inspect_folder(cfg, source, check_cancel, include_installers=True)
+        probe = {"kind": "folder"}
+    elif source.is_file():
+        probe = probe_bytes(source, check_cancel)
+    else:
+        raise SourceError("unsupported_source", "Choose a game folder, supported archive, or game installer.",
+                          ["Choose an installed game folder or a supported source file."], str(source))
+    if probe["kind"] in ("folder", "pe"):
+        executable = source if probe["kind"] == "pe" else None
+        result = inspect_folder(cfg, source, check_cancel, selected_executable=executable,
+                                include_installers=True)
         installers = result["source"].pop("installers", [])
         if len(installers) == 1:
             return inspect_source(cfg, Path(installers[0]))
@@ -1062,19 +1071,12 @@ def inspect_source(cfg, source):
                 "More than one installer was found. Choose the installer to inspect.",
                 ["Choose an installer below, or select its setup file directly."],
                 {"installers": installers}, "folder")
-        result["source"]["kind"] = "folder"
+        if executable is not None:
+            result["source"]["probe"] = probe["evidence"]
+            return _add_sibling_facts(result, source)
         return result
-    if not source.is_file():
-        raise SourceError("unsupported_source", "Choose a game folder, supported archive, or game installer.",
-                          ["Choose an installed game folder or a supported source file."], str(source))
-    probe = probe_bytes(source, check_cancel)
     if probe["kind"] == "installshield_cab":
         probe["kind"] = "installshield"
-    if probe["kind"] == "pe":
-        result = inspect_folder(cfg, source, check_cancel, selected_executable=source)
-        result["source"]["kind"] = "executable"
-        result["source"]["probe"] = probe["evidence"]
-        return _add_sibling_facts(result, source)
     if probe["kind"] in ("zip", "inno", "installshield"):
         kind = probe["kind"]
         adapter = archive_adapter(cfg, kind)

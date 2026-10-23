@@ -380,9 +380,9 @@ function step(index, installing = false) {
   element("source-forward").hidden = !source;
   element("source-forward").textContent = hasInspection ? candidateCanInstall && inspectionReady ? "Continue to review" : "View copy details" : "Check this copy";
   if (index === 3) {
-    element("installed-location").textContent = `Installed in ${destination}`;
+    element("installed-location").textContent = destination;
     element("update-note").hidden = !selected?.updateAvailable;
-    element("rebuild").textContent = selected?.updateAvailable ? "Update" : "Rebuild";
+    element("rebuild").hidden = !selected?.updateAvailable;
   }
   if (index === 1) {
     element(source ? "source-forward" : "choose-source").focus();
