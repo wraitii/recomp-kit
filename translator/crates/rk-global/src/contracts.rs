@@ -671,9 +671,9 @@ fn prepare(
                     continue;
                 }
                 Op::String(name) => {
-                    let (reads, writes_fields, flags) = rk_ir::string::effect(name.0);
+                    let (reads, writes_fields) = rk_ir::string::effect(name.0);
                     use_[index] |= fields_mask(reads) & !local;
-                    let produced = fields_mask(writes_fields) | if flags { FLAG_LANES } else { 0 };
+                    let produced = fields_mask(writes_fields);
                     local |= produced;
                     defs[index] |= produced;
                     continue;

@@ -48,58 +48,33 @@ fn leak(text: &str) -> &'static str {
     Box::leak(text.to_string().into_boxed_str())
 }
 
-fn fields(names: &[&str]) -> Fields {
-    let mut out = Fields::NONE;
-    for name in names {
-        let field = match *name {
-            "EAX" => Field::Eax,
-            "ECX" => Field::Ecx,
-            "EDX" => Field::Edx,
-            "EBX" => Field::Ebx,
-            "ESP" => Field::Esp,
-            "EBP" => Field::Ebp,
-            "ESI" => Field::Esi,
-            "EDI" => Field::Edi,
-            "CF" => Field::Cf,
-            "PF" => Field::Pf,
-            "AF" => Field::Af,
-            "ZF" => Field::Zf,
-            "SF" => Field::Sf,
-            "OF" => Field::Of,
-            _ => continue,
-        };
-        out |= Fields(field.bit());
-    }
-    out
-}
-
-pub fn effect(name: &str) -> (Fields, Fields, bool) {
+pub fn effect(name: &str) -> (Fields, Fields) {
     let base = name.rsplit('_').next().unwrap_or(name);
-    let base = base.get(..4).unwrap_or(base);
-    let pointers: &[&str] = match base {
-        "movs" | "cmps" => &["ESI", "EDI"],
-        "stos" | "scas" => &["EDI"],
-        "lods" => &["ESI"],
-        _ => &[],
+    let pointers: &[Field] = match base.get(..4).unwrap_or(base) {
+        "movs" | "cmps" => &[Field::Esi, Field::Edi],
+        "stos" | "scas" => &[Field::Edi],
+        "lods" => &[Field::Esi],
+        _ => return (Fields::NONE, Fields::NONE),
     };
-    if pointers.is_empty() {
-        return (Fields::NONE, Fields::NONE, false);
-    }
     let rep = name.contains('_');
-    let mut reads: Vec<&str> = pointers.to_vec();
+    let mut reads: Fields = pointers.iter().copied().collect();
     if rep {
-        reads.push("ECX");
+        reads.insert(Field::Ecx);
     }
-    if base == "stos" || base == "scas" {
-        reads.push("EAX");
+    let mut writes = reads;
+    if base.starts_with("stos") || base.starts_with("scas")
+        || (base.starts_with("lods") && (rep || base != "lodsd"))
+    {
+        reads.insert(Field::Eax);
     }
-    let mut writes: Vec<&str> = pointers.to_vec();
-    if rep {
-        writes.push("ECX");
+    if base.starts_with("lods") {
+        writes.insert(Field::Eax);
     }
-    if base == "lods" {
-        writes.push("EAX");
+    if base.starts_with("cmps") || base.starts_with("scas") {
+        writes |= Fields::FLAGS;
+        if rep {
+            reads |= Fields::FLAGS;
+        }
     }
-    let flags = base == "cmps" || base == "scas";
-    (fields(&reads), fields(&writes), flags)
+    (reads, writes)
 }

@@ -816,10 +816,7 @@ impl<'a> Builder<'a> {
                 self.boundary(value, state, block, false)?;
                 let token = self.value(Op::Memory, 0, &[value]);
                 state[memory_index] = Some(token);
-                let (_, mut writes, flags) = rk_ir::string::effect(string.0);
-                if flags {
-                    writes |= Fields::FLAGS;
-                }
+                let (_, writes) = rk_ir::string::effect(string.0);
                 self.reload_fields(value, writes, state, block)?;
                 ops.push(value);
             }

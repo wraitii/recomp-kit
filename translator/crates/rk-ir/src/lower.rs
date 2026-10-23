@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use rk_core::contract::Fields;
 use rk_core::ir::{FunctionIr, Insn, OpCode, PcodeOp, SehEffect, Space, Varnode};
 use rk_core::program::Image;
 use rk_core::{Addr, Diagnostic, Reason};
@@ -2114,8 +2113,4 @@ fn apply_seh(ops: &mut Vec<CgOp>, kinds: &[SehEffect]) {
             _ => ops.push(cg(Op::Seh(*kind))),
         }
     }
-}
-
-pub fn string_fields(_helper: &str) -> (Fields, Fields, bool) {
-    string::effect(_helper)
 }

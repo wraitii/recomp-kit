@@ -1517,6 +1517,12 @@ static inline int rep_movs_bulk(X86 *c, uint32_t size) {
             c->r[R_EAX] = (c->r[R_EAX] & ~(uint32_t)((1ull << BITS) - 1)) |                        \
                           ((uint32_t)v & (uint32_t)((1ull << BITS) - 1));                          \
         c->r[R_ESI] += c->eflags_df ? (uint32_t)-(BITS / 8) : (uint32_t)(BITS / 8);                \
+    }                                                                                              \
+    static inline void rep_lods##SUF(X86 *c) {                                                     \
+        while (c->r[R_ECX]) {                                                                      \
+            lods##SUF(c);                                                                          \
+            c->r[R_ECX]--;                                                                         \
+        }                                                                                          \
     }
 STRING_OPS(b, 8, uint8_t, rd8, wr8)
 STRING_OPS(w, 16, uint16_t, rd16, wr16)

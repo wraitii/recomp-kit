@@ -223,13 +223,21 @@ fn signed_sub_le(s: &Ssa, alias: &DenseAliases, id: ValueId) -> Option<(ValueId,
     None
 }
 
-fn fold(code: rk_core::ir::OpCode, operands: &[u64], sizes: &[u8], result_size: u8) -> Option<u64> {
+fn fold(s: &Ssa, code: rk_core::ir::OpCode, args: &[ValueId], result_size: u8) -> Option<u64> {
     use rk_core::ir::OpCode as C;
-    let width_bytes = sizes.first().copied().unwrap_or(result_size);
+    if !(1..=8).contains(&result_size) || !(1..=2).contains(&args.len()) {
+        return None;
+    }
+    let operand = |index: usize| {
+        let value = s.value(args[index]);
+        let Op::Const(data) = value.op else { return None };
+        (1..=8).contains(&value.size)
+            .then(|| (data & rk_core::mask(value.size as u32), value.size))
+    };
+    let (a, width_bytes) = operand(0)?;
+    let (b, low_size) = if args.len() == 2 { operand(1)? } else { (0, 0) };
     let width = width_bytes as u32 * 8;
     let bits = rk_core::mask(width_bytes as u32);
-    let a = operands.first().copied().unwrap_or(0) & bits;
-    let b = operands.get(1).copied().unwrap_or(0) & bits;
     let signed = |value: u64| -> i64 {
         if width >= 64 {
             value as i64
@@ -242,7 +250,7 @@ fn fold(code: rk_core::ir::OpCode, operands: &[u64], sizes: &[u8], result_size: 
         C::Copy => Some(a),
         C::IntZExt => Some(a),
         C::IntSExt => {
-            let source = sizes.first().copied().unwrap_or(result_size) as u32 * 8;
+            let source = width;
             Some(if source >= 64 {
                 a
             } else {
@@ -287,13 +295,9 @@ fn fold(code: rk_core::ir::OpCode, operands: &[u64], sizes: &[u8], result_size: 
         C::IntSRem => sa.checked_rem(sb).map(|value| value as u64),
         C::PopCount => Some(a.count_ones() as u64),
         C::LzCount => Some(a.leading_zeros().saturating_sub(64 - width) as u64),
-        C::SubPiece => {
-            let source = sizes.first().copied().unwrap_or(4) as u64 * 8;
-            Some(if operands[1] * 8 >= source { 0 } else { a >> (8 * operands[1]) })
-        }
-        C::Piece => {
-            let low = sizes.get(1).copied().unwrap_or(4) as u64 * 8;
-            Some((a << low) | b)
+        C::SubPiece => Some(if b >= width_bytes as u64 { 0 } else { a >> (8 * b) }),
+        C::Piece if low_size > 0 && width_bytes + low_size == result_size => {
+            Some((a << (low_size as u32 * 8)) | b)
         }
         _ => None,
     };
@@ -438,7 +442,7 @@ pub fn canonicalize(s: &mut Ssa, signed_sub: bool) {
                         distinct.push(arg);
                     }
                 }
-                (distinct.len() == 1).then_some(distinct[0])
+                (distinct.len() == 1).then(|| distinct[0])
             }
             Op::Byte(index) if args.len() == 1 => {
                 let source = &s.values[args[0] as usize];
@@ -500,30 +504,11 @@ pub fn canonicalize(s: &mut Ssa, signed_sub: bool) {
                     _ if args.len() == 2 => match identity(s, code, &args, value.size) {
                         Some(Identity::Value(id)) => Some(id),
                         Some(Identity::Const(data)) => Some(s.constant(&mut cache, value.size, data)),
-                        None if args.iter().all(|&arg| matches!(s.values[arg as usize].op, Op::Const(_))) => {
-                            let operands: Vec<u64> = args.iter().map(|&arg| match s.values[arg as usize].op {
-                                Op::Const(data) => data,
-                                _ => 0,
-                            }).collect();
-                            let sizes: Vec<u8> = args.iter().map(|&arg| s.values[arg as usize].size).collect();
-                            fold(code, &operands, &sizes, value.size)
-                                .map(|data| s.constant(&mut cache, value.size, data))
-                        }
-                        None => None,
+                        None => fold(s, code, &args, value.size)
+                            .map(|data| s.constant(&mut cache, value.size, data)),
                     },
-                    _ => {
-                        if args.is_empty() || !args.iter().all(|&arg| matches!(s.values[arg as usize].op, Op::Const(_))) {
-                            None
-                        } else {
-                            let operands: Vec<u64> = args.iter().map(|&arg| match s.values[arg as usize].op {
-                                Op::Const(data) => data,
-                                _ => 0,
-                            }).collect();
-                            let sizes: Vec<u8> = args.iter().map(|&arg| s.values[arg as usize].size).collect();
-                            fold(code, &operands, &sizes, value.size)
-                                .map(|data| s.constant(&mut cache, value.size, data))
-                        }
-                    }
+                    _ => fold(s, code, &args, value.size)
+                        .map(|data| s.constant(&mut cache, value.size, data)),
                 }
             }
                 _ => None,
