@@ -211,9 +211,11 @@ impl D3d9Queries {
             .ok_or_else(|| RenderError::invalid("Issue", "unknown query handle"))?;
         let done = Arc::clone(&record.done);
         record.generation = generation;
-        gpu.queue().submit(std::iter::empty());
-        gpu.queue().on_submitted_work_done(move || {
-            done.fetch_max(generation, Ordering::AcqRel);
+        gpu.submit_then(move |queue| {
+            queue.submit(std::iter::empty());
+            queue.on_submitted_work_done(move || {
+                done.fetch_max(generation, Ordering::AcqRel);
+            });
         });
         Ok(())
     }
@@ -372,17 +374,16 @@ impl D3d9Queries {
                 .ok_or_else(|| RenderError::invalid("GetData", "unknown query handle"))?;
             (record.generation, Arc::clone(&record.done))
         };
-        if flush {
-            gpu.queue().submit(std::iter::empty());
-        }
         if let Err(error) = gpu.device.poll(wgpu::PollType::Poll) {
             return Err(RenderError::new("GetData", error.to_string()));
         }
         if generation == 0 || done.load(Ordering::Acquire) >= generation {
-            Ok(QueryPoll::Ready(1))
-        } else {
-            Ok(QueryPoll::Pending)
+            return Ok(QueryPoll::Ready(1));
         }
+        if flush {
+            gpu.request_flush();
+        }
+        Ok(QueryPoll::Pending)
     }
 
     fn get_occlusion(

@@ -192,6 +192,7 @@ struct PendingWork {
     staging: wgpu::util::StagingBelt,
     clear: Option<PendingClear>,
     submitter: Submitter,
+    flush_pending: Arc<AtomicBool>,
 }
 
 fn frame_encoder<'a>(
@@ -271,6 +272,7 @@ impl D3d9Gpu {
                 staging: wgpu::util::StagingBelt::new(STAGING_CHUNK),
                 clear: None,
                 submitter: Submitter::new(gpu.queue.clone()),
+                flush_pending: Arc::new(AtomicBool::new(false)),
             })),
             loss,
             mipgen: Arc::new(Mutex::new(MipGenState::default())),
@@ -287,6 +289,23 @@ impl D3d9Gpu {
 
     pub fn submit_pending(&self) {
         self.pending.lock().unwrap().submit();
+    }
+
+    pub(crate) fn request_flush(&self) {
+        let mut pending = self.pending.lock().unwrap();
+        pending.submit();
+        if pending.flush_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let flush_pending = Arc::clone(&pending.flush_pending);
+        pending
+            .submitter
+            .send(SubmitJob::After(Box::new(move |queue| {
+                queue.submit(std::iter::empty());
+                queue.on_submitted_work_done(move || {
+                    flush_pending.store(false, Ordering::Release);
+                });
+            })));
     }
 
     pub(crate) fn submit_then(&self, work: impl FnOnce(&wgpu::Queue) + Send + 'static) {

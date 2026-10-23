@@ -449,6 +449,10 @@ struct D3dxEffectHost {
 struct D3d9Staging {
     uint32_t addr = 0;
     uint32_t size = 0;
+    bool active = false;
+    bool synchronized = false;
+    bool writable = false;
+    bool retain = false;
 };
 
 struct D3d9HostResource {

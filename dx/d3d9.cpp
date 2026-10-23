@@ -33,6 +33,7 @@ static const uint32_t D3DERR_DEVICELOST = MAKE_D3DHRESULT(2152);
 static const uint32_t D3DERR_DEVICENOTRESET = MAKE_D3DHRESULT(2153);
 static const uint32_t D3DOK_NOAUTOGEN = 0x08760000u | 2159u;
 static constexpr uint32_t D3D9_PIXEL_SHADER_FLOAT_CONSTANTS = 224;
+static constexpr uint32_t D3D9_LOCK_READONLY = 0x10u;
 
 static uint32_t bridge_result(X86 *c, const recomp::d3d::Status &status) {
     if (status.code == recomp::d3d::StatusCode::Ok)
@@ -1141,12 +1142,22 @@ static uint8_t *resource_bytes(ComObj *o) {
     return o->blob.empty() ? nullptr : o->blob.data();
 }
 
+static constexpr uint64_t D3D9_RETAINED_STAGING_LIMIT = 64ull * 1024ull * 1024ull;
+static uint64_t g_d3d9_retained_staging_bytes = 0;
+
+static void d3d9_free_staging(D3d9Staging &staging) {
+    if (staging.addr)
+        heap_free(staging.addr);
+    if (staging.retain)
+        g_d3d9_retained_staging_bytes -= staging.size;
+    staging = {};
+}
+
 static void d3d9_release_staging(D3d9HostResource *h) {
     if (!h)
         return;
     for (auto &entry : h->staging)
-        if (entry.second.addr)
-            heap_free(entry.second.addr);
+        d3d9_free_staging(entry.second);
     h->staging.clear();
 }
 
@@ -4973,34 +4984,54 @@ static void buffer_lock_wgpu(X86 *c) {
     bool fresh = staging.addr == 0;
     if (fresh) {
         if (prepared.total == 0) {
+            d3d9_free_staging(staging);
+            o->d3d9_resource->staging.erase(0);
             com_ret(c, D3DERR_INVALIDCALL);
             return;
         }
         uint32_t stage = heap_alloc(prepared.total, false, 16);
         if (!stage) {
+            d3d9_free_staging(staging);
+            o->d3d9_resource->staging.erase(0);
             com_ret(c, E_OUTOFMEMORY);
             return;
         }
+        staging.addr = stage;
+        staging.size = prepared.total;
+        staging.retain =
+            prepared.total <= D3D9_RETAINED_STAGING_LIMIT - g_d3d9_retained_staging_bytes;
+        if (staging.retain)
+            g_d3d9_retained_staging_bytes += prepared.total;
+    }
+    bool starting = !staging.active;
+    if (starting && !staging.synchronized) {
         rust::Slice<const uint8_t> bytes = o->d3d9_resource->bytes();
-        if (bytes.size() != prepared.total) {
-            heap_free(stage);
+        if (bytes.size() != prepared.total || staging.size != prepared.total) {
+            if (fresh) {
+                d3d9_free_staging(staging);
+                o->d3d9_resource->staging.erase(0);
+            }
             com_ret(c, D3DERR_INVALIDCALL);
             return;
         }
-        memcpy(gm_ptr(stage), bytes.data(), prepared.total);
-        staging.addr = stage;
-        staging.size = prepared.total;
+        memcpy(gm_ptr(staging.addr), bytes.data(), prepared.total);
     }
     recomp::d3d::D3d9BufferLockResult committed = o->d3d9_resource->lock_commit(request);
     if (committed.status.code != recomp::d3d::StatusCode::Ok) {
         if (fresh) {
-            heap_free(staging.addr);
-            staging.addr = 0;
-            staging.size = 0;
+            d3d9_free_staging(staging);
+            o->d3d9_resource->staging.erase(0);
         }
         com_ret(c, bridge_result(c, committed.status));
         return;
     }
+    if (starting) {
+        staging.active = true;
+        staging.synchronized = false;
+        staging.writable = false;
+    }
+    if ((flags & D3D9_LOCK_READONLY) == 0)
+        staging.writable = true;
     wr32(out, staging.addr + committed.offset);
     com_ret(c, D3D_OK9);
 }
@@ -5019,8 +5050,14 @@ static void buffer_unlock_wgpu(X86 *c) {
     rust::Slice<const uint8_t> bytes(gm_ptr(it->second.addr), it->second.size);
     recomp::d3d::D3d9BufferUnlockResult result = o->d3d9_resource->unlock(bytes);
     if (result.closed) {
-        heap_free(it->second.addr);
-        o->d3d9_resource->staging.erase(it);
+        it->second.active = false;
+        it->second.synchronized =
+            result.status.code == recomp::d3d::StatusCode::Ok && it->second.writable;
+        it->second.writable = false;
+        if (!it->second.retain || result.status.code != recomp::d3d::StatusCode::Ok) {
+            d3d9_free_staging(it->second);
+            o->d3d9_resource->staging.erase(it);
+        }
     }
     if (result.status.code != recomp::d3d::StatusCode::Ok) {
         com_ret(c, bridge_result(c, result.status));
