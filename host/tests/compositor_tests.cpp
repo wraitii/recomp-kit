@@ -6,6 +6,10 @@
 #include <cstdio>
 #include <vector>
 
+extern "C" double host_display_refresh_rate() {
+    return 0;
+}
+
 static int checks, failures;
 static void check(bool ok, const char *expr, int line) {
     ++checks;
