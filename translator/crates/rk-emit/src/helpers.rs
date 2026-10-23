@@ -12,6 +12,7 @@ static inline void recomp_return_fast_(X86 *c) {
 pub const MEMORY_HELPERS: &str = "\
 RECOMP_HOT_INLINE uint8_t recomp_rd8_(uint8_t *arena, uint32_t a) {
 #if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
+    (void)arena;
     return rd8(a);
 #else
     uint8_t v;
@@ -21,6 +22,7 @@ RECOMP_HOT_INLINE uint8_t recomp_rd8_(uint8_t *arena, uint32_t a) {
 }
 RECOMP_HOT_INLINE void recomp_wr8_(uint8_t *arena, uint32_t a, uint8_t v) {
 #if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
+    (void)arena;
     wr8(a, v);
 #else
     RECOMP_BITCOPY(arena + a, &v, 1);
@@ -28,6 +30,7 @@ RECOMP_HOT_INLINE void recomp_wr8_(uint8_t *arena, uint32_t a, uint8_t v) {
 }
 RECOMP_HOT_INLINE uint16_t recomp_rd16_(uint8_t *arena, uint32_t a) {
 #if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
+    (void)arena;
     return rd16(a);
 #else
     uint16_t v;
@@ -37,6 +40,7 @@ RECOMP_HOT_INLINE uint16_t recomp_rd16_(uint8_t *arena, uint32_t a) {
 }
 RECOMP_HOT_INLINE void recomp_wr16_(uint8_t *arena, uint32_t a, uint16_t v) {
 #if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
+    (void)arena;
     wr16(a, v);
 #else
     RECOMP_BITCOPY(arena + a, &v, 2);
@@ -44,6 +48,7 @@ RECOMP_HOT_INLINE void recomp_wr16_(uint8_t *arena, uint32_t a, uint16_t v) {
 }
 RECOMP_HOT_INLINE uint32_t recomp_rd32_(uint8_t *arena, uint32_t a) {
 #if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
+    (void)arena;
     return rd32(a);
 #else
     uint32_t v;
@@ -53,6 +58,7 @@ RECOMP_HOT_INLINE uint32_t recomp_rd32_(uint8_t *arena, uint32_t a) {
 }
 RECOMP_HOT_INLINE void recomp_wr32_(uint8_t *arena, uint32_t a, uint32_t v) {
 #if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
+    (void)arena;
     wr32(a, v);
 #else
     RECOMP_BITCOPY(arena + a, &v, 4);
@@ -60,6 +66,7 @@ RECOMP_HOT_INLINE void recomp_wr32_(uint8_t *arena, uint32_t a, uint32_t v) {
 }
 RECOMP_HOT_INLINE uint64_t recomp_rd64_(uint8_t *arena, uint32_t a) {
 #if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
+    (void)arena;
     return rd64(a);
 #else
     uint64_t v;
@@ -69,6 +76,7 @@ RECOMP_HOT_INLINE uint64_t recomp_rd64_(uint8_t *arena, uint32_t a) {
 }
 RECOMP_HOT_INLINE void recomp_wr64_(uint8_t *arena, uint32_t a, uint64_t v) {
 #if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
+    (void)arena;
     wr64(a, v);
 #else
     RECOMP_BITCOPY(arena + a, &v, 8);
@@ -76,6 +84,7 @@ RECOMP_HOT_INLINE void recomp_wr64_(uint8_t *arena, uint32_t a, uint64_t v) {
 }
 RECOMP_HOT_INLINE float recomp_rdf32_(uint8_t *arena, uint32_t a) {
 #if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
+    (void)arena;
     return rdf32(a);
 #else
     float v;
@@ -85,6 +94,7 @@ RECOMP_HOT_INLINE float recomp_rdf32_(uint8_t *arena, uint32_t a) {
 }
 RECOMP_HOT_INLINE void recomp_wrf32_(uint8_t *arena, uint32_t a, float v) {
 #if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
+    (void)arena;
     wrf32(a, v);
 #else
     RECOMP_BITCOPY(arena + a, &v, 4);
@@ -92,6 +102,7 @@ RECOMP_HOT_INLINE void recomp_wrf32_(uint8_t *arena, uint32_t a, float v) {
 }
 RECOMP_HOT_INLINE double recomp_rdf64_(uint8_t *arena, uint32_t a) {
 #if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
+    (void)arena;
     return rdf64(a);
 #else
     double v;
@@ -101,6 +112,7 @@ RECOMP_HOT_INLINE double recomp_rdf64_(uint8_t *arena, uint32_t a) {
 }
 RECOMP_HOT_INLINE void recomp_wrf64_(uint8_t *arena, uint32_t a, double v) {
 #if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)
+    (void)arena;
     wrf64(a, v);
 #else
     RECOMP_BITCOPY(arena + a, &v, 8);
