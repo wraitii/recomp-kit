@@ -29,41 +29,6 @@ source_notes = "Use the GOG copy with official patch 1.05 and no unofficial user
 code_map = "metadata"
 # Structural vtable-prefix bounds plus observed edges from typeinf.nominal.
 indirect_targets = "metadata/indirect-targets.tsv"
-x87_mode_metadata = "x87-boundaries.json"
-x87_facts = "x87-facts.json"
-# Audited assumption: imported OS/library calls preserve gameplay PC/RC on return.
-# COM calls and callback entries still require separate facts.
-x87_imports_preserve_pc_rc = true
-x87_entry_contracts = [
-  { function = 0x0041cbc0, mask = 0x0f00, value = 0, scope = "all_invocations", verify = true, evidence = "Normal gameplay cargo delivery: processCargoDelivery is called by Train::processDeliveryChain at 004adf30 after device setup. CreateDevice at 00549991 uses flags 0x20/0x40 without FPU_PRESERVE and establishes PC=RC=0. Contract covers every cargo-delivery invocation, including callback/recovery paths; startup ordering and preservation above this entry are assumed, not mechanically proven. Original entry, caller, revenue callees and device flags inspected in Ghidra." },
-  # Known-good gameplay/render math entries. Explicit offline premise: every
-  # invocation reaches the named entry after a successful IDirect3D8::CreateDevice
-  # with flags 0x20/0x40 (no FPU_PRESERVE; x87-boundaries.json site 00549991) and
-  # with no intervening callback or callee changing x87 PC/RC. PC=RC=0 is assumed
-  # for the whole all_invocations scope of each entry, not proven by a local body
-  # property: a missing local CW writer says nothing about modes established or
-  # lost across calls. Per-site facts still derive mode through analyzed call
-  # effects; unresolved effects stay unknown. verify=true raises
-  # recomp_x87_contract_violation on an incompatible entry CW (hook-forced general
-  # execution bypasses the check). Original entry, callers and decompilation
-  # inspected in Ghidra.
-  { function = 0x00536420, mask = 0x0f00, value = 0, scope = "all_invocations", verify = true, evidence = "GameMap::ComputeTerrainLightmapValue; called by FUN_005374d0 and GameMap::InitMapRenderData 005375c0. Terrain lightmap build. No local x87 CW writer; entry premise: all invocations follow CreateDevice flags 0x20/0x40 with no intervening callback/callee changing PC/RC." },
-  { function = 0x005331e0, mask = 0x0f00, value = 0, scope = "all_invocations", verify = true, evidence = "GameMap::downsampleNormalCell; called by GameMap::buildTerrainLODs 005337f0 and FUN_00533890. Terrain normal LOD. No local x87 CW writer; entry premise: all invocations follow CreateDevice flags 0x20/0x40 with no intervening callback/callee changing PC/RC." },
-  { function = 0x005679b0, mask = 0x0f00, value = 0, scope = "all_invocations", verify = true, evidence = "__updateNodeColors; called by __processNodeList 00567c70 and __processNodeListWithDelta 00567ce0. Node color/transform update. No local x87 CW writer; entry premise: all invocations follow CreateDevice flags 0x20/0x40 with no intervening callback/callee changing PC/RC." },
-  { function = 0x0048f7f0, mask = 0x0f00, value = 0, scope = "all_invocations", verify = true, evidence = "TrackDbItem::SetCornerVectorsAndUpdate; called by TrackDb::BuildTrackSection 0049d380. Track geometry. No local x87 CW writer; entry premise: all invocations follow CreateDevice flags 0x20/0x40 with no intervening callback/callee changing PC/RC." },
-  { function = 0x0048a440, mask = 0x0f00, value = 0, scope = "all_invocations", verify = true, evidence = "TrackDbItem::interpolatePositionAtT; called by TrackDbItem::traverseToAdjacentSegment 0048edf0. Track geometry. No local x87 CW writer; entry premise: all invocations follow CreateDevice flags 0x20/0x40 with no intervening callback/callee changing PC/RC." },
-  { function = 0x005468c0, mask = 0x0f00, value = 0, scope = "all_invocations", verify = true, evidence = "RenderingContext::FrustumTestSphere; called by WorldModule::RenderTerrainTiles 00524780, AddTerrainBlock 00526b70, submitForRendering 00528d90, submitVisibleObjects 005294b0. Frustum cull. No local x87 CW writer; entry premise: all invocations follow CreateDevice flags 0x20/0x40 with no intervening callback/callee changing PC/RC." },
-  { function = 0x0052e380, mask = 0x0f00, value = 0, scope = "all_invocations", verify = true, evidence = "EmitTrianglesToVb_Transformed; called by WorldModule::RenderTerrainTiles 00524780. Vertex emission. No local x87 CW writer; entry premise: all invocations follow CreateDevice flags 0x20/0x40 with no intervening callback/callee changing PC/RC." },
-  { function = 0x0052e520, mask = 0x0f00, value = 0, scope = "all_invocations", verify = true, evidence = "EmitTrianglesToVb_Static; called by WorldModule::RenderTerrainTiles 00524780. Vertex emission. No local x87 CW writer; entry premise: all invocations follow CreateDevice flags 0x20/0x40 with no intervening callback/callee changing PC/RC." },
-  { function = 0x005371f0, mask = 0x0f00, value = 0, scope = "all_invocations", verify = true, evidence = "__maybe_compute_scale_and_flag; called by GameMap::renderMapOverlayInfo 00452100, WorldObject::renderBillboard 00530280, __maybe_handle_context_menu 0053a960. Render scaling. No local x87 CW writer; entry premise: all invocations follow CreateDevice flags 0x20/0x40 with no intervening callback/callee changing PC/RC." },
-  { function = 0x00417840, mask = 0x0f00, value = 0, scope = "all_invocations", verify = true, evidence = "BuildingTypesBtyDb::calculateBaseOffset; callers include route validation 00402cb0, building placement 004197e0 and Station::initializeStation 00480210. Building geometry. No local x87 CW writer; entry premise: all invocations follow CreateDevice flags 0x20/0x40 with no intervening callback/callee changing PC/RC." },
-  { function = 0x00527450, mask = 0x0f00, value = 0, scope = "all_invocations", verify = true, evidence = "WorldModule::projectWorldToScreenNormalized01; callers include GameCamera::projectWorldToScreen 00439b20, RenderTerrainHeightMarkers 00528190 and renderBillboard 00530280. Projection. No local x87 CW writer; entry premise: all invocations follow CreateDevice flags 0x20/0x40 with no intervening callback/callee changing PC/RC." },
-  { function = 0x00489f90, mask = 0x0f00, value = 0, scope = "all_invocations", verify = true, evidence = "TrackDbItem::computeAndSetElevationMode; callers include setVectorsAndUpdate 0048e600, SetTrackCornerVectorsFromRawPoints 0048f740 and repositionFromCenterAngle 00490f80. Track elevation. No local x87 CW writer; entry premise: all invocations follow CreateDevice flags 0x20/0x40 with no intervening callback/callee changing PC/RC." },
-  { function = 0x0056e41a, mask = 0x0f00, value = 0, scope = "all_invocations", verify = true, evidence = "__set_projection_matrix; called by RenderingContext::__set_projection_dimensions 00544290. Projection matrix setup. No local x87 CW writer; entry premise: all invocations follow CreateDevice flags 0x20/0x40 with no intervening callback/callee changing PC/RC." },
-  { function = 0x004a6e70, mask = 0x0f00, value = 0, scope = "all_invocations", verify = true, evidence = "Train::someRevenueCalc; called by Train::handleMovement 004b0310. Per-tick train revenue math. No local x87 CW writer; entry premise: all invocations follow CreateDevice flags 0x20/0x40 with no intervening callback/callee changing PC/RC." },
-  { function = 0x00420c30, mask = 0x0f00, value = 0, scope = "all_invocations", verify = true, evidence = "City::accumulateMonthlyStatistics; called by processYearEndWorldUpdate 0040a160. City simulation math. No local x87 CW writer; entry premise: all invocations follow CreateDevice flags 0x20/0x40 with no intervening callback/callee changing PC/RC." },
-  { function = 0x0042be20, mask = 0x0f00, value = 0, scope = "all_invocations", verify = true, evidence = "Cargo-type map sum; called by FUN_004515c0 and InGamePanel::handleMessage 004de140. Cargo economy math. No local x87 CW writer; entry premise: all invocations follow CreateDevice flags 0x20/0x40 with no intervening callback/callee changing PC/RC." },
-]
 private_leaf_contracts = true
 checked_returns = [0x005a10d0]
 state_contract_callers = [0x0042ce00, 0x0042c1b0]

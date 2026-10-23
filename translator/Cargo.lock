@@ -581,6 +581,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rk-pcode-ffi"
+version = "0.1.0"
+dependencies = [
+ "rk-core",
+ "rk-sleigh",
+]
+
+[[package]]
 name = "rk-plan"
 version = "0.1.0"
 dependencies = [

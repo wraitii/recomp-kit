@@ -37,13 +37,14 @@ TARGETS = {
     "headless": ["recomp_headless"],
     "gen": ["recomp_gen"],
     "dispatch-tests": ["dispatch_tests"],
+    "interp-tests": ["interp_tests"],
     "plugins": ["plugins"],
     "ios": ["recomp_app"],
     "android": ["recomp_app"],
     "web": ["recomp_app"],
 }
 MACOS_ONLY = {"ios"}
-NEEDS_GEN = {"app", "smoke", "headless", "gen", "dispatch-tests", "ios", "android", "web"}
+NEEDS_GEN = {"app", "smoke", "headless", "gen", "dispatch-tests", "interp-tests", "ios", "android", "web"}
 # Targets with presets of their own, whatever the host system.
 OWN_PRESET = {"ios", "android", "web"}
 
@@ -357,6 +358,24 @@ def translation_input(cfg):
             "image_base": cfg["game"]["image_base"], "sha256": cfg["game"]["sha256"],
             "translate": stable(cfg["translate"]), "globals": stable(cfg["globals"]),
             "curated": stable(cfg["curated"]), "aux_modules": stable(cfg["aux_modules"])}
+
+
+def rust_pcode_library(build_root):
+    """Build the shared p-code evaluator library for this desktop host."""
+    target = Path(build_root) / "recomp/cargo"
+    subprocess.run(["cargo", "build", "--release", "--quiet", "--locked", "-p", "rk-pcode-ffi",
+                    "--manifest-path", str(ROOT / "translator/Cargo.toml"), "--target-dir", str(target)],
+                   check=True)
+    names = {"Darwin": "librk_pcode_ffi.dylib", "Windows": "rk_pcode_ffi.dll"}
+    name = names.get(platform.system(), "librk_pcode_ffi.so")
+    source = target / "release" / name
+    if platform.system() == "Darwin":
+        staged = Path(build_root) / "recomp/pcode" / name
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, staged)
+        subprocess.run(["install_name_tool", "-id", "@rpath/" + name, str(staged)], check=True)
+        return staged
+    return source
 
 
 def rust_analysis(build_root):
@@ -740,6 +759,8 @@ def parse_args(argv, system=None):
     game_config.add_game_args(parser)
     parser.add_argument("--stub", action="store_true",
                         help="Link the hosts against a stub translation (no game code; CI's build)")
+    parser.add_argument("--no-pcode", action="store_true",
+                        help="Omit the runtime SLEIGH lifter and p-code interpreter; missing code remains fatal")
     parser.add_argument("--no-observe", action="store_true",
                         help="Compile out indirect-transfer observation")
     parser.add_argument("--check-call-facts", action="store_true",
@@ -927,6 +948,9 @@ def main():
                     temporary.replace(header)
             if args.target == "gen":
                 return
+            pcode_disabled = (args.no_pcode or args.target in {"ios", "android", "web"} or
+                              platform.system() == "Windows" or preset.startswith("windows-cross"))
+            defines.append("-DRECOMP_PCODE_LIB=" + ("" if pcode_disabled else str(rust_pcode_library(args.build_root))))
             if args.target == "ios":
                 if not args.stub and not (args.build_root / "recomp/gen/table.c").is_file():
                     parser.error("No translation in %s/recomp/gen; run tools/build.py --regenerate on macOS first"

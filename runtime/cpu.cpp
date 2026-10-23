@@ -314,6 +314,7 @@ void recomp_unknown_call(X86 *c, uint32_t target) {
     // call through a null pointer faults at the call, and there are no
     // instructions at it to interpret. Reading them would be the very
     // dereference this page exists to refuse.
+    discovery_note("call", target, site);
     if (target >= GUEST_NULL_LIMIT && interp_call(c, target)) {
         observe_indirect(site, target, "interp");
         return;
@@ -380,9 +381,6 @@ void recomp_unknown_call(X86 *c, uint32_t target) {
                  c->r[R_ESI], c->r[R_EDI]) &&
         unknown_calls().size() < 256)
         unknown_calls().push_back(UnknownCall{target, ret});
-    // Every undeliverable call is an address the run proves is code, so it is
-    // also what a regeneration wants back (see discovery.h).
-    discovery_note("call", target, ret);
     observe_write();
     fflush(stdout);
     fflush(stderr);

@@ -22,6 +22,7 @@ translated locally into `build/recomp/gen/` and are never edited in place.
 | Code map and program model | [code_map.py](../tools/recomp/code_map.py), [rk-image](../translator/crates/rk-image/src/lib.rs) | `pack`, `read_map`, `Program` |
 | Translation driver, chunks, tables | [Translator](translator.md), [recomp-translate](../translator/crates/recomp-translate/src/main.rs), [rk-output](../translator/crates/rk-output/src/lib.rs) | `main`, `build_bodies`, `rk_output::write` |
 | Instruction semantics, SSA emission | [rk-ssa](../translator/crates/rk-ssa/src/lib.rs), [rk-emit](../translator/crates/rk-emit/src/lib.rs), [x86.h](../runtime/x86.h) | `prepare`, `emit`; register/flag/x87 helpers |
+| Missing-code execution | [pcode.cpp](../runtime/pcode.cpp), [pcode_x86.cpp](../runtime/pcode_x86.cpp), [rk-pcode-ffi](../translator/crates/rk-pcode-ffi/src/lib.rs) | `PcodeMachine::step`, `pcode_interp_call`, `rp_lift` |
 | Offline dispatch bounds | [Analysis facts](translator.md#analysis-facts), [rk-analysis](../translator/crates/rk-analysis/src/guest.rs) | `produce`, stack summaries, table census |
 | Translator checks | [diff/run.py](../tools/recomp/diff/run.py), [corpus](../tools/recomp/corpus/README.md) | Unicorn comparison; eager/SSA/native corpus |
 | Native replacement validation | [replay.cpp](../mods/native/replay.cpp), [page_track.cpp](../mods/native/page_track.cpp) | `load`, `run`, `translated`, `begin`, `end` |

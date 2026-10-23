@@ -283,8 +283,8 @@ if(TARGET recomp_gen)
     # Desktop packages carry manifests beside statically linked core plugins.
     # This avoids shipping a plugin compiled for a different host platform.
     recomp_add_builtin_mods(recomp_app RESOURCES $<TARGET_FILE_DIR:recomp_app>/resources)
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RECOMP_VIDEO)
-      # Keep staged FFmpeg libraries discoverable beside the executable.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND (RECOMP_VIDEO OR RECOMP_PCODE_LIB))
+      # Keep staged FFmpeg and p-code libraries discoverable beside the executable.
       set_target_properties(recomp_app PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
     endif()
   endif()

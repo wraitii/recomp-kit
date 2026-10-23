@@ -1,9 +1,9 @@
 # Architecture
 
 The build translates the supported executable's x86 instructions into C, then
-compiles that C alongside a handwritten native runtime. At runtime the executable
-supplies the original data image; its machine instructions are not executed by an
-x86 emulator. The loader verifies its hash before mapping any of it.
+compiles that C alongside a handwritten native runtime. The loader verifies the
+executable's hash and maps its original image. Translated code runs natively;
+dispatch gaps use the p-code interpreter described below.
 
 ```mermaid
 flowchart TD
@@ -205,7 +205,7 @@ The translator fills part of the gap itself: a bootstrap sweep of each image
 (`bootstrap_map.py`, `discover` in `[translate]`) adds provisional bodies that the
 Ghidra map does not name, and a branch into Ghidra-owned code is recorded as an
 entry of its owner. Provisional bodies are emitted as decoded regions; a provisional
-jump into mapped code dispatches at run time, and one into unmapped code traps.
+jump dispatches at run time, with unmapped code handled by the fallback below.
 Ghidra stays the authority: the sweep's bodies are evidence, and the fix for any of
 them is to create the function or entry in Ghidra, re-export and regenerate.
 `recomp-translate --discovery-report OUT.json` writes the discovered code map,
@@ -213,12 +213,35 @@ instruction lengths and full discovery report: seed evidence and ranks, gaps, tr
 conflicts, rejected functions and entries, pointer runs and switch tables. It also
 includes the original mapped spans, entries and tables for comparison.
 
-`RECOMP_DISCOVERY=<file>` writes the addresses the translation still does not carry,
-with the instruction that named them (`runtime/discovery.h`); naming such a file as
-`discovery_evidence` in `[translate]` seeds the next sweep with them, as
-`analysis_facts` and legacy `indirect_targets` already do. Meanwhile
-`runtime/interp.cpp` runs what the translation lacks, so a gap costs speed rather
-than correctness.
+The p-code interpreter is the default fallback for missing translated code.
+`RECOMP_INTERP=off` disables it at runtime; `pcode` explicitly selects the default.
+Unsupported semantics stop with diagnostics, without fabricating a return.
+`tools/build.py --no-pcode` omits the runtime SLEIGH library and evaluator;
+missing code then fails explicitly. Mobile, web and Windows builds currently
+omit this linkage too. A complete static map does not cover heap-generated code,
+which still requires the interpreter when used by the guest.
+`rk-pcode-ffi` lifts live bytes through the translator's pinned SLEIGH backend;
+`runtime/pcode.cpp` evaluates them and `pcode_x86.cpp` maps guest state and dispatch.
+Cached lifts are byte-validated, and nested execution retains shared ownership.
+The evaluator supports scalar integer p-code; x87/MMX/SSE, other userops, SHRD,
+16-bit segmentation and guest divide-exception delivery remain explicit gaps. Memory checks cover the
+null page and arena bounds, not page permissions. Scheduler checkpoints run per
+instruction; p-code operations and host recursion are bounded, but whole guest
+execution has no instruction cap. Unsupported sites inside translated bodies
+remain fatal; this fallback only handles dispatch gaps.
+
+`RECOMP_DISCOVERY=<file>` writes `target kind site hits` rows for addresses absent
+from the current translation, including calls handled by the interpreter and
+taken guest branches retained inside the p-code interpreter. P-code internal
+branches and returns are excluded. Targets must lie in a loaded PE executable
+section; heap-generated code is excluded. Each target keeps its first kind/site
+and a hit count; new targets flush immediately, with final counts written at exit.
+A call site is `00000000` unless explicitly supplied by call-site observation;
+`c->eip` is not reliable provenance in translated callers. Jump sites inside the
+p-code interpreter are exact instruction addresses.
+These are execution evidence, not recovered function boundaries or a complete
+code map. Naming the file as `discovery_evidence` in `[translate]` seeds the next
+sweep; permanent map repairs still go through Ghidra and re-export.
 
 `RECOMP_OBSERVE=<file>` writes one `site target kind count desc` row per indirect
 transfer, grouped by how it resolved: `known` (translated function table), `module`

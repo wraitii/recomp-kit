@@ -84,8 +84,10 @@ the original executable. See Ghidra cleanup notes (`docs/ghidra-cleanup.md` in t
 Generation emits 5,859 SSA bodies and 180 decoded bodies. It reports 128
 unmodelled instructions, while the generated bodies contain 3,443 distinct
 instruction trap sites including vector fallbacks not counted by that report.
-Computed jumps without recorded targets use runtime dispatch and fail with a
-named diagnostic if their destination has no translated entry.
+Computed jumps without recorded targets use runtime dispatch; missing entries
+use the kit's [p-code fallback](../../docs/architecture.md#discovery-and-code-a-build-does-not-carry),
+which stops explicitly on unsupported semantics. `--no-pcode` omits this fallback
+at build time; `RECOMP_INTERP=off` disables it at runtime.
 Advertising SSE support requires auditing the remaining lowering gaps first.
 
 Host overhead: the renderer uploads only each draw's requested vertex interval,

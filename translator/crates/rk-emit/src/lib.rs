@@ -1469,6 +1469,13 @@ impl<'a> Emitter<'a> {
             self.out.push_str("RECOMP_SETJMP3(c);\n");
             return Ok(());
         }
+        if !self.ctx.known_entries.contains(&target) {
+            let _ = writeln!(self.out, "recomp_call(c, 0x{target:08x}u);");
+            if self.plan.settle_sites.contains(&value) {
+                self.out.push_str("x86_cc_settle(c);\n");
+            }
+            return Ok(());
+        }
         if let Some((private_target, wanted)) = self.plan.call_masks.get(&value).copied() {
             if private_target == target {
                 if let Some(mask) = self

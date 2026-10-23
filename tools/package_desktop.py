@@ -55,12 +55,20 @@ def stage(app_binary: Path, cfg: dict, out_dir: Path, system=None, build_dir=Non
     # Read the actual preset's cache, including an explicit video-OFF override.
     # Exact SONAMEs avoid bundling build tools or unrelated files from ffmpeg/.
     video = False
+    pcode = None
     if build_dir is not None:
         build_dir = Path(build_dir)
         cache = (build_dir / "CMakeCache.txt").read_text().splitlines()
         video = any(line.startswith("RECOMP_VIDEO:BOOL=") and
                     line.partition("=")[2].upper() in {"1", "ON", "YES", "TRUE", "Y"}
                     for line in cache)
+        pcode = next((line.partition("=")[2] for line in cache
+                      if line.startswith("RECOMP_PCODE_LIB:FILEPATH=")), None)
+    if pcode:
+        copy(Path(pcode), staged / Path(pcode).name)
+    else:
+        name = "rk_pcode_ffi.dll" if system == "Windows" else "librk_pcode_ffi.so"
+        (staged / name).unlink(missing_ok=True)
     for component, major in (("avformat", 61), ("avcodec", 61), ("avutil", 59)):
         name = f"{component}-{major}.dll" if system == "Windows" else f"lib{component}.so.{major}"
         if video:

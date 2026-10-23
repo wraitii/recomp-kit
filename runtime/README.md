@@ -23,7 +23,8 @@ owns. Compile the runtime with `-I<repo root>` so `guest.h` can find it.
 | `gdi32*.cpp` | the GDI model: objects, DCs and palettes; software draw, text and TrueType rasterization |
 | `misc.cpp`, `misc_dlls.cpp` | ADVAPI32 registry, SHELL32, ole32, IMM32, WSOCK32, WINMM, and small optional-DLL probes |
 | `comctl32.cpp`, `imagehlp.cpp`, `media_foundation.cpp`, `msimg32.cpp`, `oleaut32.cpp` | common controls, DbgHelp, Media Foundation, msimg32 and automation shims |
-| `seh.cpp`, `interp.cpp`, `thunks.cpp` | guest exception checkpoints, the interpreter and thunk dispatch |
+| `seh.cpp`, `thunks.cpp` | guest exception checkpoints and thunk dispatch |
+| `interp.cpp`, `pcode.cpp`, `pcode_x86.cpp` | fallback selection, p-code evaluation and x86 state/dispatch; [behavior and build options](../docs/architecture.md#discovery-and-code-a-build-does-not-carry) |
 | `call_trace.cpp`, `linear_trace.cpp`, `discovery.cpp`, `observe.cpp`, `profile.cpp` | call tracing, discovery and profiling diagnostics |
 | `installation_manifest.cpp`, `layout.cpp`, `key_names.cpp`, `resources.cpp` | installation, input layout, key names and resource helpers |
 | `mods_seam.cpp`, `native_seam.h` | the mod and native-override seams |

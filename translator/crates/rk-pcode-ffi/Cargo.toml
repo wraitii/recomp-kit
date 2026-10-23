@@ -1,0 +1,15 @@
+[package]
+name = "rk-pcode-ffi"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rk-core.workspace = true
+rk-sleigh.workspace = true
+
+[lints]
+workspace = true
