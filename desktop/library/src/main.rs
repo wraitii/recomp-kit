@@ -42,6 +42,9 @@ fn command(settings: &Settings, storage: &PathBuf, request: &Value) -> Command {
         .arg(request.to_string())
         .current_dir(&settings.kit)
         .env_remove("RECOMP_BUILD_ROOT");
+    if let Some(path) = option_env!("RECOMP_TOOLKIT_UNSHIELD") {
+        cmd.env("RECOMP_UNSHIELD_LIBRARY", path);
+    }
     let mut paths = vec![PathBuf::from(&settings.python)
         .parent()
         .unwrap_or(std::path::Path::new("."))

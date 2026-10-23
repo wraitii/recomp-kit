@@ -31,7 +31,7 @@ RECIPE_DIRS = ("runtime", "dx", "host", "platform", "mods", "graphics", "cmake",
 RECIPE_FILES = ("CMakeLists.txt", "CMakePresets.json")
 RECIPE_TOOL_EXCLUDES = {"build_library.py", "check_game_literals.py",
                         "check_repo.py", "format.py", "install_jobs.py", "ios_logs.py",
-                        "setup.py", "source_inspection.py", "test.py", "zip_adapter.py", "inno_adapter.py"}
+                        "setup.py", "source_inspection.py", "test.py", "zip_adapter.py", "inno_adapter.py", "unshield_adapter.py"}
 IGNORED_PARTS = {".git", "__pycache__", ".pytest_cache", "tests", "test", ".venv"}
 JOURNAL_STAGES = {"inspecting", "discovering", "preparing", "extracting", "copying", "validating",
                   "building", "publishing", "cleaning", "complete", "failed", "cancelled"}

@@ -638,6 +638,16 @@ def probe_bytes(path, cancel=None):
                         return {"kind": "unsupported_inno", "evidence": "Inno Setup resource 11111 has an unrecognized loader signature"}
                     if marker == "unavailable":
                         return {"kind": "probe_limit", "evidence": "PE resource tree could not be verified within the bounded probe"}
+                    if path.name.casefold() == "setup.exe":
+                        with os.scandir(path.parent) as siblings:
+                            for index, sibling in enumerate(siblings):
+                                if index >= MAX_SIBLING_ENTRIES:
+                                    break
+                                if (sibling.name.casefold() == "data1.cab" and not sibling.is_symlink()
+                                        and sibling.is_file(follow_symlinks=False)):
+                                    with open(sibling.path, "rb") as cabinet:
+                                        if cabinet.read(4) == b"ISc(":
+                                            return {"kind": "installshield", "evidence": "PE setup executable with adjacent InstallShield data1.cab"}
                     return {"kind": "pe", "evidence": "PE signature"}
                 return {"kind": "probe_limit" if len(prefix) == MAX_PROBE_BYTES else "unknown",
                         "evidence": "PE header lies outside the bounded probe"}
@@ -652,6 +662,9 @@ def probe_bytes(path, cancel=None):
             if any(re.match(r"^\s*FILE\s+.+\s+(BINARY|MOTOROLA|WAVE|MP3)\s*$", line) for line in cue) and any(
                     re.match(r"^\s*TRACK\s+\d+\s+", line) for line in cue):
                 return {"kind": "cue", "evidence": "CUE FILE and TRACK records"}
+        suffix = path.suffix.casefold()
+        if suffix in (".iso", ".bin", ".cue"):
+            return {"kind": "media_hint", "evidence": f"{suffix} filename extension only; disc image format is unverified"}
         return {"kind": "unknown", "evidence": "No supported bounded source signature found"}
     except OSError as error:
         return {"kind": "unreadable", "evidence": str(error)}

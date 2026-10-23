@@ -110,8 +110,8 @@ def _sources(path):
     return sorted(rows, key=lambda item: _fold(item[0].name))
 
 
-def _fingerprint(path, cancel=None, destination=None):
-    sources = _sources(path)
+def _fingerprint(path, cancel=None, destination=None, source_files=_sources):
+    sources = source_files(path)
     digests = []
     for source, initial in sources:
         digest, count = hashlib.sha256(), 0
@@ -139,7 +139,7 @@ def _fingerprint(path, cancel=None, destination=None):
         if count != initial[2]:
             raise InnoError("source_changed", "The installer changed while it was being read.")
         digests.append((source.name, digest.hexdigest()))
-    if _sources(path) != sources:
+    if source_files(path) != sources:
         raise InnoError("source_changed", "The installer inputs changed while they were being read.")
     return digests[0][1] if len(digests) == 1 else hashlib.sha256(json.dumps(digests).encode()).hexdigest()
 
@@ -207,31 +207,31 @@ def _extract(path, destination, entries, cancel=None, selected=None, progress=No
         raise
 
 
-class InnoAdapter:
-    def __init__(self, installers):
+class InstallerAdapter:
+    def __init__(self, installers=()):
         self.installers = installers
 
     def archive_digest(self, path, cancel=None):
-        return _fingerprint(Path(path).resolve(strict=True), cancel)
+        return _fingerprint(Path(path).resolve(strict=True), cancel, source_files=self.sources)
 
     def source_size(self, path):
-        return sum(info[2] for _, info in _sources(path))
+        return sum(info[2] for _, info in self.sources(path))
 
     def archive_uncompressed_size(self, path, cancel=None):
-        return sum(size or 0 for size in _listing(Path(path).resolve(strict=True), cancel).values())
+        return sum(size or 0 for size in self.listing(Path(path).resolve(strict=True), cancel).values())
 
     def inspect(self, cfg, path, destination, cancel=None):
         path, destination = Path(path).resolve(strict=True), Path(destination).resolve()
-        sources = _sources(path)
-        entries = _listing(path, cancel)
+        sources = self.sources(path)
+        entries = self.listing(path, cancel)
         names = {_fold(name) for name in cfg["launcher"]["candidate_executables"]}
         names.update(_fold(Path(item["path"]).name) for item in cfg["setup"]["required_roles"] if item.get("sha256"))
         selected = {name for name, size in entries.items() if size is not None and _fold(Path(name).name) in names}
         if (len(selected) > source_inspection.MAX_CANDIDATES
                 or sum(entries[name] for name in selected) > source_inspection.MAX_HASH_BYTES):
             raise InnoError("installer_candidate_limit", "The installer contains too many or too large executable candidates.")
-        _extract(path, destination, entries, cancel, selected)
-        if _sources(path) != sources:
+        self.extract_entries(path, destination, entries, cancel, selected)
+        if self.sources(path) != sources:
             raise InnoError("source_changed", "The installer changed while its executable files were being inspected.")
         result = source_inspection.inspect_folder(cfg, destination, cancel, archive_entries=entries)
         result["source"]["verification"] = "executable_hashes_and_archive_listing"
@@ -240,17 +240,17 @@ class InnoAdapter:
     def extract(self, path, destination, cancel=None, progress=None):
         path, destination = Path(path).resolve(strict=True), Path(destination).resolve()
         digest = self.archive_digest(path, cancel)
-        entries = _listing(path, cancel)
+        entries = self.listing(path, cancel)
         total = sum(size or 0 for size in entries.values())
         required = self.source_size(path) + total + install_jobs.SAFETY_RESERVE_BYTES
         install_jobs.disk_space(destination.parent, required, "extracting")
-        with tempfile.TemporaryDirectory(prefix="inno-input-", dir=destination.parent) as temporary:
+        with tempfile.TemporaryDirectory(prefix="installer-input-", dir=destination.parent) as temporary:
             snapshot = Path(temporary) / path.name
-            if _fingerprint(path, cancel, Path(temporary)) != digest:
+            if _fingerprint(path, cancel, Path(temporary), self.sources) != digest:
                 raise InnoError("source_changed", "The installer changed before extraction.")
-            if _listing(snapshot, cancel) != entries:
+            if self.listing(snapshot, cancel) != entries:
                 raise InnoError("source_changed", "The installer listing changed before extraction.")
-            _extract(snapshot, destination, entries, cancel, progress=progress)
+            self.extract_entries(snapshot, destination, entries, cancel, progress=progress)
             try:
                 recipe = next((item for item in self.installers if item["sha256"].lower() == digest), None)
                 if recipe:
@@ -270,3 +270,9 @@ class InnoAdapter:
             except BaseException:
                 shutil.rmtree(destination)
                 raise
+
+
+class InnoAdapter(InstallerAdapter):
+    sources = staticmethod(_sources)
+    listing = staticmethod(_listing)
+    extract_entries = staticmethod(_extract)

@@ -34,11 +34,13 @@ jobs:
           path: |
             build/toolkit-dependencies
             build/toolkit/rust
+            build/toolkit/extractors
+            build/toolkit/source-archives
             ~/.cargo/registry
             ~/.cargo/git
-          key: toolkit-arm64-macos14-${{ hashFiles('cmake/Dependencies.cmake', 'dx/CMakeLists.txt', 'graphics/d3d8-wgpu/**', 'desktop/library/Cargo.lock', 'desktop/library/Cargo.toml', 'tools/build_d3d8_wgpu.py') }}-${{ github.sha }}
+          key: toolkit-arm64-macos14-${{ hashFiles('cmake/Dependencies.cmake', 'dx/CMakeLists.txt', 'graphics/d3d8-wgpu/**', 'desktop/library/Cargo.lock', 'desktop/library/Cargo.toml', 'tools/build_d3d8_wgpu.py', 'tools/extractors/**', 'third_party/unshield/**') }}-${{ github.sha }}
           restore-keys: |
-            toolkit-arm64-macos14-${{ hashFiles('cmake/Dependencies.cmake', 'dx/CMakeLists.txt', 'graphics/d3d8-wgpu/**', 'desktop/library/Cargo.lock', 'desktop/library/Cargo.toml', 'tools/build_d3d8_wgpu.py') }}-
+            toolkit-arm64-macos14-${{ hashFiles('cmake/Dependencies.cmake', 'dx/CMakeLists.txt', 'graphics/d3d8-wgpu/**', 'desktop/library/Cargo.lock', 'desktop/library/Cargo.toml', 'tools/build_d3d8_wgpu.py', 'tools/extractors/**', 'third_party/unshield/**') }}-
             toolkit-arm64-macos14-
       - name: Prepare pinned standalone Python
         run: |
@@ -64,6 +66,8 @@ jobs:
           "$resources/dependencies/bin/recomp-translate" --help
           "$resources/python/bin/cmake" --version
           "$resources/python/bin/ninja" --version
+          "$resources/python/bin/innoextract" --version
+          "$resources/python/bin/python3" -c 'import sys; sys.path.insert(0, sys.argv[1]); import unshield_adapter; unshield_adapter.library()' "$resources/kit/tools"
           "$resources/python/bin/python3" "$resources/kit/tools/build.py" --game stub --stub --target app --build-root "$RUNNER_TEMP/relocated-build"
           codesign --verify --deep --strict "$RUNNER_TEMP/Relocated Toolkit/Recomp Toolkit.app"
       - name: Upload portable application
@@ -81,6 +85,8 @@ jobs:
           path: |
             build/toolkit-dependencies
             build/toolkit/rust
+            build/toolkit/extractors
+            build/toolkit/source-archives
             ~/.cargo/registry
             ~/.cargo/git
           key: ${{ steps.cache.outputs.cache-primary-key }}
