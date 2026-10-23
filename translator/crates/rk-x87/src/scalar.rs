@@ -932,13 +932,14 @@ impl Scalar {
                         events.extend(self.flush());
                         let value = helper("fscale", vec![st(0), st(1)]);
                         self.set(0, helper("fx87_exact", vec![env("sw"), value]), &mut events, None, None, None, false);
+                        self.status_dirty = true;
                     }
                     X87Eager::Fpatan => {
                         events.extend(self.flush());
                         let value = helper("fx87_exact", vec![env("sw"), helper("atan2", vec![st(1), st(0)])]);
                         self.set(1, value, &mut events, None, None, None, false);
-                        events.push(Event::Evaluate(helper("fdrop", vec![Expr::Cpu])));
-                        self.move_top(1);
+                        self.drop_slot(&mut events, true);
+                        self.status_dirty = true;
                     }
                     X87Eager::Fyl2x | X87Eager::Fyl2xp1 => {
                         events.extend(self.flush());
@@ -949,8 +950,8 @@ impl Scalar {
                         }
                         let value = helper("fx87_exact", vec![env("sw"), value]);
                         self.set(1, value, &mut events, None, None, None, false);
-                        events.push(Event::Evaluate(helper("fdrop", vec![Expr::Cpu])));
-                        self.move_top(1);
+                        self.drop_slot(&mut events, true);
+                        self.status_dirty = true;
                     }
                     X87Eager::Xtract => {
                         self.fold_pending(&mut events);
