@@ -13,7 +13,7 @@ guest_root = 'C:\4x4 Evolution 2'
 
 [setup]
 supported_version = "PC 1.00.139"
-source_notes = "Choose the game folder containing 4x42.exe and its matching tridx8.dll and tridx8tl.dll files."
+source_notes = "Choose an installed game folder, or Setup.exe/data1.cab from the installation disc."
 
 [translate]
 code_map = "metadata"

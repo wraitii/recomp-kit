@@ -1,6 +1,8 @@
 import json
+import hashlib
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -9,6 +11,44 @@ from sign_macos import sign_bundle
 from build import rust_translator
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def bundle_extractors(resources, build_root):
+    build = Path(build_root) / "toolkit/extractors"
+    tools = [(build / "install/bin/innoextract", resources / "python/bin/innoextract"),
+             (build / "unshield/lib/libunshield.dylib", resources / "python/bin/libunshield.dylib")]
+    for source, target in tools:
+        if not source.is_file():
+            raise ValueError(f"Missing source-built extractor: {source}. Build with --target extractors first.")
+        shutil.copy2(source, target)
+        subprocess.run(["lipo", str(target), "-verify_arch", "arm64"], check=True)
+        commands = subprocess.check_output(["otool", "-l", str(target)], text=True)
+        versions = re.findall(r"\bminos\s+(\d+)\.(\d+)", commands)
+        versions += re.findall(r"cmd LC_VERSION_MIN_MACOSX\s+cmdsize \d+\s+version (\d+)\.(\d+)", commands)
+        if any(tuple(map(int, version)) > (14, 0) for version in versions):
+            raise ValueError(f"Extractor requires newer than macOS 14: {source}")
+        linked = subprocess.check_output(["otool", "-L", str(target)], text=True).splitlines()
+        for row in linked[2 if target.suffix == ".dylib" else 1:]:
+            dependency = row.strip().split(" (compatibility version", 1)[0]
+            if not dependency.startswith(("/usr/lib/", "/System/Library/")):
+                raise ValueError(f"Extractor has an unbundled dependency: {dependency} in {source}")
+        if target.suffix == ".dylib":
+            subprocess.run(["install_name_tool", "-id", "@loader_path/" + target.name, str(target)], check=True)
+    sources = build / "sources"
+    for name, files in (
+            ("innoextract", [sources / "innoextract/LICENSE"]),
+            ("boost", [sources / "boost/LICENSE_1_0.txt"]),
+            ("xz", [sources / "xz/COPYING", sources / "xz/COPYING.0BSD"]),
+            ("unshield", [ROOT / "third_party/unshield/LICENSE", ROOT / "third_party/unshield/lib/md5/md5c.c"])):
+        destination = resources / "licenses/extractors" / name
+        destination.mkdir(parents=True, exist_ok=True)
+        for source in files:
+            shutil.copy2(source, destination / source.name)
+    return {"macosMinimum": "14.0", "innoextract": "1.9", "boost": "1.82.0", "xz": "5.8.1",
+            "unshield": {"version": "1.6.2", "source": "https://github.com/twogood/unshield/tree/1.6.2",
+                         "sourceSha256": "a937ef596ad94d16e7ed2c8553ad7be305798dcdcfd65ae60210b1e54ab51a2f"},
+            "inputs": {target.relative_to(resources).as_posix(): hashlib.sha256(source.read_bytes()).hexdigest()
+                       for source, target in tools}}
 
 
 def package(bundle, build_root, python_root):
@@ -104,6 +144,8 @@ def package(bundle, build_root, python_root):
     (dependencies / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     for path in python.rglob("__pycache__"):
         shutil.rmtree(path)
+    extractors = bundle_extractors(resources, build_root)
+    (resources / "extractors.json").write_text(json.dumps(extractors, indent=2) + "\n")
     sign_bundle(bundle)
     archive = bundle.parent / "recomp-toolkit-macos-arm64.zip"
     subprocess.run(["ditto", "-c", "-k", "--keepParent", str(bundle), str(archive)], check=True)

@@ -8,6 +8,16 @@ target_include_directories(recomp_platform PUBLIC ${RECOMP_ROOT})
 if(WIN32)
   # os_win32.cpp resolves host names through Winsock's getaddrinfo.
   target_link_libraries(recomp_platform PUBLIC ws2_32)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
+    execute_process(
+      COMMAND ${CMAKE_CXX_COMPILER} --rtlib=compiler-rt -print-libgcc-file-name
+      OUTPUT_VARIABLE RECOMP_COMPILER_BUILTINS OUTPUT_STRIP_TRAILING_WHITESPACE
+      COMMAND_ERROR_IS_FATAL ANY)
+    if(NOT EXISTS "${RECOMP_COMPILER_BUILTINS}")
+      message(FATAL_ERROR "Clang compiler runtime is missing: ${RECOMP_COMPILER_BUILTINS}")
+    endif()
+    target_link_libraries(recomp_platform PUBLIC "${RECOMP_COMPILER_BUILTINS}")
+  endif()
 endif()
 if(APPLE)
   target_link_libraries(recomp_platform PUBLIC "-framework CoreFoundation")

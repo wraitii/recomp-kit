@@ -161,23 +161,26 @@ function renderInspection(result) {
   if (candidates.length > 1) { inspectionReady = false; candidateCanInstall = false; }
   const updateResult = (candidate) => {
     const ready = Boolean(result?.scanComplete && candidate?.installable);
-    const media = ["inno", "unsupported_inno", "iso9660", "cabinet", "installshield_cab", "cue", "raw_cd"].includes(sourceKind);
+    const media = ["inno", "installshield", "unsupported_inno", "iso9660", "cabinet", "installshield_cab", "cue", "raw_cd", "media_hint", "installer_payload"].includes(sourceKind);
     let title = "This copy isn’t ready to install";
     let help = `Choose a complete game folder containing ${selected.executable}, or prepare the required files using a checklist.`;
     if (ready) {
       title = "Your copy is supported";
-      help = sourceKind === "inno"
+      help = ["inno", "installshield"].includes(sourceKind)
         ? "Executable version verified. Game data will be extracted and checked during installation."
         : "Version verified. Next, review the install location and build tools.";
     } else if (candidates.length > 1 && !candidate) {
       title = "Choose a copy to use";
       help = "Multiple copies found. Select one to check.";
-    } else if (sourceKind === "inno") {
+    } else if (["inno", "installshield"].includes(sourceKind)) {
       title = "This installer needs attention";
       help = result.diagnostics?.[0]?.message || `The extracted files do not match the supported version of ${selected.title || selected.id}.`;
     } else if (media) {
       title = sourceKind.includes("inno") ? "This installer can’t be imported yet" : "This media can’t be imported yet";
-      help = `Install or extract it outside this app, then choose the folder containing ${selected.executable}. Or collect the files using a preparation checklist.`;
+      help = result.diagnostics?.[0]?.message || `Extract it, then choose the folder containing ${selected.executable}.`;
+    } else if (result.diagnostics?.some((item) => item.code === "installer_selection_required")) {
+      title = "Choose an installer";
+      help = "Multiple installers found. Select one below to check.";
     } else if (!candidates.length && sourceKind === "folder") {
       title = "No game found here";
       help = `${result.scanComplete ? "" : "The search stopped before all files were checked. "}Choose the installed game folder containing ${selected.executable}, or select that executable directly.`;
@@ -255,6 +258,30 @@ function renderInspection(result) {
   guidance.id = "preparation-guidance";
   target.append(guidance);
   renderPreparation(chosen);
+  if (!candidates.length) {
+    for (const diagnostic of result?.diagnostics || []) {
+      for (const path of diagnostic.details?.installers || []) {
+        const button = document.createElement("button");
+        button.textContent = path;
+        button.onclick = () => attempt(() => inspectSource(path));
+        guidance.append(button);
+      }
+      for (const instruction of diagnostic.recovery || []) {
+        const note = document.createElement("p");
+        note.textContent = instruction;
+        guidance.append(note);
+      }
+      for (const tool of diagnostic.details?.suggestedTools || []) {
+        const row = document.createElement("p");
+        const link = document.createElement("a");
+        link.textContent = `Open ${tool.label} ↗`;
+        link.href = tool.url;
+        link.onclick = (event) => { event.preventDefault(); attempt(() => backend.open(tool.url)); };
+        row.append(link);
+        guidance.append(row);
+      }
+    }
+  }
   const diagnostics = result?.diagnostics || [];
   if (diagnostics.length) {
     const details = document.createElement("details");
@@ -297,12 +324,14 @@ async function inspectSource(path) {
   try {
     const result = await backend.query({ action: "inspect", game: selected.id, source });
     if (revision !== inspectionRevision || selectedGame !== selected?.id || source !== path) return null;
+    inspecting = false;
+    source = result.source?.path || source;
     sourceKind = result.source?.kind || "";
     renderInspection(result);
     element("selected-source").textContent = `Selected: ${source}`;
     element("selected-source").hidden = false;
     if (inspectionReady && candidateCanInstall && candidateId) void attempt(reviewInstallation);
-    else { inspecting = false; step(4); }
+    else step(4);
     return result;
   } catch (error) {
     if (revision !== inspectionRevision || selectedGame !== selected?.id) return null;
@@ -432,7 +461,7 @@ async function checkRequirements() {
   element("recheck").hidden = false;
   element("build-requirements").hidden = true;
   try {
-    const result = await backend.query({ action: "check", needsRust: selected?.needsRust ?? true, needsInnoextract: sourceKind === "inno" });
+    const result = await backend.query({ action: "check", needsRust: selected?.needsRust ?? true, needsInnoextract: sourceKind === "inno", needsUnshield: sourceKind === "installshield" });
     if (revision !== checkRevision) return;
     element("check-status").textContent = result.ready ? "All requirements are installed." : "Install the missing tools below, then choose Check again.";
     for (const check of result.checks) {
@@ -514,7 +543,7 @@ async function retrySavedJob(job) {
   let checked;
   try {
     checked = await backend.query({ action: "check", needsRust: selected?.needsRust ?? true,
-      needsInnoextract: sourceKind === "inno" });
+      needsInnoextract: sourceKind === "inno", needsUnshield: sourceKind === "installshield" });
   } finally {
     checking = false;
     lock(false);
@@ -722,6 +751,7 @@ function close() {
 element("installer").addEventListener("cancel", (event) => { event.preventDefault(); close(); });
 element("close").onclick = close;
 element("refresh").onclick = () => attempt(refresh);
+element("report-issues").onclick = () => attempt(() => backend.open("https://github.com/wraitii/recomp-toolkit/issues"));
 element("recheck").onclick = () => attempt(checkRequirements);
 async function reviewInstallation() {
   step(0);
@@ -740,13 +770,13 @@ async function updateSpaceEstimate() {
   }
   element("space-summary").textContent = "Checking available space…";
   lock(false);
-  if (!["folder", "executable", "zip", "inno"].includes(sourceKind)) {
+  if (!["folder", "executable", "zip", "inno", "installshield"].includes(sourceKind)) {
     element("space-summary").textContent = "Choose an installed folder, executable, ZIP or supported installer to estimate space.";
     lock(false);
     return;
   }
   try {
-    const preflightSource = ["zip", "inno"].includes(sourceKind) ? source : candidateContentRoot || source;
+    const preflightSource = ["zip", "inno", "installshield"].includes(sourceKind) ? source : candidateContentRoot || source;
     const estimate = await backend.query({ action: "preflight", game: selected.id, source: preflightSource, sourceKind, destination });
     if (revision !== preflightRevision || currentScreen !== 0) return;
     const installedBytes = estimate.source.bytes + 40_000_000 + 10 * candidateExecutableBytes;

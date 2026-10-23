@@ -9,6 +9,7 @@ from pathlib import Path
 import platform
 import plistlib
 import queue
+import re
 import time
 import shutil
 import shlex
@@ -31,6 +32,7 @@ from source_inspection import (MAX_DISCOVERY_CANDIDATES, MAX_DISCOVERY_ENTRIES,
 import zip_adapter
 from zip_adapter import ZipError
 from inno_adapter import InnoAdapter, InnoError
+from unshield_adapter import UnshieldAdapter, library as unshield_library
 
 CANCEL_FILE = None
 KIT = Path(__file__).resolve().parents[1]
@@ -894,7 +896,7 @@ def job_log(request, storage):
                     "log": expected_log}
 
 
-def prerequisites(needs_rust, needs_innoextract=False):
+def prerequisites(needs_rust, needs_innoextract=False, needs_unshield=False):
     checks = []
     bundled_dependencies = (KIT.parent / "dependencies/manifest.json").is_file()
     brew = shutil.which("brew")
@@ -926,6 +928,15 @@ def prerequisites(needs_rust, needs_innoextract=False):
                        "detail": "Installed" if translator.is_file() else "Bundled translator is missing",
                        "help": "Reinstall Recomp Toolkit to restore its bundled translator.",
                        "command": "", "url": ""})
+    if needs_unshield:
+        try:
+            unshield_library()
+            checks.append({"label": "InstallShield extraction", "ok": True, "detail": "Installed",
+                           "help": "", "command": "", "url": ""})
+        except InnoError as error:
+            checks.append({"label": "InstallShield extraction", "ok": False, "detail": str(error),
+                           "help": "Reinstall Recomp Toolkit or install libunshield, then check again.",
+                           "command": "", "url": "https://github.com/twogood/unshield"})
     if needs_innoextract:
         tools += [("innoextract", "GOG installer extraction", "https://constexpr.org/innoextract/")]
     if os.name != "nt" and not bundled_dependencies:
@@ -993,7 +1004,45 @@ def prerequisites(needs_rust, needs_innoextract=False):
 
 
 def archive_adapter(cfg, source_kind):
-    return InnoAdapter(cfg["setup"]["installers"]) if source_kind == "inno" else zip_adapter
+    if source_kind == "inno":
+        return InnoAdapter(cfg["setup"]["installers"])
+    if source_kind == "installshield":
+        return UnshieldAdapter(cfg)
+    return zip_adapter
+
+
+def media_guidance(source, kind):
+    if source.suffix.casefold() == ".bin":
+        stem = re.sub(r"-\d+[a-z]?$", "", source.stem, flags=re.IGNORECASE)
+        with os.scandir(source.parent) as siblings:
+            for index, entry in enumerate(siblings):
+                check_cancel()
+                if index >= 4096:
+                    break
+                if (entry.name.casefold() == (stem + ".exe").casefold() and not entry.is_symlink()
+                        and entry.is_file(follow_symlinks=False)
+                        and probe_bytes(entry.path, check_cancel)["kind"] in ("inno", "unsupported_inno")):
+                    return _source_diagnostic(source, "installer_payload_selected",
+                        "This BIN appears to be a GOG installer payload. Choose its matching setup EXE.",
+                        [f"Choose {entry.name} and keep its BIN files beside it."],
+                        {"setupExecutable": entry.name}, "installer_payload")
+    if kind in ("iso9660", "raw_cd", "cue", "media_hint"):
+        message = {
+            "iso9660": "This is an ISO disc image. Extract or mount it before choosing the game files.",
+            "raw_cd": "This is raw CD sector data. Use its matching CUE file to extract the data track.",
+            "cue": "This CUE describes a disc image. Keep its BIN files beside it when extracting.",
+            "media_hint": "The filename suggests a disc image or installer payload, but its format could not be verified.",
+        }[kind]
+        recovery = ["Extract ISO images with 7-Zip. On macOS, you can also try opening the ISO in Finder."]
+        tools = [{"label": "7-Zip", "url": "https://www.7-zip.org/download.html"}]
+        if kind in ("raw_cd", "cue", "media_hint"):
+            recovery.append("For BIN/CUE disc images, convert the data track to ISO with bchunk, then extract the ISO. A BIN extension alone does not identify a disc image.")
+            tools.append({"label": "bchunk", "url": "https://github.com/hessu/bchunk"})
+        recovery.append("Then choose the extracted game folder, or Setup.exe/data1.cab if the disc contains an InstallShield installer.")
+        result = _source_diagnostic(source, "unsupported_media", message, recovery,
+                                    {"suggestedTools": tools, "formatVerified": kind != "media_hint"}, kind)
+        return result
+    return None
 
 
 def inspect_source(cfg, source):
@@ -1004,26 +1053,36 @@ def inspect_source(cfg, source):
         raise SourceError("source_unavailable", "The selected source is missing or unreadable.",
                           ["Check the source path and try again."], str(source), {"error": str(error)}) from error
     if source.is_dir():
-        result = inspect_folder(cfg, source, check_cancel)
+        result = inspect_folder(cfg, source, check_cancel, include_installers=True)
+        installers = result["source"].pop("installers", [])
+        if len(installers) == 1:
+            return inspect_source(cfg, Path(installers[0]))
+        if len(installers) > 1:
+            return _source_diagnostic(source, "installer_selection_required",
+                "More than one installer was found. Choose the installer to inspect.",
+                ["Choose an installer below, or select its setup file directly."],
+                {"installers": installers}, "folder")
         result["source"]["kind"] = "folder"
         return result
     if not source.is_file():
         raise SourceError("unsupported_source", "Choose a game folder, supported archive, or game installer.",
                           ["Choose an installed game folder or a supported source file."], str(source))
     probe = probe_bytes(source, check_cancel)
+    if probe["kind"] == "installshield_cab":
+        probe["kind"] = "installshield"
     if probe["kind"] == "pe":
         result = inspect_folder(cfg, source, check_cancel, selected_executable=source)
         result["source"]["kind"] = "executable"
         result["source"]["probe"] = probe["evidence"]
         return _add_sibling_facts(result, source)
-    if probe["kind"] in ("zip", "inno"):
+    if probe["kind"] in ("zip", "inno", "installshield"):
         kind = probe["kind"]
         adapter = archive_adapter(cfg, kind)
         try:
             digest = adapter.archive_digest(source, check_cancel)
             with tempfile.TemporaryDirectory(prefix="recomp-toolkit-inspect-") as temporary:
                 extracted = Path(temporary) / "content"
-                if kind == "inno":
+                if kind in ("inno", "installshield"):
                     result = adapter.inspect(cfg, source, extracted, check_cancel)
                 else:
                     adapter.extract(source, extracted, check_cancel)
@@ -1046,6 +1105,9 @@ def inspect_source(cfg, source):
         except (OSError, zipfile.BadZipFile, RuntimeError) as error:
             return _source_diagnostic(source, "unreadable_archive", "The archive could not be read safely.",
                                       ["Check the archive and try again."], {"error": str(error)}, kind)
+    guidance = media_guidance(source, probe["kind"])
+    if guidance:
+        return _add_sibling_facts(guidance, source)
     messages = {
         "zip": ("unsupported_archive", "The ZIP did not contain a supported game copy.",
                 ["Choose a complete installed game folder or a ZIP containing the game files."]),
@@ -1053,16 +1115,8 @@ def inspect_source(cfg, source):
                              ["Choose an installed game folder or a supported installer version."]),
         "probe_limit": ("source_probe_limit", "The source signature could not be verified within the inspection limit.",
                         ["Choose an installed game folder or a smaller source file."]),
-        "iso9660": ("unsupported_media", "An ISO 9660 disc image was recognized, but no verified import adapter is available.",
-                    ["Choose an installed game folder."]),
         "cabinet": ("unsupported_media", "A Cabinet archive was recognized, but no verified import adapter is available.",
                     ["Choose an installed game folder."]),
-        "installshield_cab": ("unsupported_media", "An InstallShield Cabinet archive was recognized, but no verified import adapter is available.",
-                               ["Choose an installed game folder."]),
-        "cue": ("unsupported_media", "A CUE disc layout was recognized, but no verified import adapter is available.",
-                ["Choose an installed game folder."]),
-        "raw_cd": ("unsupported_media", "Raw CD sector data was recognized, but no verified import adapter is available.",
-                   ["Choose an installed game folder."]),
         "unreadable": ("unreadable_source", "The selected source could not be read.",
                        ["Check the source file and try again."]),
         "unknown": ("unsupported_source", "The selected file is not a recognized game executable or supported archive.",
@@ -1187,6 +1241,7 @@ def prepare_install(request, storage):
     root = Path(request.get("destination") or previous_root).expanduser().resolve()
     cfg = game_config.load(directory, root)
     inspection = inspect_source(cfg, source_path)
+    source_path = Path(inspection["source"]["path"])
     source_kind = inspection["source"]["kind"]
     explicit_source = source_path if source_kind == "executable" else None
     selected = select_candidate(inspection, request.get("candidateId"), explicit_source)
@@ -1214,7 +1269,7 @@ def prepare_install(request, storage):
                               "The selected source overlaps the library destination or its cleanup folders.",
                               ["Choose a complete game folder outside the library destination."],
                               str(source_root), {"destination": str(root)})
-    elif source_kind in ("zip", "inno"):
+    elif source_kind in ("zip", "inno", "installshield"):
         if source_path.is_relative_to(root):
             raise SourceError("source_destination_overlap",
                               "The selected archive overlaps the library destination.",
@@ -1270,7 +1325,7 @@ def install(request, storage, prepared=None):
     exclude_paths = prepared.get("excludePaths", [])
     data = root / "original"
     emit("stage", stage="checking", message="Checking build prerequisites")
-    checks = prerequisites(True, source_kind == "inno")
+    checks = prerequisites(True, source_kind == "inno", source_kind == "installshield")
     if not checks["ready"]:
         raise ValueError("Missing prerequisites: " + ", ".join(c["label"] for c in checks["checks"] if not c["ok"]))
     check_cancel()
@@ -1279,12 +1334,12 @@ def install(request, storage, prepared=None):
     recipe_facts = recipe(directory)
     emit("stage", stage="fingerprinting", message="Reading your game files")
     source_identity = ({"kind": source_kind, "sha256": adapter.archive_digest(source_path, check_cancel)}
-                       if source_kind in ("zip", "inno") else
+                       if source_kind in ("zip", "inno", "installshield") else
                        {"kind": "folder", **install_jobs.payload_identity(selected["contentRoot"], check_cancel,
                                                                                 exclude_paths=exclude_paths,
                                                                                 progress=file_progress())})
-    archive_bytes = adapter.archive_uncompressed_size(source_path, check_cancel) if source_kind in ("zip", "inno") else 0
-    installer_bytes = adapter.source_size(source_path) if source_kind == "inno" else 0
+    archive_bytes = adapter.archive_uncompressed_size(source_path, check_cancel) if source_kind in ("zip", "inno", "installshield") else 0
+    installer_bytes = adapter.source_size(source_path) if source_kind in ("inno", "installshield") else 0
     copy_estimate = source_identity.get("bytes", archive_bytes)
     resumed = bool(job_identifier)
     if job_identifier:
@@ -1400,7 +1455,7 @@ def install(request, storage, prepared=None):
         else:
             stage = "validating"
             install_jobs.update_job(job_paths, journal, stage)
-        if source_kind in ("zip", "inno") and not reusable_copy:
+        if source_kind in ("zip", "inno", "installshield") and not reusable_copy:
             stage = "extracting"
             emit("stage", stage=stage, message="Extracting the game archive")
             install_jobs.update_job(job_paths, journal, stage)
@@ -1412,7 +1467,7 @@ def install(request, storage, prepared=None):
             extracted = staging / "extracted"
             try:
                 adapter.extract(source_path, extracted, check_cancel,
-                                **({"progress": file_progress(archive_bytes)} if source_kind == "inno" else {}))
+                                **({"progress": file_progress(archive_bytes)} if source_kind in ("inno", "installshield") else {}))
             except (ZipError, InnoError) as error:
                 raise SourceError(error.code, str(error), ["Check the archive and inspect it again."], str(source_path)) from error
             extracted_result = inspect_folder(cfg, extracted, check_cancel)
@@ -1425,7 +1480,7 @@ def install(request, storage, prepared=None):
             if adapter.archive_digest(source_path, check_cancel) != source_identity["sha256"]:
                 raise SourceError("source_changed", "The archive changed while its contents were being extracted.",
                                   ["Inspect the archive again and retry the import."], str(source_path))
-        elif source_kind not in ("zip", "inno"):
+        elif source_kind not in ("zip", "inno", "installshield"):
             source = Path(selected["contentRoot"])
             current = inspect_source(cfg, source_path)
             selected_now = select_candidate(current, selected["id"], explicit_source)
@@ -1469,7 +1524,7 @@ def install(request, storage, prepared=None):
         if copied["sha256"] != source_facts["sha256"]:
             raise SourceError("copy_validation_failed", "The staged game copy differs from its source.",
                               ["Check storage space and source permissions."], str(source))
-        if source_kind in ("zip", "inno") and not reusable_copy:
+        if source_kind in ("zip", "inno", "installshield") and not reusable_copy:
             shutil.rmtree(staging / "extracted")
         validate_game(staged_data, executable_relative, cfg["game"]["sha256"], required)
         for module in cfg["aux_modules"]:
@@ -1558,7 +1613,7 @@ def install(request, storage, prepared=None):
         check_cancel()
         current_recipe = recipe(directory)
         current_source = ({"kind": source_kind, "sha256": adapter.archive_digest(source_path, check_cancel)}
-                          if source_kind in ("zip", "inno") else
+                          if source_kind in ("zip", "inno", "installshield") else
                           {"kind": "folder", **install_jobs.payload_identity(selected["contentRoot"], check_cancel,
                                                                                exclude_paths=exclude_paths)})
         if current_recipe.get("sha256") != recipe_facts.get("sha256") or current_source != source_identity:
@@ -1805,7 +1860,7 @@ def preflight_request(request):
     if source_kind == "zip":
         source_bytes = zip_adapter.archive_uncompressed_size(source, check_cancel)
         destination_copy_bytes = source_bytes * 2
-    elif source_kind == "inno":
+    elif source_kind in ("inno", "installshield"):
         validate_inspection_request(request)
         directory = KIT / "games" / request["game"]
         if directory.parent != KIT / "games" or not (directory / "game.toml").is_file():
@@ -1961,7 +2016,7 @@ def main():
         elif action == "job_log":
             result = job_log(request, storage)
         elif action == "check":
-            result = prerequisites(request.get("needsRust", True), request.get("needsInnoextract", False))
+            result = prerequisites(request.get("needsRust", True), request.get("needsInnoextract", False), request.get("needsUnshield", False))
         elif action == "install":
             emit("stage", stage="checking", message="Checking your copy and install location")
             if request.get("jobId"):

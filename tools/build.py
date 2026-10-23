@@ -31,6 +31,7 @@ import web_launcher  # noqa: E402
 # What each --target builds. `plugins` is every mod plugin the game ships.
 TARGETS = {
     "toolkit": [],
+    "extractors": [],
     "app": ["recomp_app"],
     "smoke": ["recomp_smoke"],
     "headless": ["recomp_headless"],
@@ -824,6 +825,10 @@ def main():
         status = subprocess.call([sys.executable, str(ROOT / "tools/check_flag_state.py")])
         if status:
             sys.exit(status)
+    if args.target == "extractors":
+        from build_library import build_extractors
+        build_extractors(args.build_root, args.config, innoextract=True)
+        return
     if args.target == "toolkit":
         from build_library import build as build_library
         build_library(args.build_root, args.config, args.package_toolkit, args.toolkit_python_root)

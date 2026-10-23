@@ -12,6 +12,10 @@
 #include <string.h>
 #include <vector>
 
+extern "C" double host_display_refresh_rate() {
+    return 0;
+}
+
 static int g_checks = 0, g_failures = 0;
 #define CHECK(x)                                                                                   \
     do {                                                                                           \
