@@ -443,11 +443,10 @@ void write_caps(uint32_t addr) {
 #endif
 }
 
-// The DirectDraw table holds the front end's 8/16-bit modes, so filtering it
-// for 32 bits yields nothing. The D3D8 backend can create and present any
-// 32-bit target, so advertise the virtual desktop plus the standard 4:3 steps;
-// 0 is the default refresh. The game picks its own fullscreen size and only
-// needs a non-empty mode list to consider the adapter compatible.
+// The D3D8 backend can create and present any 32-bit target, so advertise the
+// virtual desktop, standard 4:3 steps and every 32-bit mode exposed through
+// GDI. The shared modes keep a game's setup menu and renderer from disagreeing.
+// 0 is the default refresh.
 //
 // DIVERGENCE(original): the reference adapter enumerated the real hardware's
 // modes. These host-presentable sizes are synthesized; the host seam does not
@@ -477,6 +476,17 @@ std::vector<DisplayMode> display_modes() {
     for (const auto &m : kStandard)
         if (m[0] != dw || m[1] != dh)
             result.push_back({m[0], m[1], 0, D3DFMT_X8R8G8B8});
+    for (uint32_t i = 0;; ++i) {
+        uint32_t w, h, bpp;
+        if (!ddraw_enum_display_mode(i, &w, &h, &bpp))
+            break;
+        if (bpp != 32)
+            continue;
+        auto present = std::find_if(result.begin(), result.end(),
+                                    [=](const DisplayMode &m) { return m.w == w && m.h == h; });
+        if (present == result.end())
+            result.push_back({w, h, 0, D3DFMT_X8R8G8B8});
+    }
     return result;
 }
 
