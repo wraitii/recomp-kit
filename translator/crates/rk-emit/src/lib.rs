@@ -650,12 +650,10 @@ impl<'a> Emitter<'a> {
         }
         {
             let item = &self.s.blocks[block];
+            let mut commented_addr = None;
             if let Some(insn) = self.ctx.ir.insns.get(item.start as usize) {
-                let _ = writeln!(
-                    self.out,
-                    "// {:08x}: {}",
-                    insn.addr, insn.text
-                );
+                let _ = writeln!(self.out, "// {}", insn.text);
+                commented_addr = Some(insn.addr);
             }
             let block_lines = self.x87_lines(|x87, names| x87.block_lines(self.clone, block as u32, names))?;
             self.write_x87(block_lines);
@@ -663,6 +661,14 @@ impl<'a> Emitter<'a> {
             let mut continues = true;
             for (position, value) in ops.iter().copied().enumerate() {
                 let live = self.plan.live.contains(&value);
+                let addr = self.s.value_addr[value as usize];
+                if (live || self.reload_defs.contains_key(&value)) && commented_addr != Some(addr) {
+                    if let Some(index) = self.ctx.ir.index_of(addr) {
+                        let insn = &self.ctx.ir.insns[index as usize];
+                        let _ = writeln!(self.out, "// {}", insn.text);
+                        commented_addr = Some(addr);
+                    }
+                }
                 if live {
                     if let (
                         Op::Branch { target: branch },
@@ -2317,10 +2323,15 @@ impl<'a> Emitter<'a> {
                 OpCode::IntLess => format!("(({}) < ({}))", a(0)?, a(1)?),
                 OpCode::IntLessEqual => format!("(({}) <= ({}))", a(0)?, a(1)?),
                 OpCode::IntSLess | OpCode::IntSLessEqual => {
-                    let bits = args.first().map_or(32, |arg| self.s.value(*arg).size) * 8;
-                    let sign = if bits >= 64 { format!("0x{:x}ull", 1u64 << 63) } else { format!("0x{:x}u", 1u32 << (bits - 1)) };
+                    let size = args.first().map_or(4, |arg| self.s.value(*arg).size);
                     let op = if code == OpCode::IntSLess { "<" } else { "<=" };
-                    format!("((({}) ^ {sign}) {op} (({}) ^ {sign}))", a(0)?, a(1)?)
+                    if matches!(size, 1 | 2 | 4 | 8) {
+                        let ty = signed_type(size);
+                        format!("(({ty})({}) {op} ({ty})({}))", a(0)?, a(1)?)
+                    } else {
+                        let sign = const_expr(1u64 << (size * 8 - 1), size);
+                        format!("((({}) ^ {sign}) {op} (({}) ^ {sign}))", a(0)?, a(1)?)
+                    }
                 }
                 OpCode::IntLeft | OpCode::IntRight => {
                     let bits = args.first().map_or(32, |arg| self.s.value(*arg).size) * 8;

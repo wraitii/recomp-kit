@@ -1334,7 +1334,7 @@ impl<'a> Recovery<'a> {
 
     fn spans_are_padding(&self, owner: Addr, spans: &[Span]) -> bool {
         if self.mapped_span_at(owner).is_some()
-            || self.seeds.contains_key(&owner)
+            || self.seed_rank.get(&owner).is_some_and(|&rank| rank > RANK_POINTER)
             || self.known_entries.contains(&owner)
         {
             return false;

@@ -77,6 +77,9 @@ pub fn plan_function(cg: &CgFunction, opts: &PlanOptions<'_>) -> Result<PlannedF
     for (&value, keys) in &guard {
         live_publish.entry(value).or_default().extend(keys);
     }
+    for boundary in &ssa.boundaries {
+        live_publish.entry(boundary.at).or_default();
+    }
     let live = live_values(&ssa, Some(&live_publish), &descriptor_roots, &[]);
     let entry_settle = (0..ssa.values.len()).any(|index| {
         let id = index as ValueId;
