@@ -8,15 +8,7 @@ int recomp_is_call_return(uint32_t target)
 
 int recomp_region_enter(X86 *c, uint32_t target)
 {
-    uint32_t lo = 0, hi = recomp_region_count;
-    while (lo < hi) {
-        uint32_t mid = lo + (hi - lo) / 2;
-        if (recomp_regions[mid].start <= target) lo = mid + 1; else hi = mid;
-    }
-    if (lo == 0 || target >= recomp_regions[lo - 1].end) return 0;
-    discovery_note("region", target, c->eip);
-    recomp_regions[lo - 1].fn(c, target);
-    return 1;
+    return recomp_region_call(c, recomp_regions, recomp_region_count, target);
 }
 
 const char *recomp_profile_name(uint32_t i) { return i < recomp_func_count ? profile_names[i] : 0; }
@@ -43,41 +35,19 @@ uint64_t recomp_override_hash(void)
     return h;
 }
 
-/* Indirect calls repeat the same few targets, so a direct-mapped cache sits
- * in front of the binary search. An entry is (target << 32) | (index + 2),
- * written as one word, so a racing reader sees an old or a new entry. */
-static uint64_t recomp_lookup_cache[1u << 14];
-
-static int32_t recomp_lookup_slow(uint32_t target);
-
 static int32_t recomp_lookup(uint32_t target)
 {
-    uint32_t slot = (uint32_t)(target * 2654435761u) >> 18;
-    uint64_t e = __atomic_load_n(&recomp_lookup_cache[slot], __ATOMIC_ACQUIRE);
-    if ((uint32_t)(e >> 32) == target && (uint32_t)e)
-        return (int32_t)((uint32_t)e - 2u); /* 1 caches "not a function" (a shim) */
-    int32_t i = recomp_lookup_slow(target);
-    __atomic_store_n(&recomp_lookup_cache[slot],
-                     ((uint64_t)target << 32) | (uint64_t)(uint32_t)(i + 2), __ATOMIC_RELEASE);
-    return i;
-}
-
-static int32_t recomp_lookup_slow(uint32_t target)
-{
-    uint32_t lo = 0, hi = recomp_func_count;
-    while (lo < hi) {
-        uint32_t mid = lo + (hi - lo) / 2;
-        if (recomp_func_addrs[mid] < target) lo = mid + 1; else hi = mid;
-    }
-    return (lo < recomp_func_count && recomp_func_addrs[lo] == target)
-           ? (int32_t)lo : -1;
+    const RecompDispatchEntry *entry = recomp_dispatch_lookup(&recomp_dispatch, target);
+    return entry ? (int32_t)(entry->metadata & 0x7fffffffu) : -1;
 }
 
 int32_t recomp_index_of(uint32_t addr) { return recomp_lookup(addr); }
 
 int recomp_thunk_target_kind(uint32_t target)
 {
-    if (recomp_lookup(target) >= 0 || recomp_module_lookup(target) >= 0) return 1;
+    if (recomp_lookup(target) >= 0 || recomp_module_lookup(target) >= 0 ||
+        recomp_region_has_target(recomp_regions, recomp_region_count, target) ||
+        recomp_module_region_has_target(target)) return 1;
     return (recomp_is_call_return(target) || recomp_module_is_call_return(target)) ? 2 : 0;
 }
 
@@ -112,7 +82,7 @@ static void recomp_call_inner(X86 *c, uint32_t target)
     uint32_t site = observe_take();
     if (target >= GUEST_SHIM_BASE && target < GUEST_SHIM_END) {
         observe_indirect(site, target, "shim");
-        recomp_shim_call(c, target);
+        if (RECOMP_UNLIKELY(!imports_dispatch(c, target))) recomp_shim_call(c, target);
         return;
     }
     int32_t i = recomp_lookup(target);
@@ -140,7 +110,7 @@ static void recomp_call_inner(X86 *c, uint32_t target)
         return;
     }
     if (target >= GUEST_SHIM_BASE && target < GUEST_SHIM_END) {
-        recomp_shim_call(c, target);
+        if (RECOMP_UNLIKELY(!imports_dispatch(c, target))) recomp_shim_call(c, target);
         return;
     }
     x86_cc_settle(c);
@@ -172,12 +142,9 @@ void recomp_jump(X86 *c, uint32_t target)
         if (recomp_profile_enabled) recomp_profile_pop();
         return;
     }
-    if (recomp_module_lookup(target) >= 0) {
-        recomp_module_jump(c, target);
-        return;
-    }
+    if (recomp_module_call(c, target)) return;
     if (target >= GUEST_SHIM_BASE && target < GUEST_SHIM_END) {
-        recomp_shim_call(c, target);
+        if (RECOMP_UNLIKELY(!imports_dispatch(c, target))) recomp_shim_call(c, target);
         return;
     }
     if (recomp_is_call_return(target) || recomp_module_is_call_return(target)) { c->eip = target; return; }

@@ -287,6 +287,13 @@ pub fn merge(program: &mut Program, discovered: &Discovered) -> Result<()> {
         });
     }
     for (&addr, &(owner, kind)) in &discovered.entries {
+        if !program.entries.contains_key(&addr)
+            && !program.functions.contains_key(&addr)
+            && !program.configured_entries.contains(&addr)
+            && program.functions.get(&owner).is_some_and(|f| f.provisional)
+        {
+            program.region_entries.insert(addr, owner);
+        }
         program.interior.entry(addr).or_insert((owner, kind));
     }
     program.spans = program

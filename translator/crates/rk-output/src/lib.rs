@@ -94,12 +94,23 @@ fn write_file(path: &Path, text: &str) -> Result<()> {
 
 pub fn write(out: &Path, t: &Translation) -> Result<Written> {
     std::fs::create_dir_all(out).map_err(|e| Error::io(out, e))?;
-    let entry_names: Vec<Addr> = t.program.entries.keys().copied().collect();
+    let entry_names: Vec<Addr> = t.program.entries.keys()
+        .filter(|addr| !t.program.region_entries.contains_key(addr)).copied().collect();
     let symbols = symbol_rows(t.settings, t.program, &entry_names)?;
     let module = t.settings.module.as_ref().map(|m| m.key.as_str());
 
     write_file(&out.join("funcs.h"), &funcs_header(&entry_names))?;
-    write_file(&out.join("body.h"), BODY_HEADER)?;
+    let mut body_header = BODY_HEADER.to_string();
+    if let Some(config) = &t.settings.dispatch {
+        if config.shift <= 8 && !entry_names.is_empty() {
+            let base = entry_names[0] >> config.shift << config.shift;
+            let span = (((entry_names.last().unwrap() - base) as u64 >> config.shift) + 1) << config.shift;
+            let prefix = module.map_or("recomp_".to_string(), |key| format!("recomp_{key}_"));
+            let constants = format!("#define RECOMP_DISPATCH_ENTRIES {prefix}dispatch_entries\n#define RECOMP_DISPATCH_BASE 0x{base:08x}u\n#define RECOMP_DISPATCH_SPAN {span}ull\n#define RECOMP_DISPATCH_SHIFT {}u\n#include \"x86.h\"", config.shift);
+            body_header = body_header.replace("#include \"x86.h\"", &constants);
+        }
+    }
+    write_file(&out.join("body.h"), &body_header)?;
     let chunks = partition_chunks(&t.bodies, CHUNK_SOURCE_BUDGET);
     let chunk_count = chunks.len();
     chunks
@@ -112,13 +123,15 @@ pub fn write(out: &Path, t: &Translation) -> Result<Written> {
         write_file(&out.join(name), &text)?;
     }
     let table = match &t.settings.module {
-        Some(m) => table::module_table(&entry_names, &symbols, &t.call_returns, m),
+        Some(m) => table::module_table(&entry_names, &symbols, &t.call_returns, m, t.program, t.settings.dispatch.as_ref())?,
         None => table::main_table(
             &entry_names,
             &symbols,
             &t.call_returns,
             &t.private_masks,
-        ),
+            t.program,
+            t.settings.dispatch.as_ref(),
+        )?,
     };
     write_file(&out.join("table.c"), &table)?;
     write_file(
@@ -219,10 +232,6 @@ next(c);\n}\n");
     }
     if group.iter().any(|b| b.requires.fcom) {
         s.push_str(&t.preludes.float_helpers);
-    }
-    let caches: BTreeSet<&String> = group.iter().flat_map(|b| &b.requires.icaches).collect();
-    for cache in caches {
-        let _ = writeln!(s, "static RecompICache {cache};");
     }
     let declarations: BTreeSet<&Declaration> = group.iter().flat_map(|b| &b.declarations).collect();
     let mut entries = BTreeSet::new();
@@ -337,7 +346,7 @@ fn entry_chunks(
                     s,
                     "#ifndef FN_{addr:08x}\n#define FN_{addr:08x} fn_{addr:08x}\n#define RECOMP_RAW_{addr:08x}\n#endif\n\
                      void FN_{addr:08x}(X86 *c);\n\
-                     void entry_{addr:08x}(X86 *c) {{ RECOMP_ENTER({index}u, FN_{addr:08x}(c)); }}\n"
+                     void entry_{addr:08x}(X86 *c) {{\n#ifndef RECOMP_RAW_{addr:08x}\n    x86_cc_settle(c);\n#endif\n    RECOMP_ENTER({index}u, FN_{addr:08x}(c));\n}}\n"
                 );
             }
             for (_, addr) in &entries {

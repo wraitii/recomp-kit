@@ -180,6 +180,7 @@ pub struct Program {
     pub configured_entries: BTreeSet<Addr>,
     pub entries: BTreeMap<Addr, EntryKind>,
     pub interior_by_function: BTreeMap<Addr, Vec<Addr>>,
+    pub region_entries: BTreeMap<Addr, Addr>,
     pub spans: Vec<(Addr, Addr, Addr)>,
 }
 

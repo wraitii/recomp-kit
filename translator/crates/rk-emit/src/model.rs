@@ -28,7 +28,6 @@ pub struct Requires {
     pub return_fast: bool,
     pub fcom: bool,
     pub seh_call: bool,
-    pub icaches: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug)]

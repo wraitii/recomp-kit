@@ -251,6 +251,7 @@ impl<'a> BodyContext<'a> {
             private_masks: &self.private_masks,
             private_input_arguments: &self.private_input_arguments,
             known_entries: self.known_entries,
+            region_entries: &self.program.region_entries,
             setjmp_targets: self.setjmp_targets,
             private,
         }
@@ -400,6 +401,7 @@ fn build_bodies(
         .functions
         .keys()
         .chain(program.entries.keys())
+        .filter(|addr| !program.region_entries.contains_key(addr))
         .copied()
         .collect();
     let setjmp_targets: BTreeSet<Addr> = program
@@ -788,7 +790,8 @@ fn report(input: &ReportInputs<'_>) -> Result<String> {
         "engine": "rust",
         "module": settings.module.as_ref().map(|m| m.key.as_str()),
         "functions": program.functions.len(),
-        "entry_points": program.entries.len(),
+        "entry_points": written.symbols.len(),
+        "region_entries": program.region_entries.len(),
         "entry_kinds": kinds,
         "body_chunks": written.chunks,
         "entry_chunks": written.entry_chunks,
@@ -1068,7 +1071,7 @@ fn main() -> Result<()> {
         eprintln!(
             "  {} functions, {} entries ({}), {} body chunks, {} entry chunks; {} bodies emitted, {} trapped",
             program.functions.len(),
-            program.entries.len(),
+            written.symbols.len(),
             kinds.join(", "),
             written.chunks,
             written.entry_chunks,

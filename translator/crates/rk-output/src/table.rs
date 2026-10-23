@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use rk_core::contract::Fields;
-use rk_core::settings::Module;
-use rk_core::Addr;
+use rk_core::program::Program;
+use rk_core::settings::{Dispatch, Module};
+use rk_core::{Addr, Error, Result};
 
 use crate::SymbolRow;
 
@@ -54,12 +55,144 @@ fn addr_rows(s: &mut String, addrs: &[Addr]) {
     }
 }
 
+fn region_table(s: &mut String, entry_names: &[Addr], program: &Program, prefix: &str) -> usize {
+    let owners: BTreeSet<Addr> = program.region_entries.values().copied().collect();
+    let mut regions = Vec::new();
+    for owner in owners {
+        let _ = writeln!(s, "void region_{owner:08x}(X86 *, uint32_t);");
+        let index = entry_names.binary_search(&owner).unwrap();
+        for span in &program.functions[&owner].spans {
+            regions.push((span.start, span.end(), owner, index));
+        }
+    }
+    regions.sort_unstable();
+    let mut bits = Vec::new();
+    let mut offsets = Vec::new();
+    for &(start, end, _, _) in &regions {
+        offsets.push(bits.len());
+        let mut bitmap = vec![0u8; ((end - start) as usize + 7) / 8];
+        for (&entry, _) in program.entries.range(start..end) {
+            let offset = (entry - start) as usize;
+            bitmap[offset >> 3] |= 1u8 << (offset & 7);
+        }
+        bits.extend(bitmap);
+    }
+    let _ = writeln!(s, "static const uint8_t {prefix}region_boundaries[] = {{");
+    for group in bits.chunks(32) {
+        for byte in group {
+            let _ = write!(s, "0x{byte:02x},");
+        }
+        s.push('\n');
+    }
+    if bits.is_empty() {
+        s.push_str("0,\n");
+    }
+    let _ = writeln!(s, "}};\nstatic const RecompRegion {prefix}regions[] = {{");
+    for (&(start, end, owner, index), offset) in regions.iter().zip(offsets) {
+        let _ = writeln!(s, "    {{0x{start:08x}u, 0x{end:08x}u, {index}u, region_{owner:08x}, {prefix}region_boundaries + {offset}u}},");
+    }
+    if regions.is_empty() {
+        s.push_str("    {0, 0, 0, 0, 0},\n");
+    }
+    let _ = writeln!(
+        s,
+        "}};\nstatic const uint32_t {prefix}region_count = {};",
+        regions.len()
+    );
+    regions.len()
+}
+
+fn dispatch_table(
+    s: &mut String,
+    addrs: &[Addr],
+    config: Option<&Dispatch>,
+    prefix: &str,
+    local: bool,
+) -> Result<()> {
+    let mut slots = BTreeMap::new();
+    let (base, span, shift, max_probe, count) = if let Some(config) = config {
+        if config.shift > 8 || config.max_probe > 256 {
+            return Err(Error::input(
+                "dispatch shift must be <= 8 and max_probe <= 256",
+            ));
+        }
+        let shift = config.shift;
+        let base = addrs.first().copied().unwrap_or(0) >> shift << shift;
+        let span = addrs
+            .last()
+            .map_or(0u64, |&a| ((a - base) as u64 >> shift) + 1);
+        let count = (span + config.max_probe as u64).max(1);
+        if count > 16 * 1024 * 1024 {
+            return Err(Error::input(
+                "dispatch table exceeds 16 million slots; increase dispatch.shift",
+            ));
+        }
+        for (index, &addr) in addrs.iter().enumerate() {
+            let home = ((addr - base) >> shift) as usize;
+            let mut slot = home;
+            while slots.contains_key(&slot) {
+                slot += 1;
+            }
+            if slot - home > config.max_probe as usize {
+                return Err(Error::input(format!("dispatch target {addr:08x} needs displacement {}, exceeding configured max_probe {}", slot - home, config.max_probe)));
+            }
+            slots.insert(slot, (addr, index));
+        }
+        (base, span << shift, shift, config.max_probe, count as usize)
+    } else {
+        for (index, &addr) in addrs.iter().enumerate() {
+            slots.insert(index, (addr, index));
+        }
+        (0, 0, 0, 0, addrs.len().max(1))
+    };
+    if config.is_some() {
+        let _ = writeln!(s, "RecompDispatchEntry {prefix}dispatch_entries[{count}];");
+        let _ = writeln!(
+            s,
+            "static const RecompDispatchEntry {prefix}dispatch_seeds[] = {{"
+        );
+        for (index, &addr) in addrs.iter().enumerate() {
+            if index >= 0x80000000usize {
+                return Err(Error::input("dispatch index exceeds 31 bits"));
+            }
+            let _ = writeln!(s, "    {{0x{addr:08x}u, {index}u, entry_{addr:08x}}},");
+        }
+    } else {
+        let _ = writeln!(
+            s,
+            "static const RecompDispatchEntry {prefix}dispatch_entries[{count}] = {{"
+        );
+        for (&slot, &(addr, index)) in &slots {
+            let _ = writeln!(
+                s,
+                "    [{slot}] = {{0x{addr:08x}u, {index}u, entry_{addr:08x}}},"
+            );
+        }
+    }
+    if addrs.is_empty() {
+        s.push_str("    {0, 0, 0},\n");
+    }
+    let storage = if local { "static " } else { "" };
+    let _ = writeln!(s, "}};\n{storage}const RecompDispatchTable {prefix}dispatch = {{ {prefix}dispatch_entries, 0x{base:08x}u, {span}ull, {shift}u, {max_probe}u, {count}u }};");
+    if config.is_some() {
+        let constructor = if local {
+            ""
+        } else {
+            "__attribute__((constructor)) "
+        };
+        let _ = writeln!(s, "{constructor}static void {prefix}dispatch_startup(void)\n{{\n    recomp_dispatch_init({prefix}dispatch_entries, &{prefix}dispatch, {prefix}dispatch_seeds, {}u);\n}}", addrs.len());
+    }
+    Ok(())
+}
+
 pub fn main_table(
     entry_names: &[Addr],
     symbols: &[SymbolRow],
     call_returns: &[Addr],
     private_masks: &BTreeMap<Addr, BTreeSet<Fields>>,
-) -> String {
+    program: &Program,
+    dispatch: Option<&Dispatch>,
+) -> Result<String> {
     let mut s = String::with_capacity(entry_names.len() * 120);
     s.push_str("/* generated by recomp-translate -- do not edit */\n");
     s.push_str(
@@ -88,8 +221,7 @@ pub fn main_table(
         "}};\nstatic const uint32_t recomp_call_return_count = {};\n",
         call_returns.len()
     );
-    s.push_str("typedef struct {\n    uint32_t start;\n    uint32_t end;\n    void (*fn)(X86 *, uint32_t);\n} RecompRegion;\n");
-    s.push_str("static const RecompRegion recomp_regions[] = {\n    {0x00000000u, 0x00000000u, 0},\n};\nstatic const uint32_t recomp_region_count = 0;\n\n");
+    region_table(&mut s, entry_names, program, "recomp_");
     s.push_str("static const char *const profile_names[] = {\n");
     for row in symbols {
         let _ = writeln!(s, "    {},", json_string(&row.name));
@@ -130,8 +262,9 @@ pub fn main_table(
         );
     }
     call_return_bitmap(&mut s, call_returns, "recomp_");
+    dispatch_table(&mut s, entry_names, dispatch, "recomp_", false)?;
     s.push_str(TABLE_TAIL);
-    s
+    Ok(s)
 }
 
 pub fn module_table(
@@ -139,7 +272,9 @@ pub fn module_table(
     symbols: &[SymbolRow],
     call_returns: &[Addr],
     module: &Module,
-) -> String {
+    program: &Program,
+    dispatch: Option<&Dispatch>,
+) -> Result<String> {
     let key = &module.key;
     let p = format!("recomp_{key}_");
     let n = entry_names.len();
@@ -199,6 +334,8 @@ pub fn module_table(
         s,
         "    if (recomp_frame_watch) recomp_check_saved(c, {p}addrs[i], &saved_);\n}}\n"
     );
+    let region_count = region_table(&mut s, entry_names, program, &p);
+    dispatch_table(&mut s, entry_names, dispatch, &p, true)?;
     let _ = writeln!(s, "static const RecompModule {p}module = {{");
     let _ = writeln!(
         s,
@@ -208,13 +345,21 @@ pub fn module_table(
         module.base + module.size
     );
     let _ = writeln!(s, "    {p}addrs, {n}, {p}base, {p}hooks, {p}hooked,");
-    let _ = writeln!(s, "    {p}returns, {}, {p}names\n}};", call_returns.len());
+    let _ = writeln!(
+        s,
+        "    {p}returns, {}, {p}names, {p}regions, {region_count}u, &{p}dispatch\n}};",
+        call_returns.len()
+    );
     let _ = writeln!(
         s,
         "__attribute__((constructor)) static void {p}register(void)"
     );
-    let _ = writeln!(s, "{{\n    recomp_module_register(&{p}module);\n}}");
-    s
+    s.push_str("{\n");
+    if dispatch.is_some() {
+        let _ = writeln!(s, "    {p}dispatch_startup();");
+    }
+    let _ = writeln!(s, "    recomp_module_register(&{p}module);\n}}");
+    Ok(s)
 }
 
 pub fn call_facts(
@@ -232,11 +377,7 @@ pub fn call_facts(
             targets.extend_from_slice(found);
             first
         });
-        let _ = writeln!(
-            s,
-            "    {{0x{ret:08x}u, {first}u, {}u}},",
-            found.len()
-        );
+        let _ = writeln!(s, "    {{0x{ret:08x}u, {first}u, {}u}},", found.len());
     }
     if facts.is_empty() {
         s.push_str("    {0u, 0u, 0u},\n");

@@ -40,6 +40,7 @@ pub struct EmitContext<'a> {
     pub private_masks: &'a BTreeMap<Addr, BTreeSet<Fields>>,
     pub private_input_arguments: &'a BTreeMap<Addr, String>,
     pub known_entries: &'a BTreeSet<Addr>,
+    pub region_entries: &'a BTreeMap<Addr, Addr>,
     pub setjmp_targets: &'a BTreeSet<Addr>,
     pub private: Option<&'a PrivateEmit>,
 }
@@ -437,8 +438,17 @@ impl<'a> Emitter<'a> {
             );
         }
         if self.multi {
+            if self.ctx.region_entries.values().any(|&owner| owner == addr) {
+                let args = self.call_args(Some(addr), None).replace(&format!("0x{addr:08x}u"), "target");
+                let _ = writeln!(self.out, "void region_{addr:08x}(X86 *c, uint32_t target) {{ {body}({args}); }}");
+            }
             for entry in &self.s.entries {
-                if entry.addr == addr {
+                let seh_callback = self.ctx.ir.seh.iter().any(|(&index, kinds)| {
+                    let insn = &self.ctx.ir.insns[index as usize];
+                    insn.addr + Addr::from(insn.length) == entry.addr
+                        && kinds.iter().any(|kind| matches!(kind, SehEffect::Enter | SehEffect::Adopt))
+                });
+                if entry.addr == addr || (self.ctx.region_entries.contains_key(&entry.addr) && !seh_callback) {
                     continue;
                 }
                 let args = self.call_args(Some(entry.addr), None);
@@ -612,8 +622,16 @@ impl<'a> Emitter<'a> {
                 let _ = writeln!(self.out, "case 0x{:08x}u:", entry.addr);
                 self.edge(None, entry.target as usize)?;
             }
-            self.out.push_str("default:;\n");
+            let region = self.ctx.region_entries.values().any(|&owner| owner == self.s.addr);
+            if region {
+                let _ = writeln!(self.out, "case 0u: case 0x{:08x}u:", primary.addr);
+            } else {
+                self.out.push_str("default:;\n");
+            }
             self.edge(None, primary.target as usize)?;
+            if region {
+                self.out.push_str("default: recomp_region_missing(c, entry_); return;\n");
+            }
             self.out.push_str("}\n");
         } else if primary.target == 0 && !self.transfers.edges.contains(&(DISPATCH_BLOCK, 0)) {
             self.edge_copies(DISPATCH_BLOCK, primary.target as usize)?;
@@ -1550,11 +1568,9 @@ impl<'a> Emitter<'a> {
         let target = args.get(1).or_else(|| args.first()).copied()
             .ok_or_else(|| self.error(addr, "indirect call without target"))?;
         let target = self.expr(target)?;
-        let name = format!("ic_{:08x}_{:08x}", self.s.addr, addr);
-        self.requires.icaches.insert(name.clone());
         let _ = writeln!(
             self.out,
-            "recomp_icall(c, (uint32_t)({target}), &{name}, 0x{addr:08x}u);"
+            "recomp_icall(c, (uint32_t)({target}), 0x{addr:08x}u);"
         );
         if self.plan.settle_sites.contains(&value) {
             self.out.push_str("x86_cc_settle(c);\n");

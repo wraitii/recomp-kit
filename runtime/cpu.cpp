@@ -65,6 +65,10 @@ std::vector<const RecompModule *> &modules() {
     return v;
 }
 int32_t module_index(const RecompModule *m, uint32_t target) {
+    if (m->dispatch) {
+        const RecompDispatchEntry *entry = recomp_dispatch_lookup(m->dispatch, target);
+        return entry ? (int32_t)(entry->metadata & 0x7fffffffu) : -1;
+    }
     uint32_t lo = 0, hi = m->func_count;
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2;
@@ -73,7 +77,7 @@ int32_t module_index(const RecompModule *m, uint32_t target) {
         else
             hi = mid;
     }
-    return (lo < m->func_count && m->func_addrs[lo] == target) ? (int32_t)lo : -1;
+    return lo < m->func_count && m->func_addrs[lo] == target ? (int32_t)lo : -1;
 }
 bool module_is_call_return(const RecompModule *m, uint32_t target) {
     uint32_t lo = 0, hi = m->call_return_count;
@@ -87,14 +91,8 @@ bool module_is_call_return(const RecompModule *m, uint32_t target) {
     return lo < m->call_return_count && m->call_returns[lo] == target;
 }
 
-// Module entry and call-return lookups repeat a small set of targets, so a
-// direct-mapped cache fronts the containing scan and the binary searches, as
-// recomp_lookup_cache does for the main image. Each slot packs the target in
-// the high word and a module number plus payload in the low word; zero is
-// empty, kNoModule means no module owns the target.
 const uint32_t kModuleCacheSize = 1u << 16;
 const uint32_t kNoModule = 31u;
-uint64_t g_module_entry_cache[kModuleCacheSize];
 uint64_t g_module_return_cache[kModuleCacheSize];
 uint32_t g_module_cache_slot(uint32_t target) {
     return (uint32_t)(target * 2654435761u) >> 16;
@@ -111,25 +109,12 @@ struct ModuleEntry {
     int32_t index;
 };
 ModuleEntry module_entry(uint32_t target) {
-    uint32_t slot = g_module_cache_slot(target);
-    uint64_t e = __atomic_load_n(&g_module_entry_cache[slot], __ATOMIC_ACQUIRE);
-    if ((uint32_t)(e >> 32) == target && (uint32_t)e) {
-        uint32_t low = (uint32_t)e;
-        uint32_t mod = low >> 27;
-        if (mod == kNoModule)
-            return {nullptr, -1};
-        return {modules()[mod - 1], (int32_t)((low & 0x07ffffffu) - 1)};
-    }
     const RecompModule *m = recomp_module_containing(target);
-    int32_t idx = m ? module_index(m, target) : -1;
-    uint32_t pos = m ? module_position(m) : kNoModule;
-    if ((!m || pos + 1 < kNoModule) && (uint32_t)(idx + 1) < (1u << 27)) {
-        uint32_t mod = m ? pos + 1 : kNoModule;
-        uint32_t low = (mod << 27) | (uint32_t)(idx + 1);
-        __atomic_store_n(&g_module_entry_cache[slot], ((uint64_t)target << 32) | low,
-                         __ATOMIC_RELEASE);
-    }
-    return {m, idx};
+    return {m, m ? module_index(m, target) : -1};
+}
+int module_region_enter(X86 *c, uint32_t target) {
+    const RecompModule *m = recomp_module_containing(target);
+    return m ? recomp_region_call(c, m->regions, m->region_count, target) : 0;
 }
 bool module_call_return(uint32_t target) {
     uint32_t slot = g_module_cache_slot(target);
@@ -159,26 +144,126 @@ void recomp_run(X86 *c, uint32_t target) {
     recomp_call(c, target);
 }
 
-uint32_t recomp_dispatch_epoch = 1;
+static const RecompRegion *recomp_region_find(const RecompRegion *regions, uint32_t count,
+                                              uint32_t target) {
+    uint32_t lo = 0, hi = count;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (regions[mid].start <= target)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo && target < regions[lo - 1].end ? &regions[lo - 1] : nullptr;
+}
 
-void recomp_icall_slow(X86 *c, uint32_t target, RecompICache *ic, uint32_t site) {
-#ifndef RECOMP_CHECK_CALL_FACTS
-    int32_t i = recomp_index_of(target);
-    if (i >= 0 && recomp_base_ptrs[i] == recomp_raw_ptrs[i]) {
-        ic->target = target;
-        ic->epoch = recomp_dispatch_epoch;
-        ic->index = i;
-        ic->fn = recomp_base_ptrs[i];
-        ic->module = nullptr;
-    } else if (i < 0) {
-        ModuleEntry e = module_entry(target);
-        if (e.module && e.index >= 0) {
-            ic->target = target;
-            ic->epoch = recomp_dispatch_epoch;
-            ic->index = e.index;
-            ic->fn = nullptr;
-            ic->module = e.module;
+int recomp_region_has_target(const RecompRegion *regions, uint32_t count, uint32_t target) {
+    const RecompRegion *r = recomp_region_find(regions, count, target);
+    if (!r)
+        return 0;
+    uint32_t offset = target - r->start;
+    return (r->boundaries[offset >> 3] >> (offset & 7u)) & 1u;
+}
+
+int recomp_module_region_has_target(uint32_t target) {
+    const RecompModule *m = recomp_module_containing(target);
+    return m && recomp_region_has_target(m->regions, m->region_count, target);
+}
+
+int recomp_region_call(X86 *c, const RecompRegion *regions, uint32_t count, uint32_t target) {
+    const RecompRegion *r = recomp_region_find(regions, count, target);
+    if (!r)
+        return 0;
+    RecompSaved saved;
+    recomp_save(c, &saved);
+    recomp_execution_checkpoint(c);
+    if (recomp_profile_enabled)
+        recomp_profile_push(r->index);
+    r->fn(c, target);
+    if (recomp_profile_enabled)
+        recomp_profile_pop();
+    if (recomp_frame_watch)
+        recomp_check_saved(c, target, &saved);
+    return 1;
+}
+
+RECOMP_COLD void recomp_dispatch_overflow(uint32_t target, uint32_t max_probe) {
+    fprintf(stderr, "recomp: dispatch placement for %08x exceeds %u extra probes\n", target,
+            max_probe);
+    abort();
+}
+
+void recomp_dispatch_init(RecompDispatchEntry *entries, const RecompDispatchTable *table,
+                          const RecompDispatchEntry *seeds, uint32_t seed_count) {
+    for (uint32_t i = 0; i < seed_count; ++i) {
+        const RecompDispatchEntry seed = seeds[i];
+        uint32_t offset = seed.address - table->base;
+        if (offset >= table->span || !seed.fn)
+            recomp_dispatch_overflow(seed.address, table->max_probe);
+        uint32_t home = offset >> table->shift;
+        uint32_t slot = home;
+        while (entries[slot].fn) {
+            if (slot - home >= table->max_probe)
+                recomp_dispatch_overflow(seed.address, table->max_probe);
+            ++slot;
         }
+        entries[slot] = seed;
+        if (slot != home)
+            entries[home].metadata |= 0x80000000u;
+    }
+}
+
+const RecompDispatchEntry *recomp_dispatch_lookup(const RecompDispatchTable *table,
+                                                  uint32_t target) {
+    if (!table->span) {
+        uint32_t lo = 0, hi = table->count;
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2;
+            if (table->entries[mid].address < target)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        return lo < table->count && table->entries[lo].address == target && table->entries[lo].fn
+                   ? &table->entries[lo]
+                   : nullptr;
+    }
+    uint32_t offset = target - table->base;
+    if (offset >= table->span)
+        return nullptr;
+    uint32_t slot = offset >> table->shift;
+    const RecompDispatchEntry *entry = &table->entries[slot];
+    if (entry->address == target)
+        return entry;
+    if (!(entry->metadata & 0x80000000u))
+        return nullptr;
+    for (uint32_t probe = 1; probe <= table->max_probe; ++probe) {
+        entry = &table->entries[slot + probe];
+        if (entry->address == target)
+            return entry;
+        if (!entry->fn)
+            break;
+    }
+    return nullptr;
+}
+
+RecompEntryFn recomp_icall_resolve(uint32_t target) {
+    const RecompDispatchEntry *entry = recomp_dispatch_lookup(&recomp_dispatch, target);
+    if (!entry) {
+        const RecompModule *m = recomp_module_containing(target);
+        if (m && m->dispatch)
+            entry = recomp_dispatch_lookup(m->dispatch, target);
+    }
+    return entry ? entry->fn : nullptr;
+}
+
+void recomp_icall_slow(X86 *c, uint32_t target, uint32_t site) {
+#ifndef RECOMP_CHECK_CALL_FACTS
+    if (target - GUEST_SHIM_BASE < GUEST_SHIM_END - GUEST_SHIM_BASE && !recomp_frame_watch &&
+        !recomp_observe_on) {
+        if (RECOMP_UNLIKELY(!imports_dispatch(c, target)))
+            recomp_shim_call(c, target);
+        return;
     }
 #endif
     observe_pend(site);
@@ -187,7 +272,8 @@ void recomp_icall_slow(X86 *c, uint32_t target, RecompICache *ic, uint32_t site)
 
 void recomp_module_register(const RecompModule *m) {
     modules().push_back(m);
-    ++recomp_dispatch_epoch;
+    for (uint64_t &entry : g_module_return_cache)
+        __atomic_store_n(&entry, 0, __ATOMIC_RELEASE);
 }
 uint32_t recomp_module_count(void) {
     return (uint32_t)modules().size();
@@ -215,7 +301,7 @@ int recomp_module_is_call_return(uint32_t target) {
 int recomp_module_call(X86 *c, uint32_t target) {
     ModuleEntry e = module_entry(target);
     if (!e.module || e.index < 0)
-        return 0;
+        return module_region_enter(c, target);
     recomp_module_invoke(c, e.module, e.index);
     return 1;
 }
@@ -235,6 +321,8 @@ void recomp_module_invoke(X86 *c, const RecompModule *m, int32_t i) {
 void recomp_module_jump(X86 *c, uint32_t target) {
     ModuleEntry e = module_entry(target);
     if (!e.module || e.index < 0) {
+        if (module_region_enter(c, target))
+            return;
         recomp_unknown_jump(c, target);
         return;
     }
@@ -276,10 +364,7 @@ static void return_as_if_ret(X86 *c) {
     c->r[R_EAX] = 0;
 }
 
-// An indirect call whose target landed in the trampoline range.
 void recomp_shim_call(X86 *c, uint32_t target) {
-    if (imports_dispatch(c, target))
-        return;
     LOGW("recomp_shim_call: %08x is not an allocated trampoline (ESP=%08x, return=%08x)", target,
          c->r[R_ESP], rd32(c->r[R_ESP]));
     fflush(stdout);

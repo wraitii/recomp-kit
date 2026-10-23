@@ -480,7 +480,7 @@ static void recomp_call_inner(X86 *c, uint32_t target)
     uint32_t site = observe_take();
     if (target >= GUEST_SHIM_BASE && target < GUEST_SHIM_END) {
         observe_indirect(site, target, "shim");
-        recomp_shim_call(c, target);
+        if (RECOMP_UNLIKELY(!imports_dispatch(c, target))) recomp_shim_call(c, target);
         return;
     }
     int32_t i = recomp_lookup(target);
@@ -508,7 +508,7 @@ static void recomp_call_inner(X86 *c, uint32_t target)
         return;
     }
     if (target >= GUEST_SHIM_BASE && target < GUEST_SHIM_END) {
-        recomp_shim_call(c, target);
+        if (RECOMP_UNLIKELY(!imports_dispatch(c, target))) recomp_shim_call(c, target);
         return;
     }
     x86_cc_settle(c);
@@ -545,7 +545,7 @@ void recomp_jump(X86 *c, uint32_t target)
         return;
     }
     if (target >= GUEST_SHIM_BASE && target < GUEST_SHIM_END) {
-        recomp_shim_call(c, target);
+        if (RECOMP_UNLIKELY(!imports_dispatch(c, target))) recomp_shim_call(c, target);
         return;
     }
     if (recomp_is_call_return(target) || recomp_module_is_call_return(target)) { c->eip = target; return; }

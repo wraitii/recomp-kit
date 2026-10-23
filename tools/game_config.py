@@ -486,6 +486,12 @@ def load(game_dir, build_root=None):
         raise ValueError("%s: [translate] private_leaf_contracts must be a boolean" % source)
     if type(translate.setdefault("private_input_arguments", TRANSLATE_DEFAULTS["private_input_arguments"])) is not bool:
         raise ValueError("%s: [translate] private_input_arguments must be a boolean" % source)
+    dispatch = translate.get("dispatch")
+    if dispatch is not None and (not isinstance(dispatch, dict)
+            or set(dispatch) != {"shift", "max_probe"}
+            or type(dispatch["shift"]) is not int or not 0 <= dispatch["shift"] <= 8
+            or type(dispatch["max_probe"]) is not int or not 0 <= dispatch["max_probe"] <= 256):
+        raise ValueError("%s: translate.dispatch requires shift (0..8) and max_probe (0..256)" % source)
     input_registers = translate.setdefault("private_input_registers", {})
     if not isinstance(input_registers, dict):
         raise ValueError("%s: [translate] private_input_registers must be an address-to-register table" % source)
