@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 
 use rk_core::contract::{Field, Fields};
 use rk_core::Lookup;
@@ -11,8 +11,6 @@ pub enum FlagSource {
     Record(FlagId),
     Input(StateKey),
     Const(u64),
-    Incoming,
-    Resident,
     Phi(Vec<FlagSource>),
     Unknown,
 }
@@ -67,7 +65,6 @@ pub struct FlagPublication {
 
 pub struct FlagPlan {
     record_of: Lookup<ValueId, FlagId>,
-    sources: BTreeMap<ValueId, BTreeMap<Field, FlagSource>>,
 }
 
 fn is_flag(field: Field) -> bool {
@@ -84,150 +81,18 @@ impl Ssa {
                 }
             }
         }
-        let sources = self.carried_sources();
-        FlagPlan { record_of, sources }
-    }
-
-    fn carried_sources(&self) -> BTreeMap<ValueId, BTreeMap<Field, FlagSource>> {
-        let mut record_by_op = BTreeMap::new();
-        let mut owned = BTreeMap::<ValueId, Fields>::new();
-        let mut state_values = BTreeMap::<ValueId, Fields>::new();
-        for (index, record) in self.flags.iter().enumerate() {
-            if let Some(op) = record.op {
-                record_by_op.insert(op, index as FlagId);
-            }
-            for (field, value) in &record.flags {
-                *owned.entry(*value).or_default() |= Fields(field.bit());
-                *state_values.entry(*value).or_default() |= Fields(field.bit());
-            }
-        }
-        for boundary in &self.boundaries {
-            for &(key, value) in &self.state[boundary.state_start as usize
-                ..(boundary.state_start + boundary.state_len) as usize]
-            {
-                if let Some(field) = self.field(key) {
-                    if is_flag(field) {
-                        *state_values.entry(value).or_default() |= Fields(field.bit());
-                    }
-                }
-            }
-        }
-        let mut successors = vec![Vec::new(); self.blocks.len()];
-        for (block, item) in self.blocks.iter().enumerate() {
-            for pred in &item.preds {
-                if *pred != DISPATCH_BLOCK {
-                    successors[*pred as usize].push(block as BlockId);
-                }
-            }
-        }
-        for list in &mut successors {
-            list.sort_unstable();
-            list.dedup();
-        }
-        let mut entry: Vec<Option<BTreeMap<Field, FlagSource>>> = vec![None; self.blocks.len()];
-        let mut work = VecDeque::new();
-        for (index, block) in self.blocks.iter().enumerate() {
-            if block.preds.is_empty() {
-                entry[index] = Some(incoming_sources());
-                work.push_back(index);
-            } else if block.preds.iter().any(|pred| *pred == DISPATCH_BLOCK) {
-                entry[index] = Some(unknown_sources());
-                work.push_back(index);
-            }
-        }
-        while let Some(block) = work.pop_front() {
-            let Some(start) = entry[block].clone() else { continue };
-            let end = self.walk_sources(block, start, &record_by_op, &owned, &state_values, None);
-            for &next in &successors[block] {
-                let next = next as usize;
-                let merged = match &entry[next] {
-                    Some(current) => Some(merge_sources(current, &end)),
-                    None => Some(end.clone()),
-                };
-                if merged != entry[next] {
-                    entry[next] = merged;
-                    work.push_back(next);
-                }
-            }
-        }
-        let mut sources = BTreeMap::new();
-        for (block, start) in entry.into_iter().enumerate() {
-            let start = start.unwrap_or_else(unknown_sources);
-            self.walk_sources(block, start, &record_by_op, &owned, &state_values, Some(&mut sources));
-        }
-        sources
-    }
-
-    fn walk_sources(
-        &self,
-        block: usize,
-        mut sources: BTreeMap<Field, FlagSource>,
-        record_by_op: &BTreeMap<ValueId, FlagId>,
-        owned: &BTreeMap<ValueId, Fields>,
-        state_values: &BTreeMap<ValueId, Fields>,
-        mut out: Option<&mut BTreeMap<ValueId, BTreeMap<Field, FlagSource>>>,
-    ) -> BTreeMap<Field, FlagSource> {
-        let item = &self.blocks[block];
-        for value in item.phis.iter().chain(item.ops.iter()).copied() {
-            if let Some(out) = out.as_deref_mut() {
-                if self.boundary(value).is_some() {
-                    out.insert(value, sources.clone());
-                }
-            }
-            if let Some(&id) = record_by_op.get(&value) {
-                for field in self.flags[id as usize].defined.iter() {
-                    sources.insert(field, FlagSource::Record(id));
-                }
-                continue;
-            }
-            let op = self.value(value).op;
-            if let Op::StateReload(key) = op {
-                if let Some(field) = self.field(key) {
-                    if is_flag(field) {
-                        sources.insert(field, FlagSource::Resident);
-                        continue;
-                    }
-                }
-            }
-            if matches!(op, Op::Input(_) | Op::Const(_) | Op::Phi) {
-                continue;
-            }
-            if let Some(fields) = state_values.get(&value) {
-                if !owned.contains_key(&value) {
-                    for field in fields.iter() {
-                        sources.insert(field, FlagSource::Unknown);
-                    }
-                }
-            }
-        }
-        sources
+        FlagPlan { record_of }
     }
 }
 
-fn incoming_sources() -> BTreeMap<Field, FlagSource> {
-    Fields::FLAGS.iter().map(|field| (field, FlagSource::Incoming)).collect()
-}
-
-fn unknown_sources() -> BTreeMap<Field, FlagSource> {
-    Fields::FLAGS.iter().map(|field| (field, FlagSource::Unknown)).collect()
-}
-
-fn merge_sources(left: &BTreeMap<Field, FlagSource>, right: &BTreeMap<Field, FlagSource>) -> BTreeMap<Field, FlagSource> {
-    Fields::FLAGS
-        .iter()
-        .map(|field| {
-            let value = if left.get(&field) == right.get(&field) {
-                left.get(&field).cloned().unwrap_or(FlagSource::Unknown)
-            } else {
-                FlagSource::Unknown
-            };
-            (field, value)
-        })
-        .collect()
-}
-
-fn flag_key_index(s: &Ssa, field: Field) -> Option<usize> {
-    s.keys.iter().position(|key| s.field(*key) == Some(field))
+fn flag_key_indices(s: &Ssa) -> BTreeMap<Field, usize> {
+    let mut index = BTreeMap::new();
+    for (position, field) in s.field_of.iter().enumerate() {
+        if let Some(field) = field.filter(|field| is_flag(*field)) {
+            index.entry(field).or_insert(position);
+        }
+    }
+    index
 }
 
 fn block_entry_state(s: &Ssa, block: usize) -> Vec<Option<ValueId>> {
@@ -265,8 +130,14 @@ fn block_entry_state(s: &Ssa, block: usize) -> Vec<Option<ValueId>> {
     state
 }
 
-fn entry_flag_value(s: &Ssa, block: usize, field: Field, position: usize) -> Option<ValueId> {
-    let index = flag_key_index(s, field)?;
+fn entry_flag_value(
+    s: &Ssa,
+    block: usize,
+    field: Field,
+    flag_keys: &BTreeMap<Field, usize>,
+    position: usize,
+) -> Option<ValueId> {
+    let index = *flag_keys.get(&field)?;
     let item = &s.blocks[block];
     if let Some(&phi) = item.phis.iter().find(|phi| s.phi_key.get(*phi) == Some(&index)) {
         return s.args(phi).get(position).copied();
@@ -294,6 +165,7 @@ fn merge_join_sources(
     s: &mut Ssa,
     block: usize,
     preds: &[BlockId],
+    flag_keys: &BTreeMap<Field, usize>,
     index: &mut BTreeMap<(ValueId, Field), FlagId>,
 ) {
     let mut candidates = Fields::NONE;
@@ -302,7 +174,7 @@ fn merge_join_sources(
         let mut values = Vec::with_capacity(preds.len());
         let mut complete = true;
         for position in 0..preds.len() {
-            let Some(value) = entry_flag_value(s, block, field, position) else {
+            let Some(value) = entry_flag_value(s, block, field, flag_keys, position) else {
                 complete = false;
                 break;
             };
@@ -345,7 +217,7 @@ fn merge_join_sources(
     let entry = block_entry_state(s, block);
     let mut groups: BTreeMap<u8, Vec<(Field, Vec<FlagId>, ValueId)>> = BTreeMap::new();
     for field in candidates.iter() {
-        let Some(key) = flag_key_index(s, field) else { continue };
+        let Some(&key) = flag_keys.get(&field) else { continue };
         let Some(Some(value)) = entry.get(key) else { continue };
         let ids = ids_by_field.remove(&field).unwrap_or_default();
         let Some(record) = ids.first().and_then(|id| s.flag(*id)) else { continue };
@@ -458,12 +330,13 @@ pub fn cc_kind(kind: FlagKind) -> Option<CcKind> {
 
 pub(crate) fn build_joins(s: &mut Ssa) {
     let mut index = record_index(s);
+    let flag_keys = flag_key_indices(s);
     for block in 0..s.blocks.len() {
         let preds = s.blocks[block].preds.clone();
         if preds.len() < 2 || preds.iter().any(|pred| *pred == DISPATCH_BLOCK) {
             continue;
         }
-        merge_join_sources(s, block, &preds, &mut index);
+        merge_join_sources(s, block, &preds, &flag_keys, &mut index);
     }
 }
 
@@ -532,13 +405,6 @@ impl FlagPlan {
                 hot.insert(field);
             }
             if cold && matches!(s.value(*value).op, Op::StateKeep(k) | Op::StateReload(k) if k == *key) {
-                forwarded.insert(field);
-                continue;
-            }
-            let carried = self.sources.get(&at).and_then(|sources| sources.get(&field));
-            if matches!(carried, Some(FlagSource::Incoming | FlagSource::Resident))
-                && matches!(s.value(*value).op, Op::Input(k) | Op::StateReload(k) if k == *key)
-            {
                 forwarded.insert(field);
                 continue;
             }
