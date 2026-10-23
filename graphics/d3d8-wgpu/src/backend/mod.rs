@@ -30,6 +30,7 @@
 
 use std::sync::Arc;
 
+pub(crate) mod native_completion;
 pub(crate) mod native_present;
 mod postprocess;
 

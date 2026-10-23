@@ -291,6 +291,23 @@ impl D3d9Gpu {
         self.pending.lock().unwrap().submit();
     }
 
+    pub(crate) fn submit_native_completion(
+        &self,
+        completed: impl Fn(bool) + Send + Sync + 'static,
+    ) -> Result<bool, RenderError> {
+        let mut pending = self.pending.lock().unwrap();
+        pending.apply_clear();
+        let PendingWork {
+            device, encoder, ..
+        } = &mut *pending;
+        let registered =
+            crate::backend::native_completion::register(frame_encoder(device, encoder), completed)?;
+        if registered {
+            pending.submit();
+        }
+        Ok(registered)
+    }
+
     pub(crate) fn request_flush(&self) {
         let mut pending = self.pending.lock().unwrap();
         pending.submit();

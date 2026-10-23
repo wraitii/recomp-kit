@@ -56,6 +56,7 @@ struct QueryRecord {
     kind: u32,
     generation: u64,
     done: Arc<AtomicU64>,
+    native_completion: bool,
     occlusion: Occlusion,
 }
 
@@ -118,6 +119,7 @@ impl D3d9Queries {
                 kind,
                 generation: 0,
                 done: Arc::new(AtomicU64::new(0)),
+                native_completion: false,
                 occlusion: Occlusion::Idle,
             },
         );
@@ -210,7 +212,19 @@ impl D3d9Queries {
             .get_mut(&handle)
             .ok_or_else(|| RenderError::invalid("Issue", "unknown query handle"))?;
         let done = Arc::clone(&record.done);
+        let native_done = Arc::clone(&done);
+        let loss = gpu.loss().clone();
+        record.native_completion = gpu.submit_native_completion(move |success| {
+            if success {
+                native_done.fetch_max(generation, Ordering::AcqRel);
+            } else {
+                loss.mark_physical("Metal event-query command buffer failed".to_string());
+            }
+        })?;
         record.generation = generation;
+        if record.native_completion {
+            return Ok(());
+        }
         gpu.submit_then(move |queue| {
             queue.submit(std::iter::empty());
             queue.on_submitted_work_done(move || {
@@ -367,13 +381,20 @@ impl D3d9Queries {
         handle: u32,
         flush: bool,
     ) -> Result<QueryPoll, RenderError> {
-        let (generation, done) = {
+        let (generation, done, native_completion) = {
             let record = self
                 .records
                 .get(&handle)
                 .ok_or_else(|| RenderError::invalid("GetData", "unknown query handle"))?;
-            (record.generation, Arc::clone(&record.done))
+            (record.generation, &record.done, record.native_completion)
         };
+        if native_completion {
+            return Ok(if done.load(Ordering::Acquire) >= generation {
+                QueryPoll::Ready(1)
+            } else {
+                QueryPoll::Pending
+            });
+        }
         if let Err(error) = gpu.device.poll(wgpu::PollType::Poll) {
             return Err(RenderError::new("GetData", error.to_string()));
         }
