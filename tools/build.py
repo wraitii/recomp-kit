@@ -653,11 +653,16 @@ def build_diff_harness(build_root, out):
         sys.exit("%s is missing: build the game first" % archive)
     # Desktop macOS splits the main translation's bodies into dylibs beside the
     # archive; the harness links those instead of a monolithic archive.
-    pieces = sorted(archive.parent.parent.glob("librecomp_piece_*.dylib"))
+    cache = archive.parent.parent / "CMakeCache.txt"
+    split = cache.is_file() and "RECOMP_SPLIT_TRANSLATION:BOOL=ON" in cache.read_text().splitlines()
+    pieces = sorted(archive.parent.parent.glob("librecomp_piece_*.dylib")) if split else []
     sources = [ROOT / "tools/recomp/tests/harness.c", ROOT / "tools/recomp/diff/host.c",
                ROOT / "platform/os_posix.cpp", ROOT / "platform/env.cpp",
-               ROOT / "tools/recomp/diff/host.cpp", ROOT / "runtime/guest_strings.cpp"]
+               ROOT / "tools/recomp/diff/host.cpp", ROOT / "runtime/guest_strings.cpp",
+               ROOT / "runtime/dispatch.cpp"]
     inputs = sources + [Path(__file__), archive, ROOT / "runtime/x86.h", gen / "table.c"] + pieces
+    if cache.is_file():
+        inputs.append(cache)
     if out.exists() and out.stat().st_mtime > max(p.stat().st_mtime for p in inputs):
         print("diff harness up to date: %s" % out)
         return

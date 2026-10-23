@@ -83,6 +83,7 @@ endif()
 # translation as one archive, where the branch range is not a limit.
 set(RECOMP_GEN_PIECES "")
 set(RECOMP_GEN_PIECE_BUDGET 160000000 CACHE STRING "C source bytes per translated dylib")
+option(RECOMP_SPLIT_TRANSLATION "Split desktop macOS translations into dylibs" OFF)
 
 function(recomp_make_piece index)
   set(target recomp_piece_${index})
@@ -150,7 +151,7 @@ function(recomp_split_main_gen result)
 endfunction()
 
 if(RECOMP_HAVE_GEN)
-  if(APPLE AND NOT IOS AND NOT ANDROID)
+  if(APPLE AND NOT IOS AND NOT ANDROID AND RECOMP_SPLIT_TRANSLATION)
     set(RECOMP_AUX_SHARED ON)
   else()
     set(RECOMP_AUX_SHARED OFF)

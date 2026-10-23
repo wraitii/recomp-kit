@@ -1072,6 +1072,48 @@ static inline void recomp_icall(X86 *c, uint32_t target, uint32_t site) {
     recomp_icall_slow(c, target, site);
 }
 
+static inline void recomp_icall_host(X86 *c, uint32_t target, uint32_t site) {
+#ifndef RECOMP_CHECK_CALL_FACTS
+    if (!recomp_observe_on && !recomp_frame_watch) {
+        if (RECOMP_UNLIKELY(!imports_dispatch(c, target)))
+            recomp_shim_call(c, target);
+        return;
+    }
+#endif
+    recomp_icall_slow(c, target, site);
+}
+
+static inline void recomp_icall_guest(X86 *c, uint32_t target, uint32_t site) {
+#ifndef RECOMP_CHECK_CALL_FACTS
+    if (!recomp_observe_on) {
+#ifdef RECOMP_DISPATCH_ENTRIES
+        const RecompDispatchEntry *entries = RECOMP_DISPATCH_ENTRIES;
+        uint32_t base = RECOMP_DISPATCH_BASE, shift = RECOMP_DISPATCH_SHIFT;
+        uint64_t span = RECOMP_DISPATCH_SPAN;
+#else
+        const RecompDispatchEntry *entries = recomp_dispatch.entries;
+        uint32_t base = recomp_dispatch.base, shift = recomp_dispatch.shift;
+        uint64_t span = recomp_dispatch.span;
+#endif
+        RecompEntryFn fn;
+        uint32_t offset = target - base;
+        if (offset < span) {
+            const RecompDispatchEntry *entry = entries + (offset >> shift);
+            if (entry->address == target)
+                fn = entry->fn;
+            else
+                fn = recomp_icall_resolve(target);
+        } else
+            fn = recomp_icall_resolve(target);
+        if (fn) {
+            fn(c);
+            return;
+        }
+    }
+#endif
+    recomp_icall_slow(c, target, site);
+}
+
 /* Clear the dead descriptor payload so a full-struct comparison does not see
  * bytes left over from an earlier descriptor.  Production never reads them
  * while cc_op is NONE, so this is a test/diagnostic helper. */

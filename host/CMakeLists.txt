@@ -161,8 +161,11 @@ function(recomp_host target)
 endfunction()
 
 # The mixer, its output device and the synth: portable, over SDL audio.
-set(RECOMP_AUDIO_SOURCES ${HOST}/audio/mixer.cpp ${HOST}/audio/sdl_sink.cpp ${HOST}/audio/midi_synth.cpp
+set(RECOMP_AUDIO_SOURCES ${HOST}/audio/mixer.cpp ${HOST}/audio/sdl_sink.cpp
                       ${HOST}/audio_math.cpp ${HOST}/audio_capture.cpp)
+if(RECOMP_AUDIO_MIDI)
+  list(APPEND RECOMP_AUDIO_SOURCES ${HOST}/audio/midi_synth.cpp)
+endif()
 set(RECOMP_CORE_LIBS recomp_platform recomp_runtime recomp_dx recomp_mods lua host_common gpu_backend)
 # The on-screen controls the presenter draws (controls_host.cpp is the app's own).
 set(RECOMP_CONTROLS_SOURCES ${HOST}/controls/layout.cpp
@@ -304,6 +307,7 @@ recomp_host(host_tests UI_LAYER
           ${HOST}/game_path.cpp
           ${HOST}/page_overlay.cpp ${RECOMP_PRESENT_SOURCES} ${HOST}/input.cpp ${HOST}/input_gate.cpp
           ${RECOMP_AUDIO_SOURCES}
+          $<$<NOT:$<BOOL:${RECOMP_AUDIO_MIDI}>>:${HOST}/audio/midi_synth.cpp>
           ${RECOMP_ROOT}/dx/com.cpp ${RECOMP_ROOT}/dx/host_api.cpp
           ${RECOMP_ROOT}/dx/display_stubs.cpp ${RECOMP_ROOT}/dx/dinput.cpp
           ${RECOMP_ROOT}/dx/dinput_joystick.cpp

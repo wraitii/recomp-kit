@@ -42,6 +42,8 @@ pub struct EmitContext<'a> {
     pub known_entries: &'a BTreeSet<Addr>,
     pub region_entries: &'a BTreeMap<Addr, Addr>,
     pub setjmp_targets: &'a BTreeSet<Addr>,
+    pub guest_calls: &'a BTreeMap<Addr, Vec<Addr>>,
+    pub host_calls: &'a BTreeSet<Addr>,
     pub private: Option<&'a PrivateEmit>,
 }
 
@@ -1568,10 +1570,14 @@ impl<'a> Emitter<'a> {
         let target = args.get(1).or_else(|| args.first()).copied()
             .ok_or_else(|| self.error(addr, "indirect call without target"))?;
         let target = self.expr(target)?;
-        let _ = writeln!(
-            self.out,
-            "recomp_icall(c, (uint32_t)({target}), 0x{addr:08x}u);"
-        );
+        let helper = if self.ctx.guest_calls.contains_key(&addr) {
+            "recomp_icall_guest"
+        } else if self.ctx.host_calls.contains(&addr) {
+            "recomp_icall_host"
+        } else {
+            "recomp_icall"
+        };
+        let _ = writeln!(self.out, "{helper}(c, (uint32_t)({target}), 0x{addr:08x}u);");
         if self.plan.settle_sites.contains(&value) {
             self.out.push_str("x86_cc_settle(c);\n");
         }
