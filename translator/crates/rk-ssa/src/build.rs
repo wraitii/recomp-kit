@@ -776,6 +776,9 @@ impl<'a> Builder<'a> {
                 }
                 let size = cg_op.output.map_or(0, |v| v.size as u8);
                 let value = self.value(Op::X87(x87), size, &args);
+                if matches!(x87, rk_ir::x87::X87Op::Conditional(..)) {
+                    self.boundary(value, state, block, false)?;
+                }
                 if let Some(output) = cg_op.output {
                     self.write(&output, value, state, temps)?;
                 }

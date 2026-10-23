@@ -854,13 +854,17 @@ impl Scalar {
                 self.status_dirty = true;
             }
             X87Op::Conditional(condition, src) => {
-                self.fold_pending(&mut events);
-                let value = self.read(src as i32, "value", &mut events);
-                let target = self.read(0, "value", &mut events);
+                events.extend(self.flush());
                 events.push(Event::Conditional(
                     Expr::FlagCondition(condition),
-                    vec![Event::Assign(Assign::new(target, value))],
+                    vec![Event::Evaluate(helper("fcopy", vec![
+                        Expr::Cpu,
+                        literal(0, Type::U32),
+                        literal(src as u64, Type::U32),
+                    ]))],
                 ));
+                events.push(Event::Reset);
+                self.reset();
             }
             X87Op::Extract => {
                 self.fold_pending(&mut events);
