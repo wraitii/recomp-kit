@@ -457,7 +457,7 @@ def _candidate(cfg, root, selected_relative, cancel, byte_budget, diagnostics, d
 
 
 def inspect_folder(cfg, selected_path, cancel=None, selected_executable=None, discovery_budget=None,
-                   archive_entries=None):
+                   archive_entries=None, include_installers=False):
     selected = Path(selected_path).expanduser().resolve(strict=True)
     if selected.is_file():
         selected_root = selected.parent
@@ -536,7 +536,7 @@ def inspect_folder(cfg, selected_path, cancel=None, selected_executable=None, di
                                               "sibling_limit", "sibling_collision", "sibling_symlink",
                                               "sibling_inaccessible")
                             for item in diagnostics)
-    return {"schema": SCHEMA, "source": {"kind": source_kind, "path": str(selected),
+    result = {"schema": SCHEMA, "source": {"kind": source_kind, "path": str(selected),
             "identity": {"payload": "pending",
                          "reason": "Full payload fingerprinting is performed after candidate selection."}},
             "candidates": inspected, "diagnostics": diagnostics,
@@ -544,6 +544,27 @@ def inspect_folder(cfg, selected_path, cancel=None, selected_executable=None, di
                        "maxCandidates": MAX_CANDIDATES, "maxHashBytes": byte_budget[1],
                        "entriesSeen": entries_seen, "hashBytes": byte_budget[0]},
             "scanComplete": scan_complete}
+    if include_installers and scan_complete and not any(item["installable"] for item in inspected):
+        possible = [path for _, path in files if path.suffix.casefold() == ".exe"
+                    or path.name.casefold() == "data1.cab"]
+        if len(possible) > MAX_CANDIDATES:
+            diagnostics.append(_diag("installer_probe_limit", ".", "The folder contains too many possible installers.",
+                                     {"maxCandidates": MAX_CANDIDATES},
+                                     ["Choose the installer file or a smaller folder."]))
+            result["scanComplete"] = False
+        else:
+            installers = {}
+            for path in sorted(possible, key=lambda path: _sort_key(path.as_posix())):
+                _cancelled(cancel)
+                kind = probe_bytes(path, cancel)["kind"]
+                if kind in ("installshield", "installshield_cab"):
+                    key = (path.parent, "installshield")
+                    if key not in installers or path.name.casefold() == "setup.exe":
+                        installers[key] = str(path)
+                elif kind in ("inno", "unsupported_inno"):
+                    installers[(path, kind)] = str(path)
+            result["source"]["installers"] = list(installers.values())
+    return result
 
 
 def _resource_nodes(node):

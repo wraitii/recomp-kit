@@ -1053,7 +1053,15 @@ def inspect_source(cfg, source):
         raise SourceError("source_unavailable", "The selected source is missing or unreadable.",
                           ["Check the source path and try again."], str(source), {"error": str(error)}) from error
     if source.is_dir():
-        result = inspect_folder(cfg, source, check_cancel)
+        result = inspect_folder(cfg, source, check_cancel, include_installers=True)
+        installers = result["source"].pop("installers", [])
+        if len(installers) == 1:
+            return inspect_source(cfg, Path(installers[0]))
+        if len(installers) > 1:
+            return _source_diagnostic(source, "installer_selection_required",
+                "More than one installer was found. Choose the installer to inspect.",
+                ["Choose an installer below, or select its setup file directly."],
+                {"installers": installers}, "folder")
         result["source"]["kind"] = "folder"
         return result
     if not source.is_file():
@@ -1233,6 +1241,7 @@ def prepare_install(request, storage):
     root = Path(request.get("destination") or previous_root).expanduser().resolve()
     cfg = game_config.load(directory, root)
     inspection = inspect_source(cfg, source_path)
+    source_path = Path(inspection["source"]["path"])
     source_kind = inspection["source"]["kind"]
     explicit_source = source_path if source_kind == "executable" else None
     selected = select_candidate(inspection, request.get("candidateId"), explicit_source)

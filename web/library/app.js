@@ -178,6 +178,9 @@ function renderInspection(result) {
     } else if (media) {
       title = sourceKind.includes("inno") ? "This installer can’t be imported yet" : "This media can’t be imported yet";
       help = result.diagnostics?.[0]?.message || `Extract it, then choose the folder containing ${selected.executable}.`;
+    } else if (result.diagnostics?.some((item) => item.code === "installer_selection_required")) {
+      title = "Choose an installer";
+      help = "Multiple installers found. Select one below to check.";
     } else if (!candidates.length && sourceKind === "folder") {
       title = "No game found here";
       help = `${result.scanComplete ? "" : "The search stopped before all files were checked. "}Choose the installed game folder containing ${selected.executable}, or select that executable directly.`;
@@ -257,6 +260,12 @@ function renderInspection(result) {
   renderPreparation(chosen);
   if (!candidates.length) {
     for (const diagnostic of result?.diagnostics || []) {
+      for (const path of diagnostic.details?.installers || []) {
+        const button = document.createElement("button");
+        button.textContent = path;
+        button.onclick = () => attempt(() => inspectSource(path));
+        guidance.append(button);
+      }
       for (const instruction of diagnostic.recovery || []) {
         const note = document.createElement("p");
         note.textContent = instruction;
@@ -315,12 +324,14 @@ async function inspectSource(path) {
   try {
     const result = await backend.query({ action: "inspect", game: selected.id, source });
     if (revision !== inspectionRevision || selectedGame !== selected?.id || source !== path) return null;
+    inspecting = false;
+    source = result.source?.path || source;
     sourceKind = result.source?.kind || "";
     renderInspection(result);
     element("selected-source").textContent = `Selected: ${source}`;
     element("selected-source").hidden = false;
     if (inspectionReady && candidateCanInstall && candidateId) void attempt(reviewInstallation);
-    else { inspecting = false; step(4); }
+    else step(4);
     return result;
   } catch (error) {
     if (revision !== inspectionRevision || selectedGame !== selected?.id) return null;
