@@ -514,7 +514,8 @@ static inline uint32_t recomp_sse_f32_bits(float v) {
  * rounds up to the smallest normal can still flush; the exact value, which
  * double precision holds for these operations, scaled out of the denormal
  * range, decides it. */
-static inline uint32_t recomp_sse_result(const X86 *c, uint32_t a, uint32_t b, float r, double exact) {
+static inline uint32_t recomp_sse_result(const X86 *c, uint32_t a, uint32_t b, float r,
+                                         double exact) {
     uint32_t bits = recomp_sse_f32_bits(r), magnitude = bits & 0x7fffffffu;
     if (RECOMP_UNLIKELY(magnitude - 1u < 0x00800000u)) {
         if ((c->mxcsr & 0x8000u) && fabsf((float)(exact * 0x1p64)) < 0x1p-62f)
