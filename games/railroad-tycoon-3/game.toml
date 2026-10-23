@@ -24,6 +24,7 @@ supported_version = "GOG 1.05"
 source_notes = "Use the GOG copy with official patch 1.05 and no unofficial user patch. Disc editions are not verified."
 
 [translate]
+dispatch = { shift = 3, max_probe = 31 }
 # The public map holds Ghidra boundaries and control-flow addresses. Translation
 # decodes the original executable bytes; no instruction contents are published.
 code_map = "metadata"

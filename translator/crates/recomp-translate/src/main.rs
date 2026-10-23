@@ -582,6 +582,11 @@ fn trap_body(program: &Program, addr: Addr, ir: Option<&FunctionIr>) -> Body {
             "\nvoid fn_{entry:08x}(X86 *c) {{ recomp_unmodelled(c, 0x{entry:08x}u); }}"
         ));
     }
+    if program.region_entries.values().any(|&owner| owner == addr) {
+        text.push_str(&format!(
+            "\nvoid region_{addr:08x}(X86 *c, uint32_t target) {{ recomp_unmodelled(c, target); }}"
+        ));
+    }
     let (insns, first, last) = ir
         .map(|ir| {
             let first = ir.insns.first().map_or(addr, |i| i.addr);
