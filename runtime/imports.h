@@ -132,10 +132,6 @@ const char *imports_describe(uint32_t target);
 // Stdcall argument count for an allocated trampoline, or 0 otherwise.
 uint8_t imports_argc(uint32_t trampoline);
 
-// Runs the shim bound to `target`. Returns false when `target` is not a
-// trampoline (recomp_call then falls through to its function table).
-bool imports_dispatch(X86 *c, uint32_t target);
-
 // Argument i of the current shim call: dword at ESP+4+4*i.
 static inline uint32_t arg(X86 *c, int i) {
     return rd32(c->r[R_ESP] + 4 + 4 * (uint32_t)i);

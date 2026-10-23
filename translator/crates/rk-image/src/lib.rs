@@ -69,6 +69,7 @@ pub fn load(settings: &Settings) -> Result<Program> {
         configured_entries: settings.configured_entries.clone(),
         entries: BTreeMap::new(),
         interior_by_function: BTreeMap::new(),
+        region_entries: BTreeMap::new(),
         spans,
     };
     index_entries(&mut program)?;

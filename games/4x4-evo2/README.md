@@ -87,6 +87,13 @@ argument. Pack each export with `code_map.py` into `metadata-tridx8tl` or
 `metadata-tridx8`; the latter requires `--base 0x11000000`. Regenerate and
 rebuild the windowed app afterward.
 
+DIVERGENCE(original): `native/startup.cpp` wraps the startup options menu
+(`0x00491d00`) to lock the renderer to Direct3D8 Hardware TnL and the color
+depth to 32. The Color Depth and Renderer entries still appear but no longer
+change those values or move the selection; the rest of the menu and saved
+resolution are unchanged. Set `RECOMP_EVO2_GRAPHICS=0` to keep the original
+behavior.
+
 DIVERGENCE(original): the kit exposes no wave input/output devices and returns
 device or handle errors for those APIs. DirectSound remains the audio path.
 QueryPerformanceCounter uses synthetic microsecond ticks within the runtime's

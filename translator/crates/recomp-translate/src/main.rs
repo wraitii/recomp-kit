@@ -233,6 +233,8 @@ struct BodyContext<'a> {
     fault_state: rk_core::settings::FaultState,
     known_entries: &'a BTreeSet<Addr>,
     setjmp_targets: &'a BTreeSet<Addr>,
+    guest_calls: &'a BTreeMap<Addr, Vec<Addr>>,
+    host_calls: &'a BTreeSet<Addr>,
     private_targets: &'a BTreeSet<Addr>,
     private_masks: BTreeMap<Addr, BTreeSet<Fields>>,
     private_input_arguments: BTreeMap<Addr, String>,
@@ -251,7 +253,10 @@ impl<'a> BodyContext<'a> {
             private_masks: &self.private_masks,
             private_input_arguments: &self.private_input_arguments,
             known_entries: self.known_entries,
+            region_entries: &self.program.region_entries,
             setjmp_targets: self.setjmp_targets,
+            guest_calls: self.guest_calls,
+            host_calls: self.host_calls,
             private,
         }
     }
@@ -385,6 +390,8 @@ fn build_bodies(
     analysis: &rk_frontend::Analysis,
     owned: Option<BTreeMap<Addr, std::result::Result<FunctionIr, rk_core::Error>>>,
     global: &rk_global::GlobalFacts,
+    guest_calls: &BTreeMap<Addr, Vec<Addr>>,
+    host_calls: &BTreeSet<Addr>,
     settings: &Settings,
     x87_mode: X87Mode,
     switches: Switches,
@@ -400,6 +407,7 @@ fn build_bodies(
         .functions
         .keys()
         .chain(program.entries.keys())
+        .filter(|addr| !program.region_entries.contains_key(addr))
         .copied()
         .collect();
     let setjmp_targets: BTreeSet<Addr> = program
@@ -427,6 +435,8 @@ fn build_bodies(
         fault_state: settings.fault_state,
         known_entries: &known_entries,
         setjmp_targets: &setjmp_targets,
+        guest_calls,
+        host_calls,
         private_targets: &private_targets,
         private_masks,
         private_input_arguments,
@@ -508,10 +518,21 @@ fn build_bodies(
         .map(|item| -> Result<(Vec<BodyRow>, Vec<Body>)> {
             match item {
                 Err(row) => Ok((vec![row], Vec::new())),
-                Ok((addr, ir, planned)) => {
+                Ok((addr, ir, mut planned)) => {
                     let rows = vec![emit_row(&ctx2, addr, &ir, &planned)];
                     let mut private_bodies = Vec::new();
                     if let Some(layouts) = specialized.layouts.get(&addr) {
+                        if global.private.known_modes.contains(&addr)
+                            && ctx2.x87_options.cw_clone
+                            && ctx2.x87_options.force == rk_x87::ModeForce::Auto
+                        {
+                            let mut options = ctx2.x87_options.clone();
+                            options.force = rk_x87::ModeForce::Fast;
+                            planned.x87 = Some(
+                                rk_x87::prepare(&planned.ssa, &ctx2.x87_modes, &options)
+                                    .map_err(|reason| Diagnostic::error(addr, reason))?,
+                            );
+                        }
                         for layout in layouts {
                             let private = rk_emit::PrivateEmit {
                                 mask: layout.outputs,
@@ -570,6 +591,11 @@ fn trap_body(program: &Program, addr: Addr, ir: Option<&FunctionIr>) -> Body {
     {
         text.push_str(&format!(
             "\nvoid fn_{entry:08x}(X86 *c) {{ recomp_unmodelled(c, 0x{entry:08x}u); }}"
+        ));
+    }
+    if program.region_entries.values().any(|&owner| owner == addr) {
+        text.push_str(&format!(
+            "\nvoid region_{addr:08x}(X86 *c, uint32_t target) {{ recomp_unmodelled(c, target); }}"
         ));
     }
     let (insns, first, last) = ir
@@ -788,7 +814,8 @@ fn report(input: &ReportInputs<'_>) -> Result<String> {
         "engine": "rust",
         "module": settings.module.as_ref().map(|m| m.key.as_str()),
         "functions": program.functions.len(),
-        "entry_points": program.entries.len(),
+        "entry_points": written.symbols.len(),
+        "region_entries": program.region_entries.len(),
         "entry_kinds": kinds,
         "body_chunks": written.chunks,
         "entry_chunks": written.entry_chunks,
@@ -989,6 +1016,8 @@ fn main() -> Result<()> {
             &analysis,
             owned,
             &global,
+            &facts.call_targets,
+            &facts.host_calls,
             &settings,
             if switches.x87_dynamic { X87Mode::Dynamic } else { args.x87_mode },
             switches,
@@ -1068,7 +1097,7 @@ fn main() -> Result<()> {
         eprintln!(
             "  {} functions, {} entries ({}), {} body chunks, {} entry chunks; {} bodies emitted, {} trapped",
             program.functions.len(),
-            program.entries.len(),
+            written.symbols.len(),
             kinds.join(", "),
             written.chunks,
             written.entry_chunks,

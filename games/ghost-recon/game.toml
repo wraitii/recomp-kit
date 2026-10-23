@@ -11,6 +11,9 @@ entry_point = 0x006f3d14
 guest_root = 'C:\Ghost Recon'
 store_hooks = false
 
+[audio]
+midi = false
+
 [setup]
 supported_version = "GOG 1.4"
 source_notes = "Use the GOG 1.4 game folder or the supported GOG 1.4.0.0 (19232) offline installer."
@@ -24,6 +27,7 @@ expanded_size = 1034493539
 move_files = { "__support/app/Data/Save/Script/default.ass" = "Data/Save/Script/default.ass" }
 
 [translate]
+dispatch = { shift = 3, max_probe = 6 }
 code_map = "metadata"
 analysis_facts = "metadata/analysis-facts.json"
 private_leaf_contracts = true

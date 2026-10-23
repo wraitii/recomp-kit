@@ -161,8 +161,11 @@ function(recomp_host target)
 endfunction()
 
 # The mixer, its output device and the synth: portable, over SDL audio.
-set(RECOMP_AUDIO_SOURCES ${HOST}/audio/mixer.cpp ${HOST}/audio/sdl_sink.cpp ${HOST}/audio/midi_synth.cpp
+set(RECOMP_AUDIO_SOURCES ${HOST}/audio/mixer.cpp ${HOST}/audio/sdl_sink.cpp
                       ${HOST}/audio_math.cpp ${HOST}/audio_capture.cpp)
+if(RECOMP_AUDIO_MIDI)
+  list(APPEND RECOMP_AUDIO_SOURCES ${HOST}/audio/midi_synth.cpp)
+endif()
 set(RECOMP_CORE_LIBS recomp_platform recomp_runtime recomp_dx recomp_mods lua host_common gpu_backend)
 # The on-screen controls the presenter draws (controls_host.cpp is the app's own).
 set(RECOMP_CONTROLS_SOURCES ${HOST}/controls/layout.cpp
@@ -283,8 +286,8 @@ if(TARGET recomp_gen)
     # Desktop packages carry manifests beside statically linked core plugins.
     # This avoids shipping a plugin compiled for a different host platform.
     recomp_add_builtin_mods(recomp_app RESOURCES $<TARGET_FILE_DIR:recomp_app>/resources)
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RECOMP_VIDEO)
-      # Keep staged FFmpeg libraries discoverable beside the executable.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND (RECOMP_VIDEO OR RECOMP_PCODE_LIB))
+      # Keep staged FFmpeg and p-code libraries discoverable beside the executable.
       set_target_properties(recomp_app PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
     endif()
   endif()
@@ -304,6 +307,7 @@ recomp_host(host_tests UI_LAYER
           ${HOST}/game_path.cpp
           ${HOST}/page_overlay.cpp ${RECOMP_PRESENT_SOURCES} ${HOST}/input.cpp ${HOST}/input_gate.cpp
           ${RECOMP_AUDIO_SOURCES}
+          $<$<NOT:$<BOOL:${RECOMP_AUDIO_MIDI}>>:${HOST}/audio/midi_synth.cpp>
           ${RECOMP_ROOT}/dx/com.cpp ${RECOMP_ROOT}/dx/host_api.cpp
           ${RECOMP_ROOT}/dx/display_stubs.cpp ${RECOMP_ROOT}/dx/dinput.cpp
           ${RECOMP_ROOT}/dx/dinput_joystick.cpp

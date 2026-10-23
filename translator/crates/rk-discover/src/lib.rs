@@ -287,6 +287,13 @@ pub fn merge(program: &mut Program, discovered: &Discovered) -> Result<()> {
         });
     }
     for (&addr, &(owner, kind)) in &discovered.entries {
+        if !program.entries.contains_key(&addr)
+            && !program.functions.contains_key(&addr)
+            && !program.configured_entries.contains(&addr)
+            && program.functions.get(&owner).is_some_and(|f| f.provisional)
+        {
+            program.region_entries.insert(addr, owner);
+        }
         program.interior.entry(addr).or_insert((owner, kind));
     }
     program.spans = program
@@ -1334,7 +1341,7 @@ impl<'a> Recovery<'a> {
 
     fn spans_are_padding(&self, owner: Addr, spans: &[Span]) -> bool {
         if self.mapped_span_at(owner).is_some()
-            || self.seeds.contains_key(&owner)
+            || self.seed_rank.get(&owner).is_some_and(|&rank| rank > RANK_POINTER)
             || self.known_entries.contains(&owner)
         {
             return false;

@@ -43,14 +43,12 @@ def bundle_ffmpeg(contents, libraries):
 
 def bundle_aux_dylibs(contents, libraries):
     """Embed each auxiliary translation, ID and sign it before the app."""
-    if not libraries:
-        return
     frameworks = contents / "Frameworks"
     frameworks.mkdir(parents=True, exist_ok=True)
     names = {source.name for source in libraries}
-    for stale in frameworks.glob("librecomp_piece_*.dylib"):
+    for stale in [*frameworks.glob("librecomp_piece_*.dylib"), frameworks / "librk_pcode_ffi.dylib"]:
         if stale.name not in names:
-            stale.unlink()
+            stale.unlink(missing_ok=True)
     for source in libraries:
         dest = frameworks / source.name
         shutil.copy2(source, dest)

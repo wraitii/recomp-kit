@@ -98,6 +98,7 @@ pub(crate) fn rewrite_aliases(s: &mut Ssa, alias: &impl Aliases) {
         for value in record
             .op
             .iter_mut()
+            .chain(record.kind_value.iter_mut())
             .chain(record.a.iter_mut())
             .chain(record.b.iter_mut())
             .chain(record.carry.iter_mut())
@@ -469,7 +470,8 @@ pub fn canonicalize(s: &mut Ssa, signed_sub: bool) {
                 } else if args.iter().enumerate().all(|(index, &arg)| {
                     let byte = &s.values[arg as usize];
                     byte.op == Op::Byte(index as u8) && byte.args_len == 1
-                        && resolve_alias(&alias, s.args[byte.args_start as usize]) == args[0]
+                        && resolve_alias(&alias, s.args[byte.args_start as usize])
+                            == resolve_alias(&alias, s.args(args[0])[0])
                 }) {
                     let first = &s.values[args[0] as usize];
                     let source = resolve_alias(&alias, s.args[first.args_start as usize]);

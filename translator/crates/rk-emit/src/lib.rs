@@ -40,7 +40,10 @@ pub struct EmitContext<'a> {
     pub private_masks: &'a BTreeMap<Addr, BTreeSet<Fields>>,
     pub private_input_arguments: &'a BTreeMap<Addr, String>,
     pub known_entries: &'a BTreeSet<Addr>,
+    pub region_entries: &'a BTreeMap<Addr, Addr>,
     pub setjmp_targets: &'a BTreeSet<Addr>,
+    pub guest_calls: &'a BTreeMap<Addr, Vec<Addr>>,
+    pub host_calls: &'a BTreeSet<Addr>,
     pub private: Option<&'a PrivateEmit>,
 }
 
@@ -437,8 +440,17 @@ impl<'a> Emitter<'a> {
             );
         }
         if self.multi {
+            if self.ctx.region_entries.values().any(|&owner| owner == addr) {
+                let args = self.call_args(Some(addr), None).replace(&format!("0x{addr:08x}u"), "target");
+                let _ = writeln!(self.out, "void region_{addr:08x}(X86 *c, uint32_t target) {{ {body}({args}); }}");
+            }
             for entry in &self.s.entries {
-                if entry.addr == addr {
+                let seh_callback = self.ctx.ir.seh.iter().any(|(&index, kinds)| {
+                    let insn = &self.ctx.ir.insns[index as usize];
+                    insn.addr + Addr::from(insn.length) == entry.addr
+                        && kinds.iter().any(|kind| matches!(kind, SehEffect::Enter | SehEffect::Adopt))
+                });
+                if entry.addr == addr || (self.ctx.region_entries.contains_key(&entry.addr) && !seh_callback) {
                     continue;
                 }
                 let args = self.call_args(Some(entry.addr), None);
@@ -612,8 +624,16 @@ impl<'a> Emitter<'a> {
                 let _ = writeln!(self.out, "case 0x{:08x}u:", entry.addr);
                 self.edge(None, entry.target as usize)?;
             }
-            self.out.push_str("default:;\n");
+            let region = self.ctx.region_entries.values().any(|&owner| owner == self.s.addr);
+            if region {
+                let _ = writeln!(self.out, "case 0u: case 0x{:08x}u:", primary.addr);
+            } else {
+                self.out.push_str("default:;\n");
+            }
             self.edge(None, primary.target as usize)?;
+            if region {
+                self.out.push_str("default: recomp_region_missing(c, entry_); return;\n");
+            }
             self.out.push_str("}\n");
         } else if primary.target == 0 && !self.transfers.edges.contains(&(DISPATCH_BLOCK, 0)) {
             self.edge_copies(DISPATCH_BLOCK, primary.target as usize)?;
@@ -650,12 +670,10 @@ impl<'a> Emitter<'a> {
         }
         {
             let item = &self.s.blocks[block];
+            let mut commented_addr = None;
             if let Some(insn) = self.ctx.ir.insns.get(item.start as usize) {
-                let _ = writeln!(
-                    self.out,
-                    "// {:08x}: {}",
-                    insn.addr, insn.text
-                );
+                let _ = writeln!(self.out, "// {}", insn.text);
+                commented_addr = Some(insn.addr);
             }
             let block_lines = self.x87_lines(|x87, names| x87.block_lines(self.clone, block as u32, names))?;
             self.write_x87(block_lines);
@@ -663,6 +681,14 @@ impl<'a> Emitter<'a> {
             let mut continues = true;
             for (position, value) in ops.iter().copied().enumerate() {
                 let live = self.plan.live.contains(&value);
+                let addr = self.s.value_addr[value as usize];
+                if (live || self.reload_defs.contains_key(&value)) && commented_addr != Some(addr) {
+                    if let Some(index) = self.ctx.ir.index_of(addr) {
+                        let insn = &self.ctx.ir.insns[index as usize];
+                        let _ = writeln!(self.out, "// {}", insn.text);
+                        commented_addr = Some(addr);
+                    }
+                }
                 if live {
                     if let (
                         Op::Branch { target: branch },
@@ -1469,6 +1495,13 @@ impl<'a> Emitter<'a> {
             self.out.push_str("RECOMP_SETJMP3(c);\n");
             return Ok(());
         }
+        if !self.ctx.known_entries.contains(&target) {
+            let _ = writeln!(self.out, "recomp_call(c, 0x{target:08x}u);");
+            if self.plan.settle_sites.contains(&value) {
+                self.out.push_str("x86_cc_settle(c);\n");
+            }
+            return Ok(());
+        }
         if let Some((private_target, wanted)) = self.plan.call_masks.get(&value).copied() {
             if private_target == target {
                 if let Some(mask) = self
@@ -1537,12 +1570,14 @@ impl<'a> Emitter<'a> {
         let target = args.get(1).or_else(|| args.first()).copied()
             .ok_or_else(|| self.error(addr, "indirect call without target"))?;
         let target = self.expr(target)?;
-        let name = format!("ic_{:08x}_{:08x}", self.s.addr, addr);
-        self.requires.icaches.insert(name.clone());
-        let _ = writeln!(
-            self.out,
-            "recomp_icall(c, (uint32_t)({target}), &{name}, 0x{addr:08x}u);"
-        );
+        let helper = if self.ctx.guest_calls.contains_key(&addr) {
+            "recomp_icall_guest"
+        } else if self.ctx.host_calls.contains(&addr) {
+            "recomp_icall_host"
+        } else {
+            "recomp_icall"
+        };
+        let _ = writeln!(self.out, "{helper}(c, (uint32_t)({target}), 0x{addr:08x}u);");
         if self.plan.settle_sites.contains(&value) {
             self.out.push_str("x86_cc_settle(c);\n");
         }
@@ -1815,14 +1850,16 @@ impl<'a> Emitter<'a> {
             .filter_map(|key| self.s.field(*key))
             .filter(|field| Fields::FLAGS.contains(*field))
             .collect();
-        let descriptor = flags_action
-            .then(|| self.plan.flag_publish.get(&value))
-            .flatten()
+        let publication = self.plan.flag_publish.get(&value);
+        let descriptor = publication
             .and_then(|publication| publication.descriptor)
             .map(|descriptor| (descriptor, descriptor.mask & flag_fields))
             .filter(|(_, mask)| !mask.is_empty());
-        if !flag_fields.is_empty() {
-            let need = cc_mask(Fields::FLAGS.difference(flag_fields));
+        let forwarded = publication.map_or(Fields::NONE, |publication| publication.forwarded) & flag_fields;
+        let mask = descriptor.map_or(Fields::NONE, |(_, mask)| mask);
+        let written = mask | (flag_fields & !mask & !forwarded);
+        if !written.is_empty() {
+            let need = cc_mask(Fields::FLAGS.difference(written));
             if need == 0 {
                 self.out.push_str("x86_cc_drop(c);\n");
             } else {
@@ -1832,6 +1869,11 @@ impl<'a> Emitter<'a> {
         if let Some((_, mask)) = descriptor {
             locations.retain(|location| {
                 !matches!(location, Location::Flag(field) if mask.contains(*field))
+            });
+        }
+        if !forwarded.is_empty() {
+            locations.retain(|location| {
+                !matches!(location, Location::Flag(field) if forwarded.contains(*field))
             });
         }
         for location in locations {
@@ -1844,15 +1886,12 @@ impl<'a> Emitter<'a> {
     }
 
     fn publish_descriptor(&mut self, descriptor: &FlagDescriptor, mask: Fields) -> Result<()> {
-        let op = match descriptor.kind {
-            rk_ssa::FlagKind::Add => "X86_CC_ADD",
-            rk_ssa::FlagKind::Sub | rk_ssa::FlagKind::Cmp => "X86_CC_SUB",
-            rk_ssa::FlagKind::Logic => "X86_CC_LOGIC",
-            rk_ssa::FlagKind::Inc => "X86_CC_INC",
-            rk_ssa::FlagKind::Dec => "X86_CC_DEC",
-            rk_ssa::FlagKind::Adc => "X86_CC_ADC",
-            rk_ssa::FlagKind::Sbb => "X86_CC_SBB",
-            rk_ssa::FlagKind::Incoming | rk_ssa::FlagKind::Join => return Ok(()),
+        let op = match (descriptor.kind, descriptor.kind_value) {
+            (rk_ssa::FlagKind::Join, Some(value)) => self.expr(value)?,
+            (kind, _) => match rk_ssa::cc_kind(kind) {
+                Some(kind) => support::cc_kind_name(kind).to_string(),
+                None => return Ok(()),
+            },
         };
         let (a, b, carry) = match descriptor.kind {
             rk_ssa::FlagKind::Logic => ("0u".to_string(), "0u".to_string(), "0u".to_string()),
@@ -1861,7 +1900,7 @@ impl<'a> Emitter<'a> {
                 "0u".to_string(),
                 "0u".to_string(),
             ),
-            rk_ssa::FlagKind::Adc | rk_ssa::FlagKind::Sbb => (
+            rk_ssa::FlagKind::Adc | rk_ssa::FlagKind::Sbb | rk_ssa::FlagKind::Join => (
                 self.expr(descriptor.a.unwrap_or(0))?,
                 self.expr(descriptor.b.unwrap_or(0))?,
                 self.expr(descriptor.carry.unwrap_or(0))?,
@@ -2165,6 +2204,7 @@ impl<'a> Emitter<'a> {
         match item.op {
             Op::Const(data) => Ok(const_expr(data, item.size)),
             Op::Input(key) | Op::StateReload(key) => self.field_expr(key, item.size),
+            Op::CcKind(kind) => Ok(cc_kind_name(kind).to_string()),
             Op::Target(addr) => Ok(format!("0x{addr:08x}u")),
             Op::Memory => Ok("0u".to_string()),
             Op::Byte(index) => Ok(format!(
@@ -2223,6 +2263,7 @@ impl<'a> Emitter<'a> {
         let result = match item.op {
             Op::Const(data) => const_expr(data, item.size),
             Op::Input(key) => self.field_expr(key, item.size)?,
+            Op::CcKind(kind) => cc_kind_name(kind).to_string(),
             Op::Target(addr) => format!("0x{addr:08x}u"),
             Op::Byte(index) => format!("(({}) >> {})", a(0)?, index as u32 * 8),
             Op::Pack => match self.pack_lanes(args) {
@@ -2310,10 +2351,15 @@ impl<'a> Emitter<'a> {
                 OpCode::IntLess => format!("(({}) < ({}))", a(0)?, a(1)?),
                 OpCode::IntLessEqual => format!("(({}) <= ({}))", a(0)?, a(1)?),
                 OpCode::IntSLess | OpCode::IntSLessEqual => {
-                    let bits = args.first().map_or(32, |arg| self.s.value(*arg).size) * 8;
-                    let sign = if bits >= 64 { format!("0x{:x}ull", 1u64 << 63) } else { format!("0x{:x}u", 1u32 << (bits - 1)) };
+                    let size = args.first().map_or(4, |arg| self.s.value(*arg).size);
                     let op = if code == OpCode::IntSLess { "<" } else { "<=" };
-                    format!("((({}) ^ {sign}) {op} (({}) ^ {sign}))", a(0)?, a(1)?)
+                    if matches!(size, 1 | 2 | 4 | 8) {
+                        let ty = signed_type(size);
+                        format!("(({ty})({}) {op} ({ty})({}))", a(0)?, a(1)?)
+                    } else {
+                        let sign = const_expr(1u64 << (size * 8 - 1), size);
+                        format!("((({}) ^ {sign}) {op} (({}) ^ {sign}))", a(0)?, a(1)?)
+                    }
                 }
                 OpCode::IntLeft | OpCode::IntRight => {
                     let bits = args.first().map_or(32, |arg| self.s.value(*arg).size) * 8;

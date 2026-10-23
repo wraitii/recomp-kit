@@ -29,6 +29,7 @@ struct Input {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Translate {
+    pub dispatch: Option<Dispatch>,
     pub fault_state: FaultState,
     pub msvc_x87_convention: bool,
     pub call_contracts: bool,
@@ -52,6 +53,13 @@ pub struct Translate {
     pub entry_points: Vec<Addr>,
     pub discover: Option<bool>,
     pub native: Native,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Dispatch {
+    pub shift: u8,
+    pub max_probe: u32,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -263,6 +271,7 @@ pub struct Settings {
     pub checked_returns: BTreeSet<Addr>,
     pub state_contract_callers: BTreeSet<Addr>,
     pub discover: bool,
+    pub dispatch: Option<Dispatch>,
     pub fault_state: FaultState,
     pub msvc_x87_convention: bool,
     pub x87_cw_clone: bool,
@@ -415,6 +424,7 @@ impl Settings {
             discovery_evidence: resolve(&t.discovery_evidence),
             native_header: resolve(&t.native.header),
             call_effects: CallEffects { sites, imports },
+            dispatch: t.dispatch.clone(),
             call_contracts: t.call_contracts,
             stack_memory: t.stack_memory,
             private_leaf_contracts: t.private_leaf_contracts && main,

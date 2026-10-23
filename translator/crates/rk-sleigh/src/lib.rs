@@ -29,6 +29,14 @@ pub struct Lifted {
     pub x87: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct RawLifted {
+    pub length: u8,
+    pub ops: Vec<PcodeOp>,
+    pub userops: Vec<u64>,
+    pub mnemonic: String,
+}
+
 pub struct Lifter {
     sleigh: GhidraSleigh,
     code_space: AddressSpace,
@@ -75,12 +83,7 @@ impl Lifter {
                 Some((v.address.offset, v.size as u32))
             })
             .collect();
-        Ok(Self {
-            sleigh,
-            code_space,
-            register_names,
-            diagnostic,
-        })
+        Ok(Self { sleigh, code_space, register_names, diagnostic })
     }
 
     pub fn register_name(&self, offset: u64, size: u32) -> Option<&str> {
@@ -89,6 +92,65 @@ impl Lifter {
 
     pub fn registers(&self) -> impl Iterator<Item = (&str, u64, u32)> {
         self.register_names.iter().map(|(&(offset, size), name)| (name.as_str(), offset, size))
+    }
+
+    pub fn lift_raw(&self, addr: Addr, data: &[u8]) -> Result<RawLifted> {
+        let decoded = self
+            .translate_one(addr, data)
+            .map_err(|e| Diagnostic::error(addr, Reason::LiftFailed { detail: e.to_string() }))?;
+        let length = u8::try_from(decoded.origin.size).map_err(|_| {
+            Diagnostic::error(addr, Reason::LiftFailed { detail: "instruction longer than 255 bytes".into() })
+        })?;
+        if length == 0 {
+            return Err(Diagnostic::error(addr, Reason::LiftFailed { detail: "no instruction mark".into() }));
+        }
+        if length as usize > data.len() {
+            return Err(Diagnostic::error(addr, Reason::LiftFailed {
+                detail: format!("SLEIGH length {length} overruns supplied bytes {}", data.len()),
+            }));
+        }
+        if length > 15 {
+            return Err(Diagnostic::error(addr, Reason::LiftFailed {
+                detail: format!("x86 instruction length {length} exceeds 15"),
+            }));
+        }
+        let mnemonic = self
+            .translate_native_one(addr, data)
+            .map_err(|e| Diagnostic::error(addr, Reason::LiftFailed { detail: e.to_string() }))?
+            .instruction
+            .mnemonic;
+        let mut ops = Vec::new();
+        let mut userops = Vec::new();
+        for op in decoded.instructions {
+            let opcode = map_opcode(op.op_code);
+            if opcode == OpCode::Unknown {
+                return Err(Diagnostic::error(addr, Reason::Unsupported {
+                    detail: format!("raw p-code opcode {:?}", op.op_code),
+                }));
+            }
+            let output = op.output.as_ref().map(raw_varnode).transpose()?;
+            let mut inputs = Vec::with_capacity(op.inputs.len());
+            for (index, v) in op.inputs.iter().enumerate() {
+                if index == 0 && matches!(op.op_code, SleighOp::Load | SleighOp::Store) {
+                    let id = libsla::AddressSpaceId::new(v.address.offset as usize);
+                    let space = unsafe { AddressSpace::from_ghidra_id(id) };
+                    let tag = raw_space_name(&space.name, &space.id)?;
+                    inputs.push(Varnode::new(tag, 0, u32::try_from(space.address_size).unwrap_or(u32::MAX)));
+                } else {
+                    inputs.push(raw_varnode(v)?);
+                }
+            }
+            let userop = match op.op_code {
+                SleighOp::Pseudo(libsla::PseudoOp::CallOther) => {
+                    let id = op.inputs.first().map(|v| v.address.offset);
+                    if let Some(id) = id { userops.push(id); }
+                    id
+                }
+                _ => None,
+            };
+            ops.push(PcodeOp { opcode, output, inputs, userop });
+        }
+        Ok(RawLifted { length, ops, userops, mnemonic })
     }
 
     pub fn lengths(&self, addr: Addr, data: &[u8]) -> Result<Vec<u8>> {
@@ -204,6 +266,12 @@ impl Lifter {
             .disassemble_pcode(&loader, Address::new(self.code_space.clone(), addr as u64))
     }
 
+    fn translate_native_one(&self, addr: Addr, data: &[u8]) -> std::result::Result<libsla::NativeDisassembly, libsla::Error> {
+        let loader = SliceLoader { base: addr as u64, data };
+        self.sleigh
+            .disassemble_native(&loader, Address::new(self.code_space.clone(), addr as u64))
+    }
+
     fn convert_all(&self, raw: Vec<PcodeInstruction>) -> Result<Vec<PcodeOp>> {
         let mut out = Vec::with_capacity(raw.len());
         for op in raw {
@@ -292,6 +360,21 @@ impl Lifter {
         };
         Ok(Varnode::new(space, v.address.offset, v.size as u32))
     }
+}
+
+fn raw_space_name(name: &str, id: &libsla::AddressSpaceId) -> Result<Space> {
+    match name {
+        "const" => Ok(Space::Const),
+        "ram" => Ok(Space::Ram),
+        "register" => Ok(Space::Register),
+        "unique" => Ok(Space::Unique),
+        _ => Err(rk_core::Error::input(format!("unexpected SLEIGH space {name} ({id})"))),
+    }
+}
+
+fn raw_varnode(v: &VarnodeData) -> Result<Varnode> {
+    let space = raw_space_name(&v.address.address_space.name, &v.address.address_space.id)?;
+    Ok(Varnode::new(space, v.address.offset, u32::try_from(v.size).unwrap_or(u32::MAX)))
 }
 
 fn st_index(v: Option<&Varnode>) -> Option<u32> {

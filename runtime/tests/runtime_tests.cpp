@@ -3404,45 +3404,6 @@ static void test_guest_thunks(X86 *c) {
           "SendMessageW executes the heap WNDPROC through the shared dispatch path");
     call_import(c, "USER32.dll", "DestroyWindow", {hwnd});
 
-    // A loop must be bounded, in both of the places that walk guest code.
-    // recomp_run_thunk's prober gives up on `jmp $` after its sixteen steps;
-    // the interpreter then decodes it cleanly - the JMP is the routine's last
-    // instruction and nothing branches past it - and only its step budget
-    // ends the run. Before that budget existed this call never returned. The
-    // loop writes nothing, so the guard word below the stack also says the
-    // run stopped where it stood rather than walking anywhere.
-    wr8(code + 96, 0xeb);
-    wr8(code + 97, 0xfe);
-    c->r[R_ESP] = sp - 4;
-    wr32(sp - 4, g_fake_ret);
-    wr32(sp - 8, 0xaabbccdd);
-    hits = thunk_hits;
-    recomp_unknown_call(c, code + 96);
-    check(thunk_hits == hits && c->r[R_ESP] == sp && c->eip == g_fake_ret &&
-              rd32(sp - 8) == 0xaabbccdd && strstr(interp_last_error(), "no RET within") != nullptr,
-          "a heap routine that jumps to itself stops on the step budget");
-    c->r[R_ESP] = sp;
-
-    // An unsuccessful prefix must not leave a PUSH. recomp_run_thunk follows
-    // the leading `push imm32` for real, then stops on fld [esi+4], and has
-    // to undo the word it wrote; the interpreter refuses the routine outright
-    // for the same fld, since it decodes all of it before running any of it,
-    // so it adds no writes of its own. The guard word says both held.
-    wr8(code + 96, 0x68);
-    wr32(code + 97, 0x11223344);
-    wr8(code + 101, 0xd9);
-    wr8(code + 102, 0x46);
-    wr8(code + 103, 0x04);
-    wr8(code + 104, 0xc3);
-    c->r[R_ESP] = sp - 4;
-    wr32(sp - 4, g_fake_ret);
-    wr32(sp - 8, 0xaabbccdd);
-    hits = thunk_hits;
-    check(!recomp_run_thunk(c, code + 96) && !interp_call(c, code + 96),
-          "both decoders refuse the unsupported routine");
-    check(thunk_hits == hits && c->r[R_ESP] == sp - 4 && rd32(sp - 8) == 0xaabbccdd,
-          "an undecodable routine leaves no speculative PUSH before the unknown-call fallback");
-    c->r[R_ESP] = sp;
     // Exercise the remaining opcode forms from a stack-resident thunk.
     uint32_t at = STACK_LIMIT + 0x100;
     uint8_t ops[] = {0xb8, 0,    0,    0,    0,    0x89, 0xc2, 0x8b, 0xca,

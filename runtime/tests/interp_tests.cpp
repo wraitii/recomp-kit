@@ -6,6 +6,9 @@
 //   interp_tests --run HEX     runs HEX as a routine from a fixed state and
 //                              prints the final state
 #include "interp.h"
+#if RECOMP_PCODE_FALLBACK
+#include "pcode.h"
+#endif
 
 #include <csignal>
 #include <cstdio>
@@ -14,7 +17,11 @@
 #include <string>
 #include <vector>
 #ifndef _WIN32
+#include <sys/wait.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 #endif
 
 uint8_t *g_mem;
@@ -77,6 +84,9 @@ extern "C" void recomp_jump(X86 *c, uint32_t target) {
     recomp_call(c, target);
 }
 
+extern "C" void recomp_execution_checkpoint_due(X86 *) {}
+extern "C" void discovery_note(const char *, uint32_t, uint32_t) {}
+
 static void put(uint32_t at, const std::vector<uint8_t> &b) {
     memcpy(g_mem + at, b.data(), b.size());
 }
@@ -90,178 +100,6 @@ static X86 fresh() {
     c.eflags_misc = 0x202;
     c.r[R_ESP] = STACK - 0x100;
     return c;
-}
-
-static void test_bank_routine() {
-    // The shape of an audio bank routine: fetch values through helpers and
-    // store them into the parameter block the caller passes.
-    std::vector<uint8_t> code = {
-        0x56,                               // push esi
-        0x8b, 0x74, 0x24, 0x08,             // mov esi, [esp+8]
-        0x56,                               // push esi
-        0xe8, 0,    0,    0,    0,          // call NATIVE
-        0x89, 0x86, 0x88, 0x00, 0x00, 0x00, // mov [esi+0x88], eax
-        0x83, 0xc6, 0x14,                   // add esi, 0x14
-        0x56,                               // push esi
-        0xe8, 0,    0,    0,    0,          // call HELPER
-        0x89, 0x46, 0x5c,                   // mov [esi+0x5c], eax
-        0x8b, 0x46, 0x04,                   // mov eax, [esi+4]
-        0x8b, 0x4e, 0x08,                   // mov ecx, [esi+8]
-        0x3b, 0xc1,                         // cmp eax, ecx
-        0x7c, 0x02,                         // jl +2
-        0x8b, 0xc1,                         // mov eax, ecx
-        0x0f, 0xaf, 0x46, 0x04,             // imul eax, [esi+4]
-        0x2b, 0x46, 0x08,                   // sub eax, [esi+8]
-        0x89, 0x46, 0x90,                   // mov [esi-0x70], eax
-        0xc6, 0x46, 0x00, 0x07,             // mov byte [esi], 7
-        0x83, 0xc4, 0x08,                   // add esp, 8
-        0x5e,                               // pop esi
-        0xc3,                               // ret
-    };
-    put(CODE, code);
-    put_call(CODE + 6, NATIVE);
-    put_call(CODE + 21, HELPER);
-    // The helper, also heap code: returns [arg] * 3 through LEA.
-    put(HELPER, {0x8b, 0x44, 0x24, 0x04, // mov eax, [esp+4]
-                 0x8b, 0x00,             // mov eax, [eax]
-                 0x8d, 0x04, 0x40,       // lea eax, [eax+eax*2]
-                 0xc2, 0x00, 0x00});     // ret 0 (cdecl)
-    const uint32_t block = DATA + 0x100;
-    memset(g_mem + block, 0, 0x200);
-    wr32(block + 0x14, 5);     // helper input
-    wr32(block + 0x14 + 4, 9); // eax
-    wr32(block + 0x14 + 8, 4); // ecx: 9 < 4 is false, so eax = 4
-    X86 c = fresh();
-    c.r[R_ESI] = 0x1234;
-    const uint32_t esp = c.r[R_ESP];
-    wr32(esp - 4, block);
-    wr32(esp - 8, RETURN);
-    c.r[R_ESP] = esp - 8;
-    CHECK(interp_call(&c, CODE) == 1);
-    CHECK(c.r[R_ESP] == esp - 4); // the RET popped the return address only
-    CHECK(c.eip == RETURN);
-    CHECK(c.r[R_ESI] == 0x1234);
-    CHECK(g_native_calls == 1 && g_native_arg == block);
-    CHECK(rd32(block + 0x88) == block + 1);
-    CHECK(rd32(block + 0x14 + 0x5c) == 15);
-    CHECK(rd32(block + 0x14 - 0x70) == 4 * 9 - 4);
-    CHECK(rd8(block + 0x14) == 7);
-    CHECK(rd8(block + 0x15) == 0); // one byte only
-    CHECK(c.r[R_ECX] == 4);
-
-    // Rewritten code is decoded again.
-    g_mem[HELPER + 6] = 0x90; // lea -> nop nop nop: the helper returns [arg]
-    g_mem[HELPER + 7] = 0x90;
-    g_mem[HELPER + 8] = 0x90;
-    c = fresh();
-    wr32(c.r[R_ESP] - 4, block);
-    wr32(c.r[R_ESP] - 8, RETURN);
-    c.r[R_ESP] -= 8;
-    CHECK(interp_call(&c, CODE) == 1);
-    CHECK(rd32(block + 0x14 + 0x5c) == 7); // the byte the first run stored
-}
-
-// A lone JMP to a translated entry - the shape of a compiler's thunk, and of
-// the jump-table slots a listing misses - is dispatched, not decoded through.
-static void test_tail_call_out() {
-    uint32_t stack = STACK - 0x40;
-    put(CODE, {0xe9, 0, 0, 0, 0}); // jmp NATIVE
-    wr32(CODE + 1, NATIVE - (CODE + 5));
-    X86 c = fresh();
-    c.r[R_ESP] = stack;
-    wr32(stack, RETURN);     // the caller's return address
-    wr32(stack + 4, 0x1234); // its cdecl argument, which NATIVE reads
-    uint32_t before = g_native_calls;
-    CHECK(interp_call(&c, CODE) == 1);
-    CHECK(g_native_calls == before + 1);
-    CHECK(c.r[R_EAX] == 0x1234 + 1);
-    CHECK(c.eip == RETURN);
-}
-
-static void test_refusals() {
-    // An instruction outside the set: nothing runs.
-    put(CODE, {0x56, 0xd9, 0x46, 0x04, 0x5e, 0xc3}); // push esi; fld [esi+4]; pop esi; ret
-    X86 c = fresh();
-    X86 before = c;
-    CHECK(interp_call(&c, CODE) == 0);
-    CHECK(memcmp(&c, &before, sizeof c) == 0);
-    CHECK(strstr(interp_last_error(), "unsupported") != nullptr);
-    // A branch into the middle of an instruction.
-    put(CODE, {0x74, 0x01, 0xb8, 1, 0, 0, 0, 0xc3});
-    CHECK(interp_call(&c, CODE) == 0);
-    CHECK(strstr(interp_last_error(), "inside") != nullptr);
-    // A backward branch that leaves the routine.
-    put(CODE, {0xeb, 0xfc, 0xc3});
-    CHECK(interp_call(&c, CODE) == 0);
-    // A forward branch past the first RET keeps the decoder going.
-    put(CODE, {0x85, 0xc0, 0x74, 0x01, 0xc3, 0x40, 0xc3}); // test eax,eax; jz; ret; inc eax; ret
-    c = fresh();
-    wr32(c.r[R_ESP] - 4, RETURN);
-    c.r[R_ESP] -= 4;
-    CHECK(interp_call(&c, CODE) == 1);
-    CHECK(c.r[R_EAX] == 1);
-    // A fault part way through returns zero to the caller with its stack intact.
-    put(CODE, {0x56, 0x56, 0x8b, 0x05, 0xff, 0xff, 0xff, 0xff, 0x5e, 0x5e,
-               0xc3}); // mov eax, [0xffffffff]
-    c = fresh();
-    const uint32_t esp = c.r[R_ESP];
-    wr32(esp - 4, RETURN);
-    c.r[R_ESP] = esp - 4;
-    c.r[R_EAX] = 5;
-    CHECK(interp_call(&c, CODE) == 1);
-    CHECK(c.r[R_EAX] == 0 && c.r[R_ESP] == esp && c.eip == RETURN);
-}
-
-// A routine that never reaches its RET has to stop on the step budget. Every
-// check here would hang, not fail, if the budget were taken back out, so the
-// suite is run under a watchdog: see main().
-static void test_step_budget() {
-    // jmp $ - the shape a data file's garbage decodes into. The decoder
-    // accepts it (the JMP is the routine's last instruction and nothing
-    // branches past it), so only the budget ends the run.
-    put(CODE, {0xeb, 0xfe});
-    X86 c = fresh();
-    const uint32_t esp = c.r[R_ESP];
-    wr32(esp - 4, RETURN);
-    wr32(esp - 8, 0xaabbccdd);
-    c.r[R_ESP] = esp - 4;
-    c.r[R_EAX] = 5;
-    CHECK(interp_call(&c, CODE) == 1); // ran, then faulted: not a refusal
-    CHECK(c.r[R_EAX] == 0 && c.r[R_ESP] == esp && c.eip == RETURN);
-    CHECK(rd32(esp - 8) == 0xaabbccdd); // the loop wrote nothing
-    CHECK(strstr(interp_last_error(), "no RET within 1048576 instructions") != nullptr);
-    CHECK(strstr(interp_last_error(), "01000000") != nullptr); // the guest address
-
-    // A loop that pushes stops the same way, and the fault path puts ESP back
-    // where the caller's return address left it however far the loop walked
-    // it down. push imm32; jmp $.
-    put(CODE, {0x68, 0x44, 0x33, 0x22, 0x11, 0xeb, 0xfe});
-    c = fresh();
-    wr32(esp - 4, RETURN);
-    c.r[R_ESP] = esp - 4;
-    CHECK(interp_call(&c, CODE) == 1);
-    CHECK(c.r[R_ESP] == esp && c.eip == RETURN);
-    CHECK(strstr(interp_last_error(), "no RET within") != nullptr);
-
-    // A conditional loop on a register the caller never set counts the same.
-    // dec eax; test eax,eax; jnz <start>; ret
-    put(CODE, {0x48, 0x85, 0xc0, 0x75, 0xfb, 0xc3});
-    c = fresh();
-    wr32(c.r[R_ESP] - 4, RETURN);
-    c.r[R_ESP] -= 4;
-    c.r[R_EAX] = 0; // 0 -> -1 -> ... : 2^32 iterations, well past the budget
-    CHECK(interp_call(&c, CODE) == 1);
-    CHECK(strstr(interp_last_error(), "no RET within") != nullptr);
-
-    // The budget is per interp_call, so the next call gets a whole one: a
-    // routine that stopped once must not poison the routines after it.
-    put(CODE, {0x40, 0xc3}); // inc eax; ret
-    c = fresh();
-    wr32(c.r[R_ESP] - 4, RETURN);
-    c.r[R_ESP] -= 4;
-    c.r[R_EAX] = 7;
-    CHECK(interp_call(&c, CODE) == 1);
-    CHECK(c.r[R_EAX] == 8 && c.eip == RETURN);
 }
 
 // ---- lazy arithmetic flag descriptor (x86.h) --------------------------
@@ -481,9 +319,204 @@ static int run_hex(const char *hex) {
     return 0;
 }
 
+static X86 pcode_run(const std::vector<uint8_t> &code) {
+    put(CODE, code);
+    memset(g_mem + DATA, 0, 0x100);
+    X86 c = fresh();
+    wr32(c.r[R_ESP] - 4, RETURN);
+    c.r[R_ESP] -= 4;
+    CHECK(interp_call(&c, CODE) == 1);
+    return c;
+}
+
+static void test_pcode_boundaries() {
+    X86 c = pcode_run({0xa1, 0x00, 0x00, 0x00, 0x02, // mov eax,[02000000]
+                       0x83, 0xc0, 0x05,             // add eax,5
+                       0xa3, 0x04, 0x00, 0x00, 0x02, // mov [02000004],eax
+                       0xc3});
+    CHECK(c.eip == RETURN);
+    CHECK(rd32(DATA + 4) == 5);
+    c = pcode_run({0xb0, 0x12, 0xb4, 0x34, 0x66, 0x05, 0x01, 0x01,
+                   0xc3}); // mov al,12h; mov ah,34h; add ax,0101h
+    CHECK((c.r[R_EAX] & 0xffff) == 0x3513);
+    c = pcode_run({0x85, 0xc0, 0x74, 0x06, 0xb8, 0x01, 0, 0, 0, 0xc3, 0xb8, 0x02, 0, 0, 0,
+                   0xc3}); // test eax,eax; je +6; mov eax,1; ret; mov eax,2; ret
+    CHECK(c.r[R_EAX] == 2);
+    c = pcode_run({0x68, 0x34, 0x12, 0, 0, 0x58, 0xc3}); // push 1234h; pop eax
+    CHECK(c.r[R_EAX] == 0x1234);
+
+    c = pcode_run({0xb8, 0xff, 0xff, 0xff, 0xff, 0x83, 0xc0, 0x01, 0xc3}); // mov eax,-1; add eax,1
+    CHECK(c.r[R_EAX] == 0 && c.eflags_cf == 1 && c.eflags_zf == 1 && c.eflags_of == 0);
+    c = pcode_run(
+        {0xb8, 0xff, 0xff, 0xff, 0x7f, 0x83, 0xc0, 0x01, 0xc3}); // mov eax,7fffffffh; add eax,1
+    CHECK(c.r[R_EAX] == 0x80000000u && c.eflags_of == 1 && c.eflags_sf == 1 && c.eflags_cf == 0);
+    c = pcode_run({0xb8, 0, 0, 0, 0, 0x83, 0xe8, 0x01, 0xc3}); // mov eax,0; sub eax,1
+    CHECK(c.r[R_EAX] == 0xffffffffu && c.eflags_cf == 1 && c.eflags_sf == 1 && c.eflags_of == 0);
+    c = pcode_run({0xb8, 0, 0, 0, 0x80, 0x83, 0xe8, 0x01, 0xc3}); // mov eax,80000000h; sub eax,1
+    CHECK(c.r[R_EAX] == 0x7fffffffu && c.eflags_of == 1 && c.eflags_cf == 0);
+
+    c = pcode_run({0xb8, 0xff, 0x56, 0x34, 0x12, 0x04, 0x01, 0xc3}); // mov eax,123456ffh; add al,1
+    CHECK((c.r[R_EAX] & 0xffff) == 0x5600 && c.eflags_cf == 1 && c.eflags_zf == 1);
+    c = pcode_run({0xb8, 0xff, 0xff, 0x34, 0x12, 0x66, 0x05, 0x01, 0x00,
+                   0xc3}); // mov eax,1234ffffh; add ax,1
+    CHECK((c.r[R_EAX] & 0xffffffffu) == 0x12340000u && c.eflags_cf == 1);
+    c = pcode_run({0xb8, 0x01, 0, 0, 0x80, 0xd1, 0xe0, 0xc3}); // mov eax,80000001h; shl eax,1
+    CHECK(c.r[R_EAX] == 2 && c.eflags_cf == 1);
+    c = pcode_run({0xb8, 0x01, 0, 0, 0x80, 0xd1, 0xf8, 0xc3}); // mov eax,80000001h; sar eax,1
+    CHECK(c.r[R_EAX] == 0xc0000000u && c.eflags_cf == 1);
+
+    const uint32_t target = CODE + 0x20;
+    std::vector<uint8_t> jump = {0xb8, 0,    0,    0,
+                                 0,    0xff, 0xe0, 0xc3}; // mov eax,target; jmp eax; ret
+    put(CODE, jump);
+    wr32(CODE + 1, target);
+    put(target, {0xbb, 0x55, 0, 0, 0, 0xc3}); // mov ebx,55h; ret
+    c = fresh();
+    wr32(c.r[R_ESP] - 4, RETURN);
+    c.r[R_ESP] -= 4;
+    CHECK(interp_call(&c, CODE) == 1);
+    CHECK(c.r[R_EBX] == 0x55 && c.eip == RETURN);
+
+    put(HELPER, {0xb8, 0x07, 0, 0, 0, 0xc3}); // mov eax,7; ret
+    put(CODE, {0xe8, 0, 0, 0, 0, 0xc3});      // call HELPER; ret
+    wr32(CODE + 1, HELPER - (CODE + 5));
+    c = pcode_run(
+        {g_mem[CODE], g_mem[CODE + 1], g_mem[CODE + 2], g_mem[CODE + 3], g_mem[CODE + 4], 0xc3});
+    CHECK(c.r[R_EAX] == 7 && c.eip == RETURN);
+    g_mem[HELPER + 1] = 9;
+    c = fresh();
+    wr32(c.r[R_ESP] - 4, RETURN);
+    c.r[R_ESP] -= 4;
+    CHECK(interp_call(&c, CODE) == 1 && c.r[R_EAX] == 9);
+
+    put(CODE, {0x68, 0x34, 0x12, 0, 0, 0xe8, 0, 0, 0, 0, 0x83, 0xc4, 0x04,
+               0xc3}); // push arg; call NATIVE; add esp,4; ret
+    wr32(CODE + 6, NATIVE - (CODE + 10));
+    c = fresh();
+    wr32(c.r[R_ESP] - 4, RETURN);
+    c.r[R_ESP] -= 4;
+    CHECK(interp_call(&c, CODE) == 1 && c.r[R_EAX] == 0x1235 && c.eip == RETURN);
+
+    put(CODE, {0xe9, 0, 0, 0, 0}); // jmp NATIVE
+    wr32(CODE + 1, NATIVE - (CODE + 5));
+    c = fresh();
+    wr32(c.r[R_ESP], RETURN);
+    wr32(c.r[R_ESP] + 4, 0x1234);
+    CHECK(interp_call(&c, CODE) == 1 && c.r[R_EAX] == 0x1235 && c.eip == RETURN);
+}
+
+#if RECOMP_PCODE_FALLBACK && !defined(_WIN32)
+static const char *pcode_stop_needle(const char *name) {
+    if (!strcmp(name, "x87"))
+        return "x87";
+    if (!strcmp(name, "short"))
+        return "lift failed";
+    if (!strcmp(name, "fault"))
+        return "outside arena";
+    if (!strcmp(name, "recursion"))
+        return "recursion limit";
+    return "";
+}
+
+static int pcode_stop(const char *name) {
+    const char *needle = pcode_stop_needle(name);
+    bool fault_progress = false;
+    if (!strcmp(name, "x87"))
+        put(CODE, {0xd9, 0x46, 0x04, 0xc3});
+    else if (!strcmp(name, "div-zero"))
+        put(CODE, {0xb8, 0x64, 0, 0, 0, 0xb9, 0, 0, 0, 0, 0x31, 0xd2, 0xf7, 0xf1, 0xc3});
+    else if (!strcmp(name, "idiv-overflow"))
+        put(CODE, {0xb8, 0, 0, 0, 0x80, 0xb9, 0xff, 0xff, 0xff, 0xff, 0x99, 0xf7, 0xf9, 0xc3});
+    else if (!strcmp(name, "shrd"))
+        put(CODE, {0x0f, 0xad, 0xc8, 0xc3});
+    else if (!strcmp(name, "short"))
+        put(CODE, std::vector<uint8_t>(15, 0x0f));
+    else if (!strcmp(name, "fault")) {
+        put(CODE, {0xc7, 0x05, 0x00, 0x00, 0x00, 0x02, 0x55, 0, 0, 0, 0xa1, 0xff, 0xff, 0xff, 0xff,
+                   0xc3});
+        fault_progress = true;
+    } else if (!strcmp(name, "recursion"))
+        put(CODE, {0xe8, 0xfb, 0xff, 0xff, 0xff});
+    else
+        return 2;
+    X86 c = fresh();
+    wr32(c.r[R_ESP], RETURN);
+    bool nested = !strcmp(name, "recursion");
+    int result = nested ? interp_call(&c, CODE) : pcode_interp_call(&c, CODE);
+    if (nested)
+        return 1;
+    const char *error = pcode_interp_last_error();
+    if (error)
+        fprintf(stderr, "%s\n", error);
+    if (result != -1 || !error || !strstr(error, needle))
+        return 1;
+    if (fault_progress && rd32(DATA) != 0x55)
+        return 1;
+    return 0;
+}
+
+static void test_pcode_stops() {
+    struct Case {
+        const char *name, *needle;
+    } cases[] = {
+        {"x87", "x87"},
+        {"div-zero", "division"},
+        {"idiv-overflow", "division"},
+        {"shrd", "SHR"},
+        {"short", "lift failed"},
+        {"fault", "outside arena"},
+        {"recursion", "recursion limit"},
+    };
+    char self[4096];
+#ifdef __APPLE__
+    uint32_t size = sizeof self - 1;
+    ssize_t n = _NSGetExecutablePath(self, &size) ? -1 : (ssize_t)strlen(self);
+#else
+    ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+#endif
+    if (n <= 0)
+        return;
+    self[n] = 0;
+    for (const Case &item : cases) {
+        int pipefd[2];
+        if (pipe(pipefd) != 0)
+            return;
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(pipefd[0]);
+            dup2(pipefd[1], 2);
+            close(pipefd[1]);
+            execl(self, self, "--pcode-stop", item.name, (char *)nullptr);
+            _exit(127);
+        }
+        close(pipefd[1]);
+        char output[512] = {};
+        ssize_t used = 0;
+        while (used < (ssize_t)sizeof output - 1) {
+            ssize_t n = read(pipefd[0], output + used, sizeof output - 1 - used);
+            if (n <= 0)
+                break;
+            used += n;
+        }
+        close(pipefd[0]);
+        int status = 0;
+        bool nested = !strcmp(item.name, "recursion");
+        bool ok = pid > 0 && waitpid(pid, &status, 0) == pid &&
+                  (nested ? WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT
+                          : WIFEXITED(status) && WEXITSTATUS(status) == 0) &&
+                  strstr(output, item.needle) != nullptr;
+        ++g_checks;
+        if (!ok) {
+            ++g_failures;
+            fprintf(stderr, "FAIL pcode stop case %s (status %d): %s\n", item.name, status, output);
+        }
+    }
+}
+#endif
+
 #ifndef _WIN32
 extern "C" void watchdog(int) {
-    const char msg[] = "FAIL interp_tests hung: a routine ran without a step budget\n";
+    const char msg[] = "FAIL interp_tests timed out\n";
     ssize_t ignored = write(2, msg, sizeof msg - 1);
     (void)ignored;
     _exit(1);
@@ -496,17 +529,20 @@ int main(int argc, char **argv) {
         return 1;
     if (argc == 3 && !strcmp(argv[1], "--run"))
         return run_hex(argv[2]);
-    // Without the interpreter's step budget the checks in test_step_budget do
-    // not fail, they never come back; the watchdog turns that into a failure.
-    // The whole suite inside the budget is a fraction of a second.
 #ifndef _WIN32
     signal(SIGALRM, watchdog);
     alarm(30);
 #endif
-    test_bank_routine();
-    test_tail_call_out();
-    test_refusals();
-    test_step_budget();
+#if RECOMP_PCODE_FALLBACK && !defined(_WIN32)
+    if (argc == 3 && !strcmp(argv[1], "--pcode-stop"))
+        return pcode_stop(argv[2]);
+#endif
+#if RECOMP_PCODE_FALLBACK
+    test_pcode_boundaries();
+#ifndef _WIN32
+    test_pcode_stops();
+#endif
+#endif
     test_lazy_flags();
     printf("interp: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

@@ -63,6 +63,7 @@ pub fn prepare_with_publications(
     crate::validate(&ssa)?;
     canonicalize(&mut ssa, opts.signed_sub);
     forward(&mut ssa, opts.stack_reload, Some(opts.call_facts));
+    crate::flags::build_joins(&mut ssa);
     crate::coalesce::coalesce(&mut ssa, opts.coalesce_roots);
     canonicalize(&mut ssa, opts.signed_sub);
     let plans = opts.lazy_publications.then(|| {
@@ -83,6 +84,13 @@ pub fn prepare_with_publications(
             crate::FlagKind::Adc | crate::FlagKind::Sbb => {
                 vec![record.a, record.b, record.carry, record.result]
             }
+            crate::FlagKind::Join => vec![
+                record.kind_value,
+                record.a,
+                record.b,
+                record.carry,
+                record.result,
+            ],
             _ => vec![record.a, record.b, record.result],
         })
         .flatten()

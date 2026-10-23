@@ -21,18 +21,30 @@ std::string guest_key_name(uint32_t dik) {
 
 extern "C" uint8_t recomp_observe_on = 0;
 extern "C" uint32_t recomp_observe_site = 0;
-extern "C" uint32_t recomp_dispatch_epoch = 1;
 extern "C" void observe_record(uint32_t site, uint32_t target, const char *kind) {
     (void)site;
     (void)target;
     (void)kind;
 }
 extern "C" void observe_write(void) {}
-extern "C" void recomp_icall_slow(X86 *c, uint32_t target, RecompICache *ic, uint32_t site) {
-    (void)ic;
-    (void)site;
-    recomp_unknown_call(c, target);
+extern "C" RecompEntryFn recomp_icall_resolve(uint32_t target) {
+    const RecompDispatchEntry *entry = recomp_dispatch_lookup(&recomp_dispatch, target);
+    return entry ? entry->fn : nullptr;
+}
+extern "C" void recomp_icall_slow(X86 *c, uint32_t target, uint32_t site) {
+    observe_pend(site);
+    recomp_call(c, target);
 }
 extern "C" void recomp_module_invoke(X86 *c, const RecompModule *m, int32_t i) {
     recomp_unknown_call(c, m->func_addrs[i]);
+}
+
+extern "C" bool imports_dispatch(X86 *c, uint32_t target) {
+    (void)c;
+    harness_escape("import", target);
+    return false;
+}
+extern "C" int recomp_module_region_has_target(uint32_t target) {
+    (void)target;
+    return 0;
 }

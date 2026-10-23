@@ -17,8 +17,8 @@ source_notes = "Choose an installed game folder, or Setup.exe/data1.cab from the
 
 [translate]
 code_map = "metadata"
-entry_points = [0x0060ffed, 0x00610022]
-native = { header = "native/frame_pacing.h", sources = ["native/frame_pacing.cpp", "native/input.cpp"] }
+entry_points = [0x00492216, 0x0060ffed, 0x00610022]
+native = { header = "native/frame_pacing.h", sources = ["native/frame_pacing.cpp", "native/input.cpp", "native/startup.cpp"] }
 
 [render]
 d3d8_wgpu = true

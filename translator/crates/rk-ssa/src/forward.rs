@@ -1,5 +1,6 @@
 use rk_core::ir::OpCode;
 use rk_core::{Lookup, LookupSet};
+use rk_ir::x87::MemoryEffect;
 use rk_ir::Op;
 
 use crate::canonical::{canonicalize, rewrite_aliases};
@@ -205,6 +206,9 @@ pub fn forward(
                                 } else {
                                     pending.push(args[0]);
                                 }
+                            }
+                            Op::X87(op) if op.memory() == Some(MemoryEffect::Read) => {
+                                pending.push(s.args(effect)[0]);
                             }
                             Op::Call { .. } | Op::CallInd => {
                                 let target = match s.value(effect).op {

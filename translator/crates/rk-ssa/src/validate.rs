@@ -107,6 +107,7 @@ fn shape(s: &Ssa, id: ValueId) -> bool {
         Op::Memory => n == 1 && z == 0,
         Op::StateReload(key) => n == 1 && state_width(key, z),
         Op::StateKeep(key) => n == 2 && state_width(key, z) && size(1) == z,
+        Op::CcKind(_) => n == 0 && z == 1,
         Op::Call { .. } | Op::String(_) | Op::Seh(_) | Op::Slow(_) | Op::CallOther(_) => n == 1 && size(0) == 0 && z == 0,
         Op::CallInd => n == 2 && size(0) == 0 && size(1) == 4 && z == 0,
         Op::Branch { .. } | Op::Tail { .. } | Op::ImportTail { .. } | Op::Return

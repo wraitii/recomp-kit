@@ -41,6 +41,12 @@ function(recomp_mac_bundle target)
     endforeach()
   endif()
   set(aux_args)
+  if(RECOMP_PCODE_LIB)
+    set_target_properties(${target} PROPERTIES
+      BUILD_WITH_INSTALL_RPATH ON
+      INSTALL_RPATH "@executable_path/../Frameworks")
+    list(APPEND aux_args --aux-dylib "${RECOMP_PCODE_LIB}")
+  endif()
   if(RECOMP_AUX_SHARED)
     # The auxiliary translations are dylibs beside the executable; the runtime
     # and main table stay in the executable and are exported for them.
