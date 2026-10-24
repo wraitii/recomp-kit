@@ -586,10 +586,21 @@ fn build_bodies(
         .map(|item| -> Result<(Vec<BodyRow>, Vec<Body>)> {
             match item {
                 Err(row) => Ok((vec![row], Vec::new())),
-                Ok((addr, ir, planned)) => {
+                Ok((addr, ir, mut planned)) => {
                     let rows = vec![emit_row(&ctx2, addr, &ir, &planned)];
                     let mut private_bodies = Vec::new();
                     if let Some(layouts) = specialized.layouts.get(&addr) {
+                        if global.private.known_modes.contains(&addr)
+                            && ctx2.x87_options.cw_clone
+                            && ctx2.x87_options.force == rk_x87::ModeForce::Auto
+                        {
+                            let mut options = ctx2.x87_options.clone();
+                            options.force = rk_x87::ModeForce::Fast;
+                            planned.x87 = Some(
+                                rk_x87::prepare(&planned.ssa, &ctx2.x87_modes, &options)
+                                    .map_err(|reason| Diagnostic::error(addr, reason))?,
+                            );
+                        }
                         for layout in layouts {
                             let private = rk_emit::PrivateEmit {
                                 mask: layout.outputs,

@@ -237,7 +237,8 @@ impl Lifter {
                 .iter()
                 .any(|op| st_index(op.output.as_ref()).is_some() || op.inputs.iter().any(|v| st_index(Some(v)).is_some()))
             {
-                if sub_flow {
+                let conditional_move = matches!(&data[pos..pos + size], [0xda | 0xdb, 0xc0..=0xdf]);
+                if sub_flow && !conditional_move {
                     return Err(Diagnostic::error(
                         at,
                         Reason::Unsupported { detail: "x87 instruction with internal control flow".into() },

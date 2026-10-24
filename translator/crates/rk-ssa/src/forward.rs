@@ -1,5 +1,6 @@
 use rk_core::ir::OpCode;
 use rk_core::{Lookup, LookupSet};
+use rk_ir::x87::MemoryEffect;
 use rk_ir::Op;
 
 use crate::address::Addresses;
@@ -56,6 +57,10 @@ pub fn forward(s: &mut Ssa, call_facts: Option<&dyn CallFacts>) -> bool {
                                     pending.push(args.get(1).copied().unwrap_or(s.args(effect)[0]));
                                     continue;
                                 }
+                            }
+                            Op::X87(op) if op.memory() == Some(MemoryEffect::Read) => {
+                                pending.push(args.get(1).copied().unwrap_or(s.args(effect)[0]));
+                                continue;
                             }
                             Op::Memory | Op::Phi | Op::Input(_) => {
                                 pending.extend_from_slice(args);

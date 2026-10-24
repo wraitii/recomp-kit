@@ -433,7 +433,7 @@ def eager(r, address=None, result=None, decoded=False):
         effect('fucomi' if m.startswith('FU') else 'fcomi', CPU, st(0), st(r.src))
     elif r.action == 'conditional':
         operations.append(Conditional(Expr('flag_condition', Type.BOOL, data=m),
-                          (Evaluate(helper('fset', Type.VOID, CPU, literal(0), st(r.src))),)))
+                          (Evaluate(helper('fcopy', Type.VOID, CPU, literal(0), literal(r.src))),)))
     elif r.action == 'extract':
         value = Expr('named', Type.F64, data='captured')
         operations.extend((Declare(value), Assign(value, st(0))))

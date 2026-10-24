@@ -767,7 +767,7 @@ impl<'a> Emitter<'a> {
         match item.op {
             Op::Memory => Ok(true),
             Op::X87(op) => {
-                if op.touches_memory() {
+                if op.touches_memory() || matches!(op, rk_ir::x87::X87Op::Conditional(..)) {
                     self.publish(value)?;
                 }
                 let lines = self.x87_lines(|x87, names| x87.event_lines(self.clone, value, names))?;
