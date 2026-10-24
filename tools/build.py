@@ -640,6 +640,41 @@ def harness_name(system=None):
     return "harness.dylib" if (system or platform.system()) == "Darwin" else "harness.so"
 
 
+def build_translator_harness(gen, out):
+    """Compile a synthetic translation and the diff host without a game build."""
+    gen = Path(gen).resolve()
+    generated = sorted(gen.glob("chunk_*.c")) + [gen / "table.c", gen / "call_facts.c"]
+    if not (gen / "table.c").is_file():
+        sys.exit("%s/table.c is missing: translate the fixture first" % gen)
+    host = [ROOT / "tools/recomp/tests/harness.c", ROOT / "tools/recomp/diff/host.c",
+            ROOT / "platform/os_posix.cpp", ROOT / "platform/env.cpp",
+            ROOT / "tools/recomp/diff/host.cpp", ROOT / "runtime/guest_strings.cpp",
+            ROOT / "runtime/dispatch.cpp"]
+    out = Path(out).resolve()
+    objects = out.parent / (out.stem + "-objects")
+    objects.mkdir(parents=True, exist_ok=True)
+    darwin = platform.system() == "Darwin"
+    cc = ["xcrun", "clang"] if darwin else ["clang"]
+    built = []
+    for index, source in enumerate(generated):
+        obj = objects / ("gen-%03d.o" % index)
+        subprocess.check_call(cc + ["-std=c11", "-O1", "-ffp-contract=off", "-w", "-fPIC",
+                                    "-I", str(gen), "-I", str(ROOT), "-I", str(ROOT / "runtime"),
+                                    "-c", str(source), "-o", str(obj)])
+        built.append(str(obj))
+    for source in host[2:]:
+        obj = objects / (source.stem + ".o")
+        subprocess.check_call(cc + ["-x", "c++", "-std=c++17", "-O1", "-fno-exceptions", "-fPIC",
+                                    "-I", str(ROOT), "-c", str(source), "-o", str(obj)])
+        built.append(str(obj))
+    whole = (["-dynamiclib", "-lc++", "-framework", "CoreFoundation", "-framework", "CoreServices"]
+             if darwin else ["-shared", "-lm"])
+    subprocess.check_call(cc + ["-O1", "-ffp-contract=off", "-std=c11", "-w", "-fPIC",
+                                "-I", str(gen), "-I", str(ROOT), "-I", str(ROOT / "runtime"),
+                                str(host[0]), str(host[1])] + built + whole + ["-o", str(out)])
+    print("built translator harness: %s" % out)
+
+
 def build_diff_harness(build_root, out):
     """Compile the Unicorn diff harness beside the translated archive.
 
@@ -778,8 +813,12 @@ def parse_args(argv, system=None):
     parser.add_argument("--analysis-compare", type=Path, help="old facts for a separate comparison report")
     parser.add_argument("--diff-harness", action="store_true",
                         help="Compile the Unicorn diff harness for the translated archive and exit")
+    parser.add_argument("--translator-harness", action="store_true",
+                        help="Compile a standalone fixture translation and the Unicorn diff host and exit")
+    parser.add_argument("--translator-gen", type=Path, default=None,
+                        help="Generated sources for --translator-harness")
     parser.add_argument("--harness-out", type=Path, default=None,
-                        help="Where --diff-harness writes the shared library")
+                        help="Where --diff-harness or --translator-harness writes the shared library")
     parser.add_argument("--device", default=None, help="devicectl identifier (iOS) or adb serial (Android)")
     parser.add_argument("--team", default=os.environ.get("RECOMP_IOS_TEAM", ""),
                         help="Apple team id for automatic signing (ios target; default $RECOMP_IOS_TEAM)")
@@ -788,6 +827,13 @@ def parse_args(argv, system=None):
                         help="Android: push the configured game install minus [bundle].exclude before launch")
     parser.add_argument("--console", action="store_true", help="After launching on the device, stream its console")
     args = parser.parse_args(argv)
+    if args.translator_harness:
+        if not args.translator_gen or not args.harness_out:
+            parser.error("--translator-harness requires --translator-gen and --harness-out")
+        if any((args.stub, args.regenerate, args.function_corpus, args.diff_harness,
+                args.produce_analysis_facts, args.config != "Release")):
+            parser.error("--translator-harness is isolated; it cannot be combined with other build modes")
+        return args, parser
     if args.produce_analysis_facts and any((args.regenerate, args.regen_function, args.diff_harness,
                                           args.function_corpus, args.stub, args.target != "app")):
         parser.error("--produce-analysis-facts is an isolated offline mode")
@@ -847,7 +893,7 @@ def regenerate_selection(value, cfg, parser):
 def main():
     """Check inputs, translate under the build lock when needed, then configure and build."""
     args, parser = parse_args(sys.argv[1:])
-    if not args.function_corpus:
+    if not args.function_corpus and not args.translator_harness:
         status = subprocess.call([sys.executable, str(ROOT / "tools/check_flag_state.py")])
         if status:
             sys.exit(status)
@@ -858,6 +904,11 @@ def main():
     if args.target == "toolkit":
         from build_library import build as build_library
         build_library(args.build_root, args.config, args.package_toolkit, args.toolkit_python_root)
+        return
+    if args.translator_harness:
+        out = args.harness_out.resolve()
+        with buildlock.BuildLock(out.parent, "tools/build.py --translator-harness"):
+            build_translator_harness(args.translator_gen, out)
         return
     if args.diff_harness:
         out = args.harness_out or (args.build_root / "recomp/diff" / harness_name())

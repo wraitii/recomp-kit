@@ -319,6 +319,7 @@ class Inputs:
         self.rng = random.Random(seed)
         self.np = np.random.default_rng(seed)
         self.image = image
+        self.pool = b""
 
     def pointer(self):
         return SCRATCH + (self.rng.randrange(SCRATCH_SIZE * 3 // 4) & ~3)
@@ -334,6 +335,12 @@ class Inputs:
         return self.rng.getrandbits(32)
 
     def words(self, size):
+        if len(self.pool) < 2 * size:
+            self.pool = self.fresh(2 * size)
+        at = self.rng.randrange(size // 4 + 1) * 4
+        return self.pool[at:at + size]
+
+    def fresh(self, size):
         n = size // 4
         kind = self.np.random(n)
         pointers = SCRATCH + self.np.integers(0, SCRATCH_SIZE * 3 // 16, n) * 4
@@ -530,14 +537,29 @@ def run_variant(native, mode, addr, data, fills, stack, region_list, regs, eflag
     return ("state", native_snapshot(native, st, region_list))
 
 
+def apply_fixed(values, spec):
+    regs, eflags, cw, stack, fills = values
+    regs = list(regs)
+    stack = bytearray(stack)
+    for name, value in spec.get("regs", {}).items():
+        regs[REG_NAMES.index(name)] = value & 0xffffffff
+    if spec.get("eflags") is not None:
+        eflags = spec["eflags"] & 0xffffffff
+    for index, value in spec.get("args", {}).items():
+        struct.pack_into("<I", stack, 4 + 4 * index, value & 0xffffffff)
+    return regs, eflags, cw, bytes(stack), fills
+
+
 class RecordedInputs:
     def __init__(self, addr, image, args):
         self.addr, self.args, self.iteration = addr, args, 0
         self.source = Inputs(args.seed ^ addr, image, args.fpu_cw)
+        self.fixed = getattr(args, "fixed_inputs", {}).get(addr, [])
 
     def make(self):
         args = self.args
-        filename = "%08x-%06d.json.gz" % (self.addr, self.iteration)
+        index = self.iteration
+        filename = "%08x-%06d.json.gz" % (self.addr, index)
         self.iteration += 1
         if args.replay_inputs:
             with gzip.open(args.replay_inputs / filename, "rt") as stream:
@@ -546,6 +568,8 @@ class RecordedInputs:
                     base64.b64decode(record["stack"], validate=True),
                     [(addr, base64.b64decode(data, validate=True)) for addr, data in record["fills"]])
         values = self.source.make()
+        if index < len(self.fixed):
+            values = apply_fixed(values, self.fixed[index])
         if args.record_inputs:
             regs, eflags, cw, stack, fills = values
             record = {"regs": regs, "eflags": eflags, "cw": cw,
@@ -676,7 +700,7 @@ def run_all(addrs, args, dylib, image):
             if chunk:
                 running[fd][3].extend(chunk)
                 continue
-            pid, addr, _, out = running.pop(fd)
+            pid, addr, begun, out = running.pop(fd)
             os.close(fd)
             _, status = os.waitpid(pid, 0)
             if out:
@@ -685,6 +709,7 @@ def run_all(addrs, args, dylib, image):
                 results.append({"addr": addr, "status": "crashed",
                                 "problems": ["translation crashed (signal %d)" % os.WTERMSIG(status)
                                              if os.WIFSIGNALED(status) else "worker exited"]})
+            results[-1]["seconds"] = round(time.time() - begun, 3)
             report(results[-1], len(results), len(addrs))
         now = time.time()
         for fd, (pid, addr, begun, _) in list(running.items()):
