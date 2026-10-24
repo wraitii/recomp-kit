@@ -37,6 +37,7 @@ pub struct PrivateEmit {
 pub struct EmitContext<'a> {
     pub ir: &'a FunctionIr,
     pub checked_returns: &'a BTreeSet<Addr>,
+    pub effect_returns: &'a BTreeSet<Addr>,
     pub private_masks: &'a BTreeMap<Addr, BTreeSet<Fields>>,
     pub private_input_arguments: &'a BTreeMap<Addr, String>,
     pub known_entries: &'a BTreeSet<Addr>,
@@ -1536,6 +1537,7 @@ impl<'a> Emitter<'a> {
                         self.out,
                         "if (entry_contract_prepare_{target:08x}(c, 0)) {{ entry_contract_{target:08x}_{:04x}({args}); }} else {{ CALL_FN_CHECKED({target:08x}, 0x{expected:08x}u); }}", mask.0
                     );
+                    self.resume_check(value, target, expected);
                     if self.plan.settle_sites.contains(&value) {
                         self.out.push_str("x86_cc_settle(c);\n");
                     }
@@ -1553,6 +1555,7 @@ impl<'a> Emitter<'a> {
                 .ok_or_else(|| self.error(self.s.value_addr[value as usize], "call without return address"))?;
             self.declarations.insert(Declaration::Checked(target));
             let _ = writeln!(self.out, "CALL_FN_CHECKED({target:08x}, 0x{expected:08x}u);");
+            self.resume_check(value, target, expected);
         } else {
             self.declare_entry(target);
             let _ = writeln!(self.out, "CALL_FN({target:08x});");
@@ -1661,8 +1664,18 @@ impl<'a> Emitter<'a> {
         }
         self.publish(value)?;
         if self.ctx.known_entries.contains(&target) {
-            self.declare_entry(target);
-            let _ = writeln!(self.out, "CALL_FN({target:08x}); return;");
+            if self.checked && self.ctx.checked_returns.contains(&target) {
+                self.declarations.insert(Declaration::Checked(target));
+                if self.private.is_some() {
+                    let _ = writeln!(self.out, "CALL_FN_CHECKED({target:08x}, rd32(c->r[R_ESP])); return;");
+                } else {
+                    self.declare_entry(target);
+                    let _ = writeln!(self.out, "if (checked_return_) {{ CALL_FN_CHECKED({target:08x}, rd32(c->r[R_ESP])); }} else {{ CALL_FN({target:08x}); }} return;");
+                }
+            } else {
+                self.declare_entry(target);
+                let _ = writeln!(self.out, "CALL_FN({target:08x}); return;");
+            }
         } else {
             let at = self.s.value_addr[value as usize];
             let _ = writeln!(
@@ -1759,6 +1772,16 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    fn resume_check(&mut self, value: ValueId, target: Addr, expected: Addr) {
+        if self.ctx.effect_returns.contains(&target) {
+            let site = self.s.value_addr[value as usize];
+            let _ = writeln!(
+                self.out,
+                "if (RECOMP_UNLIKELY(c->eip != 0x{expected:08x}u)) {{ recomp_return_resume(c, 0x{site:08x}u, 0x{expected:08x}u, c->eip); return; }}"
+            );
+        }
+    }
+
     fn return_value(&mut self, value: ValueId) -> Result<()> {
         if let Some(private) = self.private {
             self.publish_private_return(value, private)?;
@@ -1766,10 +1789,50 @@ impl<'a> Emitter<'a> {
                 "if (RECOMP_UNLIKELY(c->eip != expected_return_)) {\n",
             );
             self.publish_private_fallback(value)?;
-            self.out.push_str("recomp_return_fast_(c);\nreturn;\n}\nreturn;\n");
+            if !self.ctx.effect_returns.contains(&self.s.addr) {
+                self.out.push_str("recomp_return_fast_(c);\n");
+            }
+            self.out.push_str("return;\n}\nreturn;\n");
             return Ok(());
         }
         self.publish(value)?;
+        if self.ctx.effect_returns.contains(&self.s.addr) {
+            self.out.push_str(
+                "if (!checked_return_) { recomp_return_fast_(c); return; }\nif (RECOMP_UNLIKELY(c->eip != expected_return_)) return;\nrecomp_return_fast_(c);\nreturn;\n",
+            );
+            return Ok(());
+        }
+        if !self.ctx.ir.intra_call_returns.is_empty() {
+            let current = self.block_of(value);
+            let targets: Vec<usize> = self
+                .successors(current)
+                .iter()
+                .copied()
+                .filter(|target| {
+                    self.ctx
+                        .ir
+                        .intra_call_returns
+                        .contains(&self.plan.block_addrs[*target])
+                })
+                .collect();
+            if !targets.is_empty() {
+                self.out.push_str("switch (c->eip) {\n");
+                for target in targets {
+                    let _ = writeln!(self.out, "case 0x{:08x}u:", self.plan.block_addrs[target]);
+                    self.edge(Some(current), target)?;
+                }
+                self.out.push_str("default:\n");
+                if self.checked {
+                    self.out.push_str(
+                        "if (!checked_return_ || RECOMP_UNLIKELY(c->eip != expected_return_)) recomp_return_fast_(c);\nreturn;\n",
+                    );
+                } else {
+                    self.out.push_str("recomp_return_fast_(c);\nreturn;\n");
+                }
+                self.out.push_str("}\n");
+                return Ok(());
+            }
+        }
         if self.checked {
             self.out.push_str(
                 "if (!checked_return_ || RECOMP_UNLIKELY(c->eip != expected_return_)) recomp_return_fast_(c);\nreturn;\n",

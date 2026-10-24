@@ -25,6 +25,8 @@ pub(crate) struct RawFunction {
     pub(crate) fallthrough: Vec<Addr>,
     pub(crate) end: Addr,
     pub(crate) pushed_continuations: BTreeSet<Addr>,
+    pub(crate) intra_calls: BTreeMap<u32, Addr>,
+    pub(crate) intra_call_returns: BTreeSet<Addr>,
     pub(crate) seh_sites: BTreeMap<u32, Addr>,
     pub(crate) seh_restores: BTreeSet<u32>,
     pub(crate) return_jumps: BTreeSet<u32>,
@@ -91,6 +93,14 @@ impl RawFunction {
             }
         }
         let next = self.fallthrough.get(i).copied().and_then(|addr| self.idx(addr));
+        if let Some(&target) = self.intra_calls.get(&(i as u32)) {
+            return std::iter::once(target)
+                .chain(self.fallthrough.get(i).copied())
+                .filter_map(|target| self.idx(target))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+        }
         if m == "INT3" {
             return Vec::new();
         }
@@ -98,6 +108,7 @@ impl RawFunction {
             return self
                 .pushed_continuations
                 .iter()
+                .chain(self.intra_call_returns.iter())
                 .filter_map(|target| self.idx(*target))
                 .collect();
         }
@@ -219,10 +230,21 @@ impl RawFunction {
         };
         let m = ins.mnemonic.as_str();
         let next = self.fallthrough.get(i).copied().and_then(|addr| self.idx(addr));
-        if m == "INT3" {
+        if let Some(&target) = self.intra_calls.get(&(i as u32)) {
+            std::iter::once(target)
+                .chain(self.fallthrough.get(i).copied())
+                .filter_map(|target| self.idx(target))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        } else if m == "INT3" {
             Vec::new()
         } else if m == "RET" {
-            self.pushed_continuations.iter().filter_map(|t| self.idx(*t)).collect()
+            self.pushed_continuations
+                .iter()
+                .chain(self.intra_call_returns.iter())
+                .filter_map(|t| self.idx(*t))
+                .collect()
         } else if JCC.contains(&m) {
             let mut out: Vec<u32> = next.into_iter().collect();
             if let Some(target) = self.branch_target(i) {
@@ -388,6 +410,24 @@ impl RawFunction {
             self.contiguous[i] = self.fallthrough[i] == next;
         }
         self.recovered_tables = recover_tables(program, relocated, self);
+        self.intra_calls = self
+            .decoded
+            .iter()
+            .enumerate()
+            .filter_map(|(i, ins)| {
+                if ins.mnemonic != "CALL" {
+                    return None;
+                }
+                let target = self.branch_target(i)?;
+                (self.index.contains_key(&target) && !program.entries.contains_key(&target))
+                    .then_some((i as u32, target))
+            })
+            .collect();
+        self.intra_call_returns = self
+            .intra_calls
+            .keys()
+            .filter_map(|&i| self.fallthrough.get(i as usize).copied())
+            .collect();
         self.pushed_continuations = self.pushed_continuations();
         self.seh_sites = seh_frame_sites(self, &program.image);
         self.seh_restores = seh_restore_sites(self);
@@ -551,6 +591,8 @@ pub(crate) fn build_raw(
         fallthrough: Vec::new(),
         end,
         pushed_continuations: BTreeSet::new(),
+        intra_calls: BTreeMap::new(),
+        intra_call_returns: BTreeSet::new(),
         seh_sites: BTreeMap::new(),
         seh_restores: BTreeSet::new(),
         return_jumps: BTreeSet::new(),
@@ -642,6 +684,8 @@ pub(crate) fn finalize(program: &Program, addr: Addr, mut raw: RawFunction, help
         entries,
         dead,
         call_returns,
+        intra_calls: raw.intra_calls,
+        intra_call_returns: raw.intra_call_returns,
         seh,
         seh_handlers: raw.seh_sites,
         seh_unwind_only,

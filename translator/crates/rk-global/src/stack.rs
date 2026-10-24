@@ -11,11 +11,19 @@ use rk_ssa::StackEffect;
 type Checked<T> = std::result::Result<T, &'static str>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReturnEffect {
+    Exact,
+    Adjust(i32),
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Value {
     Stack(u32),
     Constant(u64),
     Input(Varnode),
     ReturnAddress,
+    ReturnOffset(i32),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -29,8 +37,10 @@ pub struct Summary {
     pub effect: StackEffect,
     pub reads: BTreeSet<(i32, u32)>,
     pub reads_other: bool,
+    pub writes_other: bool,
     pub preserves: Fields,
     pub mapped_noreturn: bool,
+    pub returns: ReturnEffect,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -39,6 +49,7 @@ pub struct Analysis {
     pub sites: BTreeMap<Addr, Summary>,
     pub rejected: BTreeMap<String, usize>,
     pub rejected_sites: BTreeMap<String, usize>,
+    pub unbalanced_returns: BTreeSet<Addr>,
 }
 
 pub struct CallFacts<'a> {
@@ -155,27 +166,29 @@ impl State {
         if size == 0 || size > 32 {
             return Err("unsupported memory width");
         }
-        if overlap(offset, size, 0, 4) {
-            return Err("return-address write");
-        }
         self.slots
             .retain(|&(at, width), _| !overlap(offset, size, at, width));
         Ok(())
     }
 
-    fn returning(&self) -> Checked<Fields> {
+    fn returning(&self) -> Checked<(Fields, ReturnEffect)> {
         let esp = Registers::get().require("ESP");
         if self.registers.get(&esp) != Some(&Value::Stack(0)) {
             return Err("unproved ESP balance");
         }
-        if self.slots.get(&(0, 4)) != Some(&Value::ReturnAddress) {
-            return Err("unproved return address");
-        }
-        Ok(fields()
-            .filter_map(|(field, register)| {
-                (self.registers.get(&register) == Some(&Value::Input(register))).then_some(field)
-            })
-            .collect())
+        let returns = match self.slots.get(&(0, 4)) {
+            Some(Value::ReturnAddress) => ReturnEffect::Exact,
+            Some(Value::ReturnOffset(delta)) => ReturnEffect::Adjust(*delta),
+            _ => ReturnEffect::Unknown,
+        };
+        Ok((
+            fields()
+                .filter_map(|(field, register)| {
+                    (self.registers.get(&register) == Some(&Value::Input(register))).then_some(field)
+                })
+                .collect(),
+            returns,
+        ))
     }
 }
 
@@ -211,6 +224,23 @@ fn evaluate(op: &PcodeOp, state: &State, locals: &BTreeMap<Varnode, Value>) -> O
         OpCode::IntAdd | OpCode::IntSub if output.size == 4 => {
             let b = state.read(*op.inputs.get(1)?, locals)?;
             let subtract = op.opcode == OpCode::IntSub;
+            let offset = |value, delta: i64| match value {
+                Value::ReturnAddress => Some(Value::ReturnOffset(delta as i32)),
+                Value::ReturnOffset(at) => Some(Value::ReturnOffset(at.wrapping_add(delta as i32))),
+                _ => None,
+            };
+            if let Value::Constant(data) = b {
+                if let Some(value) = offset(a, if subtract { -(data as u32 as i32 as i64) } else { data as u32 as i32 as i64 }) {
+                    return Some(value);
+                }
+            }
+            if !subtract {
+                if let Value::Constant(data) = a {
+                    if let Some(value) = offset(b, data as u32 as i32 as i64) {
+                        return Some(value);
+                    }
+                }
+            }
             let address = |value| match value {
                 Value::Stack(offset) => Address::exact(Base::Frame, offset),
                 Value::Constant(data) => Address::exact(Base::Absolute, data as u32),
@@ -244,6 +274,9 @@ fn compose(
     reads: &mut BTreeSet<(i32, u32)>,
     writes: &mut BTreeSet<(i32, u32)>,
 ) -> Checked<()> {
+    if summary.writes_other {
+        state.slots.clear();
+    }
     for &(at, width) in &summary.effect.writes {
         let at = offset.wrapping_add(at as u32);
         state.invalidate(at, width)?;
@@ -268,6 +301,7 @@ fn summarize(
     fir: &FunctionIr,
     known: &BTreeMap<Addr, Summary>,
     excluded: &BTreeSet<Addr>,
+    returns_only: bool,
 ) -> Checked<Summary> {
     if !fir.entries.is_empty()
         || !fir.dynamic.is_empty()
@@ -286,7 +320,9 @@ fn summarize(
     let mut cleanups = BTreeSet::new();
     let mut preserves = Fields::ALL;
     let mut reads_other = false;
+    let mut writes_other = false;
     let mut mapped_noreturn = false;
+    let mut returns = None;
     let mut steps = 0;
     while let Some(index) = pending.pop_front() {
         steps += 1;
@@ -322,7 +358,13 @@ fn summarize(
             {
                 return Err("return has successors");
             }
-            preserves = preserves & state.returning()?;
+            let (preserved, effect) = state.returning()?;
+            preserves = preserves & preserved;
+            returns = Some(match (returns, effect) {
+                (None, effect) => effect,
+                (Some(a), b) if a == b => a,
+                _ => ReturnEffect::Unknown,
+            });
             cleanups.insert(return_pop(program, insn).ok_or("unsupported return encoding")?);
             reads.insert((0, 4));
             continue;
@@ -340,7 +382,12 @@ fn summarize(
                         return Err("unsupported store");
                     }
                     let Some(Value::Stack(offset)) = state.read(op.inputs[0], &locals) else {
-                        return Err("potentially aliased non-stack write");
+                        if !returns_only {
+                            return Err("potentially aliased non-stack write");
+                        }
+                        state.slots.clear();
+                        writes_other = true;
+                        continue;
                     };
                     let size = op.inputs[1].size;
                     let stored = state.read(op.inputs[1], &locals);
@@ -381,6 +428,7 @@ fn summarize(
                         )),
                     )?;
                     reads_other |= callee.reads_other;
+                    writes_other |= callee.writes_other;
                     mapped_noreturn |= callee.mapped_noreturn;
                 }
                 OpCode::CallInd
@@ -413,7 +461,8 @@ fn summarize(
             {
                 return Err("unmodeled tail exit");
             }
-            state.returning()?;
+            let (preserved, effect) = state.returning()?;
+            preserves = preserves & preserved;
             if program.is_noreturn(targets[0]) {
                 if excluded.contains(&targets[0]) {
                     return Err("opaque noreturn callee");
@@ -424,9 +473,27 @@ fn summarize(
             let callee = known.get(&targets[0]).ok_or("unresolved tail")?;
             compose(&mut state, callee, 0, &mut reads, &mut writes)?;
             state.write(Registers::get().require("ESP"), Some(Value::Stack(0)))?;
-            preserves = preserves & state.returning()?;
+            let (preserved, _) = state.returning()?;
+            preserves = preserves & preserved;
+            let effect = match (effect, callee.returns) {
+                _ if callee.writes_other => ReturnEffect::Unknown,
+                (ReturnEffect::Exact, next) | (next, ReturnEffect::Exact) => next,
+                (ReturnEffect::Adjust(a), ReturnEffect::Adjust(b)) => {
+                    match a.wrapping_add(b) {
+                        0 => ReturnEffect::Exact,
+                        delta => ReturnEffect::Adjust(delta),
+                    }
+                }
+                _ => ReturnEffect::Unknown,
+            };
+            returns = Some(match (returns, effect) {
+                (None, effect) => effect,
+                (Some(a), b) if a == b => a,
+                _ => ReturnEffect::Unknown,
+            });
             cleanups.insert(callee.effect.cleanup);
             reads_other |= callee.reads_other;
+            writes_other |= callee.writes_other;
             mapped_noreturn |= callee.mapped_noreturn;
             continue;
         }
@@ -457,8 +524,10 @@ fn summarize(
         },
         reads,
         reads_other,
+        writes_other,
         preserves,
         mapped_noreturn,
+        returns: returns.unwrap_or(ReturnEffect::Unknown),
     })
 }
 
@@ -477,6 +546,7 @@ pub fn analyze(
     analysis: &rk_frontend::Analysis,
     excluded: &BTreeSet<Addr>,
     indirect: &BTreeMap<Addr, Vec<Addr>>,
+    returns_only: bool,
 ) -> Analysis {
     let mut output = Analysis::default();
     let mut callers: BTreeMap<Addr, BTreeSet<Addr>> = BTreeMap::new();
@@ -501,7 +571,7 @@ pub fn analyze(
             analysis.ir[&addr]
                 .as_ref()
                 .map_err(|_| "unlifted function")
-                .and_then(|fir| summarize(program, fir, &output.functions, excluded))
+                .and_then(|fir| summarize(program, fir, &output.functions, excluded, returns_only))
         };
         match result {
             Ok(summary) => {
@@ -512,6 +582,9 @@ pub fn analyze(
                 }
             }
             Err(reason) => {
+                if reason == "unproved ESP balance" {
+                    output.unbalanced_returns.insert(addr);
+                }
                 failures.insert(addr, reason);
             }
         }
@@ -557,8 +630,12 @@ fn join(
             result.effect.writes.extend_from_slice(&next.effect.writes);
             result.reads.extend(&next.reads);
             result.reads_other |= next.reads_other;
+            result.writes_other |= next.writes_other;
             result.preserves = result.preserves & next.preserves;
             result.mapped_noreturn |= next.mapped_noreturn;
+            if result.returns != next.returns {
+                result.returns = ReturnEffect::Unknown;
+            }
         } else {
             result = Some(next.clone());
         }

@@ -216,6 +216,10 @@ pub struct FunctionIr {
     #[serde(default)]
     pub call_returns: BTreeSet<Addr>,
     #[serde(default)]
+    pub intra_calls: BTreeMap<u32, Addr>,
+    #[serde(default)]
+    pub intra_call_returns: BTreeSet<Addr>,
+    #[serde(default)]
     pub seh: BTreeMap<u32, Vec<SehEffect>>,
     #[serde(default)]
     pub seh_handlers: BTreeMap<u32, Addr>,

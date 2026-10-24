@@ -162,6 +162,13 @@ pub fn lower(fir: &FunctionIr, image: &Image, x87: &dyn X87Recipes) -> rk_core::
     let mut insns = Vec::with_capacity(fir.insns.len());
     for (index, insn) in fir.insns.iter().enumerate() {
         let (mut ops, is_x87, flag_operands) = lowerer.lower_insn(fir, index as u32, insn)?;
+        if let Some(&target) = fir.intra_calls.get(&(index as u32)) {
+            for op in &mut ops {
+                if matches!(op.op, Op::Call { .. }) {
+                    op.op = Op::Branch { target };
+                }
+            }
+        }
         lowerer.add_tail(fir, index as u32, &mut ops);
         let flag = if is_x87 {
             None

@@ -274,6 +274,19 @@ void recomp_shim_call(X86 *c, uint32_t target) {
     abort();
 }
 
+#if defined(__GNUC__)
+__attribute__((cold, noinline))
+#endif
+void recomp_unexpected_return(X86 *c, uint32_t site, uint32_t expected, uint32_t target) {
+    fprintf(
+        stderr,
+        "recomp: unexpected guest return to 0x%08x from site 0x%08x (expected 0x%08x, ESP=%08x)\n",
+        target, site, expected, c ? c->r[R_ESP] : 0);
+    fflush(stdout);
+    fflush(stderr);
+    abort();
+}
+
 void recomp_region_missing(X86 *c, uint32_t target) {
     LOGW("recomp_region_missing: %08x is not an instruction of its decoded region (from=%08x)",
          target, c->eip);

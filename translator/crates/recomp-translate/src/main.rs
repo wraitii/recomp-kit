@@ -15,8 +15,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use rayon::prelude::*;
 use rk_core::contract::Fields;
-use rk_core::ir::FunctionIr;
-use rk_core::program::Program;
+use rk_core::ir::{FunctionIr, OpCode, Space};
+use rk_core::program::{EntryKind, Program};
 use rk_core::settings::Settings;
 use rk_core::timing::Phases;
 use rk_core::{parse_hex, Addr, Diagnostic, Hex};
@@ -228,6 +228,7 @@ struct BodyContext<'a> {
     program: &'a Program,
     facts: rk_global::ContractCallFacts<'a>,
     checked: &'a BTreeSet<Addr>,
+    effect_returns: &'a BTreeSet<Addr>,
     x87_modes: rk_x87::ModeInput,
     x87_options: rk_x87::Options,
     fault_state: rk_core::settings::FaultState,
@@ -250,6 +251,7 @@ impl<'a> BodyContext<'a> {
         rk_emit::EmitContext {
             ir,
             checked_returns: self.checked,
+            effect_returns: self.effect_returns,
             private_masks: &self.private_masks,
             private_input_arguments: &self.private_input_arguments,
             known_entries: self.known_entries,
@@ -385,6 +387,70 @@ fn account(stats: &mut EmitStats, (addr, body, reason, report): BodyRow, bodies:
     bodies.push(body);
 }
 
+fn effect_returns(stack: &rk_global::stack::Analysis) -> BTreeSet<Addr> {
+    stack
+        .functions
+        .iter()
+        .filter_map(|(&addr, summary)| {
+            (summary.returns != rk_global::stack::ReturnEffect::Exact).then_some(addr)
+        })
+        .chain(stack.unbalanced_returns.iter().copied())
+        .collect()
+}
+
+fn prepare_return_entries(
+    analysis: &mut rk_frontend::Analysis,
+    stack: &rk_global::stack::Analysis,
+) -> BTreeMap<Addr, Addr> {
+    let mut entries = BTreeMap::new();
+    for (&caller, result) in &mut analysis.ir {
+        let Ok(fir) = result else { continue };
+        let mut invalid = None;
+        let mut added = false;
+        for insn in &fir.insns {
+            if insn.mnemonic != "CALL" {
+                continue;
+            }
+            let target = insn.ops.iter().find_map(|op| {
+                matches!(op.opcode, OpCode::Call | OpCode::Branch)
+                    .then_some(op.inputs.first())
+                    .flatten()
+                    .filter(|input| matches!(input.space, Space::Ram | Space::Const))
+                    .map(|input| input.offset as Addr)
+            });
+            let Some(summary) = target.and_then(|target| stack.functions.get(&target)) else {
+                continue;
+            };
+            let rk_global::stack::ReturnEffect::Adjust(delta) = summary.returns else {
+                continue;
+            };
+            let continuation = insn.addr + insn.length as Addr;
+            let adjusted = continuation.wrapping_add(delta as u32);
+            if fir.index_of(adjusted).is_none() {
+                invalid = Some(Diagnostic::new(
+                    insn.addr,
+                    rk_core::Reason::UnsupportedControlFlow {
+                        detail: "return adjustment leaves translated block".into(),
+                    },
+                ));
+                break;
+            }
+            if !fir.entries.contains(&adjusted) {
+                fir.entries.push(adjusted);
+                added = true;
+            }
+            entries.insert(adjusted, caller);
+        }
+        if let Some(diagnostic) = invalid {
+            *result = Err(rk_core::Error::Diagnostic(diagnostic));
+        } else if added {
+            fir.entries.sort_unstable();
+            fir.entries.dedup();
+        }
+    }
+    entries
+}
+
 fn build_bodies(
     program: &Program,
     analysis: &rk_frontend::Analysis,
@@ -421,10 +487,12 @@ fn build_bodies(
     } else {
         BTreeSet::new()
     };
+    let effect_returns = effect_returns(&global.returns);
     let make_ctx = |private_masks, private_input_arguments| BodyContext {
         program,
         facts: global.call_facts(),
         checked: &global.private.checked_returns,
+        effect_returns: &effect_returns,
         x87_modes: rk_x87::ModeInput::from(&global.x87),
         x87_options: rk_x87::Options {
             strict: settings.fault_state == rk_core::settings::FaultState::Exact,
@@ -981,7 +1049,7 @@ fn main() -> Result<()> {
     phases.mark("facts");
     let whole = args.out.is_some() || args.dump.is_empty();
     let wants_global = whole || args.wants(Stage::Global);
-    let global = if wants_global {
+    let mut global = if wants_global {
         rk_global::GlobalFacts::analyze(&rk_global::GlobalInput {
             settings: &settings,
             program: &program,
@@ -995,6 +1063,29 @@ fn main() -> Result<()> {
         rk_global::GlobalFacts::default()
     };
     phases.mark("global");
+    let extra_entries = if wants_global {
+        prepare_return_entries(&mut analysis, &global.returns)
+    } else {
+        BTreeMap::new()
+    };
+    let effect_returns = effect_returns(&global.returns);
+    global.private.checked_returns.extend(effect_returns.iter().copied());
+    let mut pending: Vec<_> = global.private.checked_returns.iter().copied().collect();
+    while let Some(addr) = pending.pop() {
+        let Some(Ok(fir)) = analysis.ir.get(&addr) else { continue };
+        for (&index, targets) in &fir.exits {
+            if fir.insns[index as usize].mnemonic != "JMP" {
+                continue;
+            }
+            for &target in targets {
+                if matches!(analysis.ir.get(&target), Some(Ok(_)))
+                    && global.private.checked_returns.insert(target)
+                {
+                    pending.push(target);
+                }
+            }
+        }
+    }
     let only = if whole { &[][..] } else { &args.only[..] };
     let wants_bodies = whole || args.wants(Stage::Bodies);
     let owned = (wants_bodies && args.dump.is_empty()).then(|| std::mem::take(&mut analysis.ir));
@@ -1022,6 +1113,14 @@ fn main() -> Result<()> {
         )
     };
     phases.mark("emit");
+    for (addr, owner) in extra_entries {
+        program.entries.entry(addr).or_insert(EntryKind::Discovered);
+        let entries = program.interior_by_function.entry(owner).or_default();
+        if !entries.contains(&addr) {
+            entries.push(addr);
+            entries.sort_unstable();
+        }
+    }
     let call_returns = summary.call_returns.clone();
     let translation = Translation {
         settings: &settings,

@@ -706,6 +706,8 @@ __attribute__((noreturn, cold, noinline))
 void recomp_shim_call(X86 *c, uint32_t target);
 /* target is neither a translated function nor a shim.  Logs; may abort. */
 void recomp_unknown_call(X86 *c, uint32_t target);
+/* A checked return adjusted the target to an address that is not resumable. */
+void recomp_unexpected_return(X86 *c, uint32_t site, uint32_t expected, uint32_t target);
 void recomp_region_missing(X86 *c, uint32_t target);
 /* A popped callback sentinel can bypass translated callers. The innermost
  * guest_call owns the live host return checkpoint and its guest stack range. */
@@ -877,8 +879,8 @@ void recomp_module_jump(X86 *c, uint32_t target);
  * A CALL continuation belongs to the pending host caller, even when it is
  * also an alternate entry. Other entries are tail calls, as in interface
  * adapters that exchange a vtable method onto the guest stack before RET.
- * Delay-load adapters also RET into resolved import shims. Unknown returns
- * retain the existing EIP/host-return behaviour. */
+ * Delay-load adapters also RET into resolved import shims. An unrecognised
+ * non-continuation target is a named runtime failure. */
 static inline void recomp_return(X86 *c) {
     if (c->eip == GUEST_RETURN_SENTINEL) {
         recomp_callback_return(c);
@@ -889,6 +891,19 @@ static inline void recomp_return(X86 *c) {
     if ((c->eip >= GUEST_SHIM_BASE && c->eip < GUEST_SHIM_END) || recomp_index_of(c->eip) >= 0 ||
         recomp_module_lookup(c->eip) >= 0)
         recomp_call(c, c->eip);
+    else
+        recomp_unexpected_return(c, c->eip, 0, c->eip);
+}
+
+static inline void recomp_return_resume(X86 *c, uint32_t site, uint32_t expected, uint32_t target) {
+    if (target == expected)
+        return;
+    if ((target >= GUEST_SHIM_BASE && target < GUEST_SHIM_END) || recomp_index_of(target) >= 0 ||
+        recomp_module_lookup(target) >= 0) {
+        recomp_jump(c, target);
+        return;
+    }
+    recomp_unexpected_return(c, site, expected, target);
 }
 
 /* --------------------------------------------------------------- flags */

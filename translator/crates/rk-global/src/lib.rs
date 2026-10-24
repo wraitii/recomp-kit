@@ -111,6 +111,7 @@ pub struct GlobalReport {
 #[derive(Clone, Debug, Default)]
 pub struct GlobalFacts {
     pub stack: stack::Analysis,
+    pub returns: stack::Analysis,
     pub memory: memory::Analysis,
     memory_inference: bool,
     pub contracts: BTreeMap<Addr, Contract>,
@@ -128,10 +129,11 @@ impl GlobalFacts {
         let mut mode_opaque = opaque_helpers.clone();
         mode_opaque.extend(native.iter().copied());
         let stack = if input.settings.stack_memory {
-            stack::analyze(input.program, input.analysis, &mode_opaque, input.indirect)
+            stack::analyze(input.program, input.analysis, &mode_opaque, input.indirect, false)
         } else {
             stack::Analysis::default()
         };
+        let returns = stack::analyze(input.program, input.analysis, &mode_opaque, input.indirect, true);
         let modes = modes::analyze(
             input.analysis,
             input.indirect,
@@ -209,6 +211,7 @@ impl GlobalFacts {
         }
         Ok(Self {
             stack,
+            returns,
             memory,
             memory_inference: input.settings.stack_memory,
             contracts: contracts.contracts,
