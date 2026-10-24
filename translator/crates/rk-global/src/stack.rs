@@ -4,6 +4,7 @@ use rk_core::contract::{Field, Fields};
 use rk_core::ir::{FunctionIr, Insn, OpCode, PcodeOp, Space, Varnode};
 use rk_core::program::Program;
 use rk_core::Addr;
+use rk_core::memory::{Address, Base};
 use rk_ir::Registers;
 use rk_ssa::StackEffect;
 
@@ -43,9 +44,15 @@ pub struct Analysis {
 pub struct CallFacts<'a> {
     pub registers: crate::ContractCallFacts<'a>,
     pub stack: &'a Analysis,
+    pub memory: Option<&'a crate::memory::Analysis>,
 }
 
 impl rk_ssa::CallFacts for CallFacts<'_> {
+    fn memory(&self, site: Addr, target: Option<Addr>) -> Option<&rk_core::memory::Effects> {
+        let effects = self.memory?;
+        match target { Some(target) => effects.functions.get(&target), None => effects.sites.get(&site) }
+    }
+
     fn call(&self, site: Addr, target: Option<Addr>) -> rk_ssa::CallEffect {
         let mut effect = self.registers.call(site, target);
         if let Some(summary) = self.summary(site, target) {
@@ -74,7 +81,8 @@ impl CallFacts<'_> {
 }
 
 fn overlap(a: u32, width_a: u32, b: u32, width_b: u32) -> bool {
-    a.wrapping_sub(b) < width_b || b.wrapping_sub(a) < width_a
+    use rk_core::memory::{Address, Base, Range};
+    !Range::new(Address::exact(Base::Frame, a), width_a).disjoint(Range::new(Address::exact(Base::Frame, b), width_b))
 }
 
 fn register_overlap(a: Varnode, b: Varnode) -> bool {
@@ -203,22 +211,15 @@ fn evaluate(op: &PcodeOp, state: &State, locals: &BTreeMap<Varnode, Value>) -> O
         OpCode::IntAdd | OpCode::IntSub if output.size == 4 => {
             let b = state.read(*op.inputs.get(1)?, locals)?;
             let subtract = op.opcode == OpCode::IntSub;
-            match (a, b) {
-                (Value::Stack(offset), Value::Constant(delta)) => Some(Value::Stack(if subtract {
-                    offset.wrapping_sub(delta as u32)
-                } else {
-                    offset.wrapping_add(delta as u32)
-                })),
-                (Value::Constant(delta), Value::Stack(offset)) if !subtract => {
-                    Some(Value::Stack(offset.wrapping_add(delta as u32)))
-                }
-                (Value::Constant(a), Value::Constant(b)) => Some(Value::Constant(
-                    (if subtract {
-                        a.wrapping_sub(b)
-                    } else {
-                        a.wrapping_add(b)
-                    }) & mask(output.size),
-                )),
+            let address = |value| match value {
+                Value::Stack(offset) => Address::exact(Base::Frame, offset),
+                Value::Constant(data) => Address::exact(Base::Absolute, data as u32),
+                _ => Address::Unknown,
+            };
+            let result = if subtract { address(a).sub(address(b)) } else { address(a).add(address(b)) };
+            match result {
+                Address::Known { base: Base::Frame, offset, span: 0 } => Some(Value::Stack(offset)),
+                Address::Known { base: Base::Absolute, offset, span: 0 } => Some(Value::Constant(offset as u64)),
                 _ => None,
             }
         }

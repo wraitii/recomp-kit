@@ -431,6 +431,12 @@ def rust_translator(build_root):
     return target / "release" / ("recomp-translate.exe" if os.name == "nt" else "recomp-translate")
 
 
+def test_translator_analysis(build_root):
+    subprocess.run(["cargo", "test", "--quiet", "--locked", "--lib", "-p", "rk-core", "-p", "rk-ssa", "-p", "rk-global",
+                    "--manifest-path", str(ROOT / "translator/Cargo.toml"),
+                    "--target-dir", str(Path(build_root) / "recomp/cargo")], check=True)
+
+
 def write_translation_input(cfg, build_root):
     path = Path(build_root) / "recomp/translate-input.json"
     path.parent.mkdir(parents=True, exist_ok=True)

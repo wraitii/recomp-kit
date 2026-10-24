@@ -104,7 +104,7 @@ fn shape(s: &Ssa, id: ValueId) -> bool {
         Op::Phi => args.iter().all(|&arg| s.value(arg).size == z),
         Op::Byte(lane) => n == 1 && z == 1 && lane < size(0),
         Op::Pack => n == z as usize && z > 0 && args.iter().all(|&arg| s.value(arg).size == 1),
-        Op::Memory => n == 1 && z == 0,
+        Op::Memory => n >= 1 && z == 0 && (size(0) == 0 || rk_ir::properties(s.value(args[0]).op).memory) && args.iter().skip(1).all(|&arg| s.value(arg).size == 0),
         Op::StateReload(key) => n == 1 && state_width(key, z),
         Op::StateKeep(key) => n == 2 && state_width(key, z) && size(1) == z,
         Op::CcKind(_) => n == 0 && z == 1,

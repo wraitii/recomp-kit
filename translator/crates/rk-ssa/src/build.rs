@@ -31,6 +31,10 @@ impl CallEffect {
 }
 
 pub trait CallFacts: Sync {
+    fn memory(&self, _site: Addr, _target: Option<Addr>) -> Option<&rk_core::memory::Effects> {
+        None
+    }
+
     fn call(&self, site: Addr, target: Option<Addr>) -> CallEffect;
 
     fn stack(&self, _site: Addr, _target: Option<Addr>) -> Option<&StackEffect> {
@@ -486,6 +490,7 @@ impl<'a> Builder<'a> {
             flags: self.flags,
             loc: self.loc,
             value_addr: self.value_addr,
+            memory_partitioned: false,
             phi_key: self.phi_key,
             entry_reads: self.entry_reads,
             exit_state: self.exit_state,

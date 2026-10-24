@@ -15,7 +15,6 @@ pub struct PrepareOptions<'a> {
     pub call_facts: &'a dyn CallFacts,
     pub allow_slow: bool,
     pub value_budget: usize,
-    pub stack_reload: Option<&'a dyn Fn(ValueId) -> Option<(ValueId, i32)>>,
     pub signed_sub: bool,
     pub lazy_publications: bool,
     pub fault_state: FaultState,
@@ -35,7 +34,6 @@ impl<'a> PrepareOptions<'a> {
             call_facts,
             allow_slow: true,
             value_budget: DEFAULT_VALUE_BUDGET,
-            stack_reload: None,
             signed_sub: true,
             lazy_publications: true,
             fault_state: FaultState::Relaxed,
@@ -62,7 +60,7 @@ pub fn prepare_with_publications(
         .map_err(rk_core::Error::Diagnostic)?;
     crate::validate(&ssa)?;
     canonicalize(&mut ssa, opts.signed_sub);
-    forward(&mut ssa, opts.stack_reload, Some(opts.call_facts));
+    forward(&mut ssa, Some(opts.call_facts));
     crate::flags::build_joins(&mut ssa);
     crate::coalesce::coalesce(&mut ssa, opts.coalesce_roots);
     canonicalize(&mut ssa, opts.signed_sub);

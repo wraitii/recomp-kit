@@ -1,5 +1,5 @@
-//! Byte-lane SSA over `CgFunction`. Registers and flags are tracked per byte and memory as a single
-//! token, and each observable effect gets a boundary carrying the state at that point. Calls use
+//! Byte-lane SSA over `CgFunction`, with range-scoped memory definitions and conservative residual
+//! memory. Observable effects retain ordered boundaries carrying the guest state. Calls use
 //! `CallFacts` under the optimizing policy and conservative effects otherwise. `prepare`
 //! canonicalizes, forwards stores to loads, coalesces whole-register phis and removes dead values;
 //! `liveness` and `flags` derive state publications and lazy flag plans.
@@ -10,7 +10,9 @@ use rk_core::contract::{Field, Fields};
 use rk_core::{Addr, Lookup};
 use rk_ir::{Op, SlowInsn, StateKey};
 
+pub mod address;
 mod build;
+pub mod memory;
 mod canonical;
 mod coalesce;
 mod dump;
@@ -137,6 +139,7 @@ pub struct Ssa {
     pub flags: Vec<FlagRecord>,
     pub loc: Vec<Option<InsnLoc>>,
     pub value_addr: Vec<Addr>,
+    pub(crate) memory_partitioned: bool,
     pub(crate) phi_key: Lookup<ValueId, usize>,
     pub(crate) entry_reads: Vec<Vec<(usize, ValueId)>>,
     pub(crate) exit_state: Vec<Vec<Option<ValueId>>>,

@@ -82,6 +82,7 @@ def main():
     build_py.game_config.add_game_args(parser)
     raw = parser.parse_args()
     if raw.translator:
+        build_py.test_translator_analysis(ROOT / "build")
         command = [sys.executable, str(ROOT / "tests/translator/run.py"),
                    "--iterations", str(raw.iterations), "--jobs", str(raw.jobs)]
         for case in raw.case:
